@@ -383,6 +383,11 @@ async function copyVolumeAtomicOverwrite(
   options: VolumeCopyOptions
 ): Promise<void> {
   const tmp = makeTempVolumeName(targetVolume)
+  // commit (target の clear+refill) が始まったか / 完了したか。commit が始まった後に
+  // 失敗した場合は target が空/中途半端で、検証済みの完全なコピーは tmp にしか無い。
+  // この時 tmp を消すと唯一の正データを失うため、cleanup では tmp を残して復旧手順を出す。
+  let commitStarted = false
+  let commitDone = false
   try {
     createVolume(tmp)
     // 1. stage
@@ -403,10 +408,26 @@ async function copyVolumeAtomicOverwrite(
       )
     }
     // 3. commit (target を消すのはここが初めて)
+    commitStarted = true
     await copyVolumeWithCp(tmp, targetVolume, { clearTarget: true })
+    commitDone = true
   } finally {
-    // 4. cleanup (createVolume も try 内に入れたので、途中失敗でも temp を掃除する)
-    removeVolume(tmp)
+    // 4. cleanup。commit 開始後に失敗した場合だけは tmp を残す (target が壊れていて
+    //    tmp が唯一の完全コピーのため)。それ以外 (staging/verify 失敗 = target 無傷、
+    //    または commit 成功) では tmp は不要なので削除する。
+    if (commitStarted && !commitDone) {
+      console.log(
+        `  ⚠️  Overwrite of '${targetVolume}' failed mid-commit — its data may be incomplete.`
+      )
+      console.log(
+        `      A verified full copy is preserved in temp volume '${tmp}'. Recover with:`
+      )
+      console.log(
+        `        docker run --rm -v ${tmp}:/from -v ${targetVolume}:/to alpine sh -c 'find /to -mindepth 1 -delete && cp -a /from/. /to/' && docker volume rm ${tmp}`
+      )
+    } else {
+      removeVolume(tmp)
+    }
   }
 }
 

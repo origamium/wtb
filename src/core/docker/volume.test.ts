@@ -226,8 +226,12 @@ describe("copyVolume atomic overwrite", () => {
       (a) => a[0] === "volume" && a[1] === "rm" && (a.at(-1) ?? "").startsWith(`${TARGET}__wtbtmp_`)
     )
 
+  let logSpy: ReturnType<typeof vi.spyOn>
+  const logged = () => logSpy.mock.calls.map((c) => c[0]).join("\n")
+
   beforeEach(() => {
     vi.clearAllMocks()
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {})
     // default: rsync succeeds; source & temp both non-empty
     vi.mocked(spawn).mockImplementation(() => fakeRsyncProc(0) as never)
     vi.mocked(execDockerSafe).mockImplementation((args: string[]) => {
@@ -313,5 +317,28 @@ describe("copyVolume atomic overwrite", () => {
     await expect(copyVolume(SOURCE, TARGET, { clearTarget: true })).rejects.toThrow(/probe failed/)
     expect(clearedTarget()).toBe(false)
     expect(removedTemp()).toBe(true)
+  })
+
+  it("preserves the staged temp volume when the commit fails mid-overwrite", async () => {
+    // staging (rsync) + verify succeed, but the commit cp into the REAL target fails
+    // (e.g. disk full). The target is now cleared/partial, so the verified copy in the
+    // temp volume is the ONLY intact data and must NOT be deleted.
+    vi.mocked(execDockerSafe).mockImplementation((args: string[]) => {
+      if (args.includes(DU_CMD)) {
+        const vol = mountVol(args, ":/data")
+        return vol === SOURCE || vol.includes("__wtbtmp_") ? "100" : "0"
+      }
+      if (args.includes(CP_CMD) && args.includes(`${TARGET}:/target`)) {
+        throw new Error("disk full during commit")
+      }
+      return ""
+    })
+
+    await expect(copyVolume(SOURCE, TARGET, { clearTarget: true })).rejects.toThrow()
+    // commit started (target was cleared) but the temp volume must be preserved
+    expect(clearedTarget()).toBe(true)
+    expect(removedTemp()).toBe(false)
+    // and the user is told how to recover from the temp volume
+    expect(logged()).toContain("preserved in temp volume")
   })
 })
