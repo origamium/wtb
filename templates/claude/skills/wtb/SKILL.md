@@ -66,6 +66,7 @@ Reading the output:
 - `compose.services.<service>.host_ports[]` is the authoritative list of host-bound ports (already adjusted for the current worktree).
 - `endpoints` is a pre-rendered list of `http://localhost:<host_port>` entries. Use these first; reach for `env.*_PORT` only if no compose file is present.
 - If Docker is missing or the Compose file is absent, `compose.services` is `{}` — that is not an error. Use `env` values instead.
+- `compose.file` is resolved per worktree: wtb prefers **this worktree's own copy** of `docker_compose_file` (so the ports are the *adjusted* ones) and only falls back to the source repo's copy if the worktree has none. If you see the source's path in `compose.file`, the worktree copy was missing and the ports may be the *un-adjusted* originals — re-run `wtb create` (or copy the compose file in) to get isolated ports.
 - Warnings (e.g. `📋 Loading configuration from: wtb.yaml`) go to stderr; stdout stays valid JSON. Pipe to `jq` safely.
 
 When the user asks an open question like "check the health endpoint," pick the first `http://localhost:<port>` from `endpoints` (or reason from service names like `web` / `api` when multiple exist).
@@ -105,7 +106,7 @@ Useful flags:
 - `--dry-run` — preview without touching anything. **Suggest this to the user before the real run** if the config is unfamiliar or recently changed.
 - `-p <path>` — custom worktree location (default: `../worktree-<branch-with-slashes-as-dashes>`).
 - `--no-create-branch` — attach to an existing branch instead of creating a new one.
-- `--no-docker` / `--no-env` / `--no-copy` / `--no-link` / `--no-start` — skip individual phases.
+- `--no-docker` / `--no-env` / `--no-copy` / `--no-link` / `--no-start` — skip individual phases. Note: `--no-docker` skips **both** the Compose port-remap **and** the volume-clone phase (volume cloning is gated on Docker being active), so a worktree created with `--no-docker` starts with empty volumes even without `--no-volume-copy`.
 - `--no-volume-copy` — skip the volume-clone phase entirely (start with empty volumes).
 - `--no-stop` — don't auto-stop the source Compose stack; skip in-use volumes with a warning instead (the pre-stop-then-copy behavior). Use only when momentarily stopping the source services is unacceptable.
 - `--force-volume-copy` — clone even when source containers are running or the target already has data (clones *live* without stopping — data-corruption risk; dev only). Overwriting an existing target is atomic (staged via a temp volume, verified, then swapped), so a failed overwrite never empties the target.
@@ -144,7 +145,7 @@ wtb remove feature/old-branch
 
 Flags:
 
-- `-f, --force` — allow removal with uncommitted changes.
+- `-f, --force` — allow removal with uncommitted changes. (wtb does **not** run its own dirty-check; without `-f`, `git worktree remove` itself refuses a dirty worktree and the command fails. Run `wtb ls -l` first to see the `*` dirty flag before deciding.)
 - `--no-docker` — skip `docker compose down` (useful when the Docker daemon is already stopped).
 - `--no-end` — skip `end_command`.
 - `--remove-volumes` — also delete the worktree's Docker volumes (`docker compose down -v`). **Destructive for cloned data — confirm with the user.**
@@ -176,6 +177,19 @@ Use `wtb status` for diagnosis when ports look wrong or services are missing —
 | `env.adjust` | Per-key transform: `number` = auto-bump to next free port, `string` = literal replace, `null` = remove. |
 | `volumes.exclude` | Compose volume keys to exclude from auto-cloning. Default `[]` (clone every named non-`external` volume). |
 | `volumes.seed_command` | Command run in the worktree when `create --seed` is used, *instead of* cloning volume data (fresh-seeded DB rather than a copy of main's). |
+
+## Installing / updating this skill (`wtb init-claude`)
+
+This skill file is installed by `wtb init-claude`. If the user asks to install, refresh, or update the wtb skill — or you notice it's stale versus the installed CLI — use it:
+
+```bash
+wtb init-claude              # write .claude/skills/wtb/SKILL.md in this repo
+wtb init-claude --force      # overwrite an existing SKILL.md (use when updating)
+wtb init-claude --user       # install globally at ~/.claude/skills/wtb/ instead
+wtb init-claude --dry-run     # print the target path only; write nothing
+```
+
+Because `.claude/skills/` is a regular tracked directory, every worktree created with `wtb create` inherits the skill automatically — there's nothing to sync per worktree. After installing, suggest the user `git add .claude/skills/wtb && git commit`. `init-claude` is safe to run autonomously *except* `--force`, which overwrites the existing file — confirm before using it.
 
 ## Troubleshooting hints
 

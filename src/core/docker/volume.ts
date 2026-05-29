@@ -136,11 +136,10 @@ export async function copyVolumeWithRsync(
 ): Promise<void> {
   const { onProgress, incremental = true, compress = false } = options
 
-  try {
-    createVolume(targetVolume)
-  } catch {
-    // 既に存在する場合は無視
-  }
+  // `docker volume create` は idempotent (既存 volume なら何もせず成功) なので
+  // 失敗 = 本当のエラー (daemon down / 不正な名前 / driver エラー)。握り潰さず
+  // 伝播させ、呼び出し側で copy 失敗として明確に扱う。
+  createVolume(targetVolume)
 
   const totalBytes = getVolumeSize(sourceVolume) ?? 0
 
@@ -279,11 +278,8 @@ export async function copyVolumeWithCp(
   } = {}
 ): Promise<void> {
   const { onProgress, clearTarget = false } = options
-  try {
-    createVolume(targetVolume)
-  } catch {
-    // 既に存在する場合は無視
-  }
+  // idempotent: 既存なら no-op で成功。失敗は本当のエラーなので伝播させる。
+  createVolume(targetVolume)
 
   const totalBytes = getVolumeSize(sourceVolume) ?? 0
 

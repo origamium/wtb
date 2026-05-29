@@ -165,7 +165,7 @@ wtb create bugfix/urgent-fix
 |-----------|------|
 | `-p, --path <path>` | worktreeの作成場所を指定（デフォルト: 親ディレクトリに `worktree-<branch名>` で作成） |
 | `--no-create-branch` | 既存のブランチを使用（新規作成しない） |
-| `--no-docker` | Docker Composeのセットアップをスキップ |
+| `--no-docker` | Docker Compose のセットアップをスキップ — **volume クローンもスキップされる**(volume フェーズは Docker 前提)ため、worktree は空の volume で始まる |
 | `--no-env` | 環境変数ファイルの処理をスキップ（`.env`のコピー/調整） |
 | `--no-copy` | ファイルコピーをスキップ（`copy_files`） |
 | `--no-link` | symlink作成をスキップ（`link_files`） |

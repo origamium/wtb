@@ -119,15 +119,25 @@ env:
 
   # Environment variable adjustments
   # Values can be:
-  #   - string: direct replacement
-  #   - number: increment by this amount (for ports)
-  #   - null: remove the variable
+  #   - number: marks the key as a PORT — wtb picks the next free port starting
+  #             at (original + 1), avoiding other worktrees' ports. The number
+  #             itself is only a type marker (any positive integer works); it is
+  #             NOT added to the original.
+  #   - string: direct replacement with this literal value
+  #   - null:   remove the variable entirely
   adjust:
-    # Example port adjustments:
-    # APP_PORT: 1000        # Add 1000 to original port
-    # DB_PORT: 1000         # Add 1000 to original port
-    # API_URL: "string"     # Replace with this string
-    # DEBUG_MODE: null      # Remove this variable
+    # Example adjustments:
+    # APP_PORT: 1            # PORT → auto-bump to the next free port
+    # DB_PORT: 1             # PORT → auto-bump to the next free port
+    # API_URL: "string"      # Replace with this literal string
+    # DEBUG_MODE: null       # Remove this variable
+
+# Volume cloning (Docker named volumes are auto-cloned to each worktree)
+# volumes:
+#   exclude:                 # volume keys to skip cloning (e.g. regenerable caches)
+#     - cache_data
+#   # Run instead of cloning when 'wtb create --seed' is used (fresh DB per worktree):
+#   seed_command: docker compose up -d db && npm run db:migrate && npm run db:seed
 `
 
   fs.writeFileSync(targetPath, yamlContent, "utf-8")

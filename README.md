@@ -154,7 +154,7 @@ Creates a new worktree for `<branch>`, branching from `base_branch` unless the b
 |--------|-------------|
 | `-p, --path <path>` | Custom worktree location |
 | `--no-create-branch` | Use an existing branch (fails if it doesn't exist) |
-| `--no-docker` | Skip Docker Compose copy/port-remap |
+| `--no-docker` | Skip Docker Compose copy/port-remap — **also skips volume cloning** (the volume phase requires Docker), so the worktree starts with empty volumes |
 | `--no-env` | Skip `env.file` copy + `env.adjust` |
 | `--no-copy` | Skip `copy_files` |
 | `--no-link` | Skip `link_files` symlinks |
