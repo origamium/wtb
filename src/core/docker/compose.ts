@@ -8,6 +8,7 @@ import fs from "fs-extra"
 import { parse, stringify } from "yaml"
 import { COMPOSE_FILE_NAMES, FILE_ENCODING, PORT_RANGE } from "../../constants/index.js"
 import type { ComposeConfig, FileOperationOptions } from "../../types/index.js"
+import { execDockerSafe } from "../../utils/exec.js"
 
 /**
  * Docker Composeファイルを読み込んでパース
@@ -288,7 +289,7 @@ export function generateProjectName(projectDir: string, branchName?: string): st
 export function resolveComposeProjectName(
   composeConfig: ComposeConfig,
   workdir: string,
-  env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = process.env
 ): string {
   const explicit = (composeConfig as { name?: unknown }).name
   if (typeof explicit === "string" && explicit.length > 0) {
@@ -362,4 +363,33 @@ export function validateComposeConfig(config: ComposeConfig): {
     errors,
     warnings,
   }
+}
+
+/**
+ * source の Docker Compose スタックを停止する (`docker compose stop`)。
+ *
+ * volume を安全にクローンするための一時停止に使う。`down` と違い、`stop` は
+ * コンテナ・ネットワーク・volume を保持したままプロセスのみ止めるため、
+ * 後で {@link composeStart} で素早く復帰できる。Postgres/MySQL/Redis などの
+ * ライブ volume を破損なくコピーするために create フローから呼ばれる。
+ *
+ * @param composeFilePath - Compose ファイルの絶対パス
+ * @param projectName - Compose プロジェクト名 (resolveComposeProjectName の結果)
+ * @param cwd - 実行ディレクトリ (通常は source の gitRoot)
+ * @throws {Error} docker 呼び出しが失敗した場合 (呼び出し側で握りつぶす想定)
+ */
+export function composeStop(composeFilePath: string, projectName: string, cwd: string): void {
+  execDockerSafe(["compose", "-f", composeFilePath, "-p", projectName, "stop"], { cwd })
+}
+
+/**
+ * {@link composeStop} で停止した source スタックを再開する (`docker compose start`)。
+ *
+ * @param composeFilePath - Compose ファイルの絶対パス
+ * @param projectName - Compose プロジェクト名
+ * @param cwd - 実行ディレクトリ (通常は source の gitRoot)
+ * @throws {Error} docker 呼び出しが失敗した場合 (呼び出し側で握りつぶす想定)
+ */
+export function composeStart(composeFilePath: string, projectName: string, cwd: string): void {
+  execDockerSafe(["compose", "-f", composeFilePath, "-p", projectName, "start"], { cwd })
 }

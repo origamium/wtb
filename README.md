@@ -15,6 +15,7 @@ A CLI tool built on Git worktrees that gives every branch its own isolated worki
 ## Table of contents
 
 - [Why wtb?](#why-wtb)
+- [Philosophy & scope](#philosophy--scope)
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [Commands](#commands)
@@ -36,6 +37,7 @@ A CLI tool built on Git worktrees that gives every branch its own isolated worki
 - [Claude Code integration](#claude-code-integration)
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
+- [Roadmap](#roadmap)
 - [Changelog](#changelog)
 - [License](#license)
 
@@ -50,6 +52,18 @@ Typical use cases:
 - You need a clean checkout to review a PR without stashing, resetting, or killing your running dev server.
 - You'd like `.env`, local configs, or credentials automatically copied (and adjusted) to each new worktree.
 - You run Docker Compose and need each branch's services on their own ports.
+
+## Philosophy & scope
+
+wtb is built for a particular way of working: running many changes — including ones that touch the database and backend — in true parallel, one isolated worktree per change.
+
+- **Parallelism is the speedup.** In vibe-coding workflows, doing DB- and backend-touching changes in full parallel (a worktree per change) is where the time savings come from.
+- **Every worktree is fully autonomous on code.** Each worktree can change and run code on its own, completely independent of the others.
+- **Every worktree is fully autonomous on data.** Each worktree starts from a complete copy of the DB state, so it can write migrations and mutate data freely without affecting any other worktree.
+- **Conflicts are expected — and that's fine.** Working this way, conflicts are the norm; the best code emerges from the collision of competing requirements. wtb deliberately does *not* try to resolve them for you.
+- **Docker Compose only, for now.** wtb currently supports Docker Compose plus its YAML and env files only. Other stacks are out of scope at this stage.
+- **No coding-agent orchestration (yet).** wtb does not orchestrate coding agents. A coding agent launched inside a worktree should treat its job as done once it finishes the task; if more work is needed, a human is expected to go in and pick it up. In practice the recommended pattern is to let the agent run all the way to opening a pull request.
+- _The author is partial to the V6 hybrid power units used in F1._
 
 ## How it works
 
@@ -75,7 +89,7 @@ When you run `wtb create <branch>`, the tool walks these phases in order:
 3. **Symlink** — `link_files` entries are symlinked back to the source (existing files/dirs/symlinks are replaced safely).
 4. **Environment files** — `env.file` entries are copied; if `env.adjust` is non-empty, port-style values are bumped to the next free port that doesn't collide with other worktrees' `.env` files.
 5. **Docker Compose** — if `docker_compose_file` is configured, wtb reads it, remaps host ports around running containers, and writes the adjusted copy into the worktree.
-6. **Volume clone** — every named (non-`external`) Docker volume declared in the Compose file is cloned to the new worktree's project, so e.g. PostgreSQL data carries over without re-seeding. Volumes whose source container is currently running are skipped (with a warning) to avoid corruption — stop the source side first, or pass `--force-volume-copy`. See [Volume cloning](#volume-cloning).
+6. **Volume clone** — every named (non-`external`) Docker volume declared in the Compose file is cloned to the new worktree's project, so e.g. PostgreSQL data carries over without re-seeding. If the source stack is running (the usual case for a live dev DB), wtb **automatically stops it, clones, and restarts it** so the copy is corruption-safe — no manual step. Pass `--no-stop` to skip in-use volumes instead, or `--force-volume-copy` to clone live. See [Volume cloning](#volume-cloning).
 7. **Start command** — `start_command`, if configured, runs inside the new worktree with `/bin/sh`.
 
 `wtb remove <branch>` runs in reverse: `docker compose down` (or `down -v` with `--remove-volumes`, unless `end_command` is set), then `end_command`, then `git worktree remove`.
@@ -147,6 +161,7 @@ Creates a new worktree for `<branch>`, branching from `base_branch` unless the b
 | `--no-start` | Skip `start_command` |
 | `--no-volume-copy` | Skip cloning Docker volumes from the source project |
 | `--force-volume-copy` | Clone volumes even when the source container is running or the target volume already has data |
+| `--no-stop` | Don't auto-stop the source Compose stack before cloning; skip in-use volumes instead (the old behavior) |
 | `--dry-run` | Print the plan, make no changes |
 
 Examples:
@@ -382,9 +397,11 @@ How it works:
 1. wtb enumerates `volumes:` keys from the Compose file.
 2. Volumes marked `external: true` are **skipped** (they're shared by design).
 3. Source volume name is resolved as `<source_project>_<key>` (or the explicit `volumes.<key>.name` if set). Same for the target with the new worktree's project name.
-4. For each volume:
-   - **If a running container is using the source volume**, wtb skips it with a warning (live filesystem copy of an active database is unsafe — Postgres/MySQL/Redis can corrupt). Stop the source side with `docker compose down` first, or pass `--force-volume-copy` to clone live anyway.
-   - **If the target volume already has data**, wtb skips it (assumes you've already populated it). Pass `--force-volume-copy` to overwrite.
+4. **Stop-then-copy.** If any cloneable source volume is in use by a running container, wtb **stops the source Compose stack** (`docker compose stop` — containers/networks are preserved), clones, then **restarts it** (`docker compose start`). The restart runs in a `finally` block and is also wired to `SIGINT`, so an interrupted clone (Ctrl-C) never leaves your source services down. This makes a live dev DB clone safely with no manual step. Opt out with `--no-stop` (then in-use volumes are skipped with a warning instead), or use `--force-volume-copy` to clone live without stopping (data-corruption risk). Note: `docker compose start` brings up *every* stopped service in the project — if you had intentionally left some down, re-stop them after.
+5. For each volume:
+   - **If the source stack was stopped** (or `--force-volume-copy` was passed, or nothing was running), wtb clones it.
+   - **If `--no-stop` is set and a running container is using the source volume**, wtb skips it with a warning (a live filesystem copy of an active database can corrupt — Postgres/MySQL/Redis). Stop the source side with `docker compose stop` first, drop `--no-stop`, or pass `--force-volume-copy`.
+   - **If the target volume already has data**, wtb skips it (assumes you've already populated it). Pass `--force-volume-copy` to overwrite. The overwrite is **atomic**: wtb stages the new data into a temporary volume and verifies it before replacing the target, so a failed copy never leaves the target emptied.
    - Otherwise, wtb does a recursive copy via a transient `instrumentisto/rsync-ssh` sidecar container (with an Alpine `cp -a` fallback if rsync isn't available).
 
 Selectively exclude volumes you don't want to clone (e.g. regenerable caches):
@@ -397,7 +414,9 @@ volumes:
     - tmp_data
 ```
 
-Disable the whole phase per-invocation with `wtb create <branch> --no-volume-copy`. Force-clone running source volumes (data-loss risk, dev only) with `--force-volume-copy`.
+Disable the whole phase per-invocation with `wtb create <branch> --no-volume-copy`. Keep the source stack running and skip in-use volumes with `--no-stop`. Force-clone running source volumes live (data-loss risk, dev only) with `--force-volume-copy`.
+
+The per-volume summary reports `N cloned, N skipped, N failed`. If any volume **fails** to clone, the worktree is still created but the final banner changes from `🎉 Worktree created successfully!` to `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`, so the incomplete state is obvious (note: the command still exits `0` — the worktree exists). A *skip* is intentional (external/excluded volume, missing source, in-use under `--no-stop`, or a target that already has data); a *failure* means the copy itself errored.
 
 `wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`).
 
@@ -600,6 +619,16 @@ Yes — but lifecycle scripts, Docker integration, and port remapping are mostly
 
 **Why the "wtb" name?**
 Short for "worktree turbo" — git worktrees, but with the environment-wrangling turbocharged.
+
+## Roadmap
+
+Planned, **not yet implemented** — listed so the intended direction is on record.
+
+- **Seed instead of copy (opt-in).** A flag will let `create` run a seed step instead of cloning volume data — useful when you want a freshly seeded DB rather than a clone of main's. Because nothing is copied off a live volume, this path does *not* stop the stack.
+
+Recently shipped (was on this list):
+
+- **Stop-then-copy for DB integrity.** ✅ `create` now auto-stops the source Compose stack before cloning live volumes and restarts it afterward (crash-safe), so a running dev DB clones with no manual step. Opt out with `--no-stop`.
 
 ## Changelog
 

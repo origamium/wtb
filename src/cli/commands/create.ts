@@ -12,6 +12,8 @@ import { loadConfig } from "../../core/config/loader.js"
 import { getUsedPorts } from "../../core/docker/client.js"
 import {
   adjustPortsInCompose,
+  composeStart,
+  composeStop,
   readComposeFile,
   resolveComposeProjectName,
   writeComposeFile,
@@ -43,7 +45,22 @@ interface CreateOptions {
   start?: boolean
   volumeCopy?: boolean
   forceVolumeCopy?: boolean
+  stop?: boolean
   dryRun?: boolean
+}
+
+/**
+ * setupVolumeCopy の結果サマリ。
+ * - copied: 正常にクローンできた volume 数
+ * - skipped: 意図的に skip した数 (external / source 不在 / target にデータあり /
+ *   --no-stop で稼働中 / 停止後も別 project が使用中)
+ * - failed: copyVolume が例外を投げた数 (= データ分離が未達成)。これが 1 以上なら
+ *   worktree は作成されてもデータ的に半端な状態なので、呼び出し側で明示的に surface する。
+ */
+export interface VolumeCopyResult {
+  copied: number
+  skipped: number
+  failed: number
 }
 
 /**
@@ -63,7 +80,11 @@ export function createCommand(): Command {
     .option("--no-volume-copy", "Skip cloning Docker volumes from the source project")
     .option(
       "--force-volume-copy",
-      "Clone volumes even when the source container is running or the target volume already has data",
+      "Clone volumes even when the source container is running or the target volume already has data"
+    )
+    .option(
+      "--no-stop",
+      "Don't auto-stop the source Compose stack before cloning live volumes (skip in-use volumes instead)"
     )
     .option("--dry-run", "Show what would be done without making changes")
     .action(withErrorHandling(executeCreateCommand))
@@ -72,10 +93,7 @@ export function createCommand(): Command {
 /**
  * createコマンドのメイン実行ロジック
  */
-async function executeCreateCommand(
-  branch: string,
-  options: CreateOptions
-): Promise<void> {
+async function executeCreateCommand(branch: string, options: CreateOptions): Promise<void> {
   const gitRoot = getGitRootOrThrow()
 
   // 既存のworktreeチェック
@@ -212,6 +230,7 @@ async function executeCreateCommand(
 
   // Volume clone phase (named volumes from compose are auto-cloned to the new
   // worktree's project so e.g. PostgreSQL data carries over).
+  let volumeFailures = 0
   if (config.docker_compose_file && !skipDocker) {
     console.log("")
     if (skipVolumeCopy) {
@@ -219,7 +238,11 @@ async function executeCreateCommand(
     } else if (dryRun) {
       previewVolumeCopy(gitRoot, config)
     } else {
-      await setupVolumeCopy(gitRoot, worktreePath, config, { force: forceVolumeCopy })
+      const volumeResult = await setupVolumeCopy(gitRoot, worktreePath, config, {
+        force: forceVolumeCopy,
+        stop: options.stop,
+      })
+      volumeFailures = volumeResult.failed
     }
   }
 
@@ -241,7 +264,15 @@ async function executeCreateCommand(
   if (dryRun) {
     console.log("🔍 Dry run complete — no changes were made")
   } else {
-    console.log("🎉 Worktree created successfully!")
+    if (volumeFailures > 0) {
+      // worktree itself is created, but its data isolation is incomplete. Make this
+      // loud and machine-parsable so an autonomous agent doesn't treat it as clean.
+      console.log(
+        `⚠️  Worktree created, but ${volumeFailures} volume(s) FAILED to clone — this worktree's data is NOT fully isolated. See the errors above; re-run the clone after resolving them.`
+      )
+    } else {
+      console.log("🎉 Worktree created successfully!")
+    }
     console.log("")
     console.log("Next steps:")
     console.log(`  cd ${worktreePath}`)
@@ -471,25 +502,26 @@ export async function setupVolumeCopy(
   gitRoot: string,
   worktreePath: string,
   config: WtbConfig,
-  options: { force?: boolean }
-): Promise<void> {
-  if (!config.docker_compose_file) return
+  options: { force?: boolean; stop?: boolean }
+): Promise<VolumeCopyResult> {
+  const NONE: VolumeCopyResult = { copied: 0, skipped: 0, failed: 0 }
+  if (!config.docker_compose_file) return NONE
 
   const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
-  if (!existsSync(sourceComposePath)) return
+  if (!existsSync(sourceComposePath)) return NONE
 
   let composeConfig: ReturnType<typeof readComposeFile>
   try {
     composeConfig = readComposeFile(sourceComposePath)
   } catch (error) {
     console.log(`📦 Volume clone skipped: cannot read compose file (${getErrorMessage(error)})`)
-    return
+    return NONE
   }
 
   const exclude = config.volumes?.exclude ?? []
   const cloneable = discoverCloneableVolumes(composeConfig, exclude)
   if (cloneable.length === 0) {
-    return // nothing to copy — silent
+    return NONE // nothing to copy — silent
   }
 
   // Compose の実際のプロジェクト名 (compose-spec 準拠) を解決する。
@@ -500,76 +532,152 @@ export async function setupVolumeCopy(
   const targetProject = resolveComposeProjectName(composeConfig, worktreePath)
   console.log("📦 Cloning Docker volumes...")
 
+  // stop-then-copy: source volume を使う稼働中コンテナがあり、--no-stop でも
+  // --force-volume-copy でもなければ、source スタックを停止してから安全にコピーし、
+  // finally で必ず再開する。これで「DB が起動中だと clone が skip される」という
+  // データ自律性のギャップ (README Roadmap) を解消する。
+  const stopEnabled = options.stop !== false
+  let stoppedStack = false
+  // process.exit() (e.g. the SIGINT handler in cli/index.ts) bypasses the finally
+  // below, so a Ctrl-C mid-copy would leave the source stack down. Restart it from
+  // a prepended SIGINT handler too — it runs before the index handler exits.
+  let restartOnAbort: (() => void) | undefined
+  if (stopEnabled && !options.force) {
+    const anyInUse = cloneable.some((key) => {
+      const source = resolveVolumeName(composeConfig, key, sourceProject)
+      return (
+        !!source &&
+        !source.external &&
+        volumeExists(source.name) &&
+        getContainersUsingVolume(source.name).length > 0
+      )
+    })
+    if (anyInUse) {
+      console.log(
+        "  ⏸️  Source Compose stack is running — stopping it to clone volumes safely (will restart after)..."
+      )
+      try {
+        composeStop(sourceComposePath, sourceProject, gitRoot)
+        stoppedStack = true
+        restartOnAbort = () => {
+          try {
+            composeStart(sourceComposePath, sourceProject, gitRoot)
+          } catch {
+            // best-effort restart on abort; nothing else we can do mid-signal
+          }
+        }
+        process.prependListener("SIGINT", restartOnAbort)
+      } catch (error) {
+        console.log(
+          `  ⚠️  Could not stop source stack (${getErrorMessage(error)}) — falling back to per-volume skip`
+        )
+      }
+    }
+  }
+
   let copiedCount = 0
   let skippedCount = 0
+  let failedCount = 0
 
-  for (const key of cloneable) {
-    const source = resolveVolumeName(composeConfig, key, sourceProject)
-    const target = resolveVolumeName(composeConfig, key, targetProject)
-    if (!source || !target) {
-      // discoverCloneableVolumes が external を弾いているのでここには来ない想定
-      continue
-    }
-    if (source.external) {
-      // 念のためのガード
-      continue
-    }
+  try {
+    for (const key of cloneable) {
+      const source = resolveVolumeName(composeConfig, key, sourceProject)
+      const target = resolveVolumeName(composeConfig, key, targetProject)
+      if (!source || !target) {
+        // discoverCloneableVolumes が external を弾いているのでここには来ない想定
+        continue
+      }
+      if (source.external) {
+        // 念のためのガード
+        continue
+      }
 
-    // source 存在チェック
-    if (!volumeExists(source.name)) {
-      console.log(`  ℹ️  ${key}: source volume '${source.name}' does not exist yet — skipping`)
-      skippedCount++
-      continue
-    }
+      // source 存在チェック
+      if (!volumeExists(source.name)) {
+        console.log(`  ℹ️  ${key}: source volume '${source.name}' does not exist yet — skipping`)
+        skippedCount++
+        continue
+      }
 
-    // 稼働中コンテナチェック (Postgres などのライブコピーは破損リスク)
-    const usingContainers = getContainersUsingVolume(source.name)
-    if (usingContainers.length > 0 && !options.force) {
-      console.log(
-        `  ⚠️  ${key}: source volume '${source.name}' is in use by ${usingContainers.join(", ")}`
-      )
-      console.log(
-        `      → skipping (run 'docker compose down' on the source side, or pass --force-volume-copy to clone live with data-corruption risk)`
-      )
-      skippedCount++
-      continue
-    }
-
-    // target に既にデータが入っているかチェック (空の volume ならコピーで上書き OK)
-    let targetHadData = false
-    if (volumeExists(target.name)) {
-      const targetSize = getVolumeSize(target.name)
-      if (targetSize > 0) {
-        if (!options.force) {
+      // 稼働中コンテナチェック (Postgres などのライブコピーは破損リスク)。force でない
+      // 限り、stoppedStack の有無に関わらず copy 直前に必ず再チェックする。これにより
+      // (a) --no-stop 時のライブ source skip、(b) スタックを停止したのに別 Compose
+      // project が共有名前付き volume を掴んでいて依然 in-use なケース、の両方を弾く。
+      if (!options.force) {
+        const usingContainers = getContainersUsingVolume(source.name)
+        if (usingContainers.length > 0) {
           console.log(
-            `  ⚠️  ${key}: target volume '${target.name}' already has data — skipping (use --force-volume-copy to overwrite)`
+            `  ⚠️  ${key}: source volume '${source.name}' is in use by ${usingContainers.join(", ")}`
+          )
+          console.log(
+            stoppedStack
+              ? "      → skipping: still in use after stopping the source stack (likely held by another Compose project sharing this named volume) — stop that side or pass --force-volume-copy"
+              : "      → skipping (--no-stop set; stop the source stack manually, drop --no-stop to auto stop-then-copy, or pass --force-volume-copy to clone live with data-corruption risk)"
           )
           skippedCount++
           continue
         }
-        // force=true: target に古いファイルが残ったままにならないよう、コピー前に
-        // target を消去する (rsync は --delete、cp は find -delete でこの semantics
-        // を実現)。これがないと cp フォールバック時に "上書き" の約束が破れる。
-        targetHadData = true
+      }
+
+      // target に既にデータが入っているかチェック (空の volume ならコピーで上書き OK)。
+      // getVolumeSize は確定できないと null を返す。null を「空」と誤認して上書き
+      // しないよう、null は「データがあるかもしれない」として扱う。
+      let targetHadData = false
+      if (volumeExists(target.name)) {
+        const targetSize = getVolumeSize(target.name)
+        const targetMayHaveData = targetSize === null || targetSize > 0
+        if (targetMayHaveData) {
+          if (!options.force) {
+            const reason =
+              targetSize === null
+                ? "size could not be determined — skipping (use --force-volume-copy to overwrite anyway)"
+                : "already has data — skipping (use --force-volume-copy to overwrite)"
+            console.log(`  ⚠️  ${key}: target volume '${target.name}' ${reason}`)
+            skippedCount++
+            continue
+          }
+          // force=true: 既存データを上書きする。clearTarget=true を渡すと copyVolume が
+          // atomic 経路 (一時 volume にステージング→検証→target を置換) を使うので、
+          // コピーが途中で失敗しても target の既存データが空になることはない。
+          targetHadData = true
+        }
+      }
+
+      try {
+        await copyVolume(source.name, target.name, {
+          onProgress: createVolumeCopyProgressHandler(`  📦 ${key}`),
+          clearTarget: targetHadData,
+        })
+        console.log(`  ✅ Cloned ${source.name} → ${target.name}`)
+        copiedCount++
+      } catch (error) {
+        console.log(`  ❌ Failed to clone ${key}: ${getErrorMessage(error)}`)
+        failedCount++
       }
     }
 
-    try {
-      await copyVolume(source.name, target.name, {
-        onProgress: createVolumeCopyProgressHandler(`  📦 ${key}`),
-        clearTarget: targetHadData,
-      })
-      console.log(`  ✅ Cloned ${source.name} → ${target.name}`)
-      copiedCount++
-    } catch (error) {
-      console.log(`  ❌ Failed to clone ${key}: ${getErrorMessage(error)}`)
-      skippedCount++
+    console.log(
+      `  → ${copiedCount} volume(s) cloned, ${skippedCount} skipped, ${failedCount} failed`
+    )
+  } finally {
+    if (restartOnAbort) {
+      process.removeListener("SIGINT", restartOnAbort)
+    }
+    if (stoppedStack) {
+      console.log("  ▶️  Restarting source Compose stack...")
+      try {
+        composeStart(sourceComposePath, sourceProject, gitRoot)
+        console.log("  ✅ Source stack restarted")
+      } catch (error) {
+        console.log(`  ⚠️  Failed to restart source stack: ${getErrorMessage(error)}`)
+        console.log(
+          "     Bring it back up manually: 'docker compose start' (or 'up -d') in the source repo."
+        )
+      }
     }
   }
 
-  console.log(
-    `  → ${copiedCount} volume(s) cloned, ${skippedCount} skipped`
-  )
+  return { copied: copiedCount, skipped: skippedCount, failed: failedCount }
 }
 
 /**

@@ -49,16 +49,16 @@ describe("setupVolumeCopy orchestration", () => {
     vi.mocked(composeModule.readComposeFile).mockReturnValue(
       composeFixture({ postgres_data: null })
     )
-    vi.mocked(composeModule.resolveComposeProjectName).mockImplementation(
-      (_cfg, dir) => (dir.endsWith("worktree") ? "target_proj" : "source_proj")
+    vi.mocked(composeModule.resolveComposeProjectName).mockImplementation((_cfg, dir) =>
+      dir.endsWith("worktree") ? "target_proj" : "source_proj"
     )
-    vi.mocked(volumeModule.discoverCloneableVolumes).mockImplementation(
-      (cfg, exclude) =>
-        Object.keys(cfg.volumes ?? {}).filter((k) => !(exclude ?? []).includes(k))
+    vi.mocked(volumeModule.discoverCloneableVolumes).mockImplementation((cfg, exclude) =>
+      Object.keys(cfg.volumes ?? {}).filter((k) => !(exclude ?? []).includes(k))
     )
-    vi.mocked(volumeModule.resolveVolumeName).mockImplementation(
-      (_cfg, key, project) => ({ name: `${project}_${key}`, external: false })
-    )
+    vi.mocked(volumeModule.resolveVolumeName).mockImplementation((_cfg, key, project) => ({
+      name: `${project}_${key}`,
+      external: false,
+    }))
     vi.mocked(volumeModule.volumeExists).mockReturnValue(true)
     vi.mocked(volumeModule.getVolumeSize).mockReturnValue(0)
     vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue([])
@@ -69,8 +69,8 @@ describe("setupVolumeCopy orchestration", () => {
     logSpy.mockRestore()
   })
 
-  const run = (force = false, config: WtbConfig = baseConfig()) =>
-    setupVolumeCopy("/repo", "/repo/worktree", config, { force })
+  const run = (force = false, config: WtbConfig = baseConfig(), stop?: boolean) =>
+    setupVolumeCopy("/repo", "/repo/worktree", config, { force, stop })
 
   it("returns silently when docker_compose_file is empty", async () => {
     await run(false, baseConfig({ docker_compose_file: "" }))
@@ -97,18 +97,102 @@ describe("setupVolumeCopy orchestration", () => {
     expect(messages).toContain("0 volume(s) cloned, 1 skipped")
   })
 
-  it("skips when source container is running and force=false", async () => {
-    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue(["pg-main"])
+  it("stops the source stack, clones, then restarts when source is running (default)", async () => {
+    // Pre-scan sees the running container; after composeStop it is gone, so the
+    // per-volume re-check passes and the clone proceeds.
+    vi.mocked(volumeModule.getContainersUsingVolume)
+      .mockReturnValueOnce(["pg-main"])
+      .mockReturnValue([])
     await run(false)
+    // Default (no --force, no --no-stop): stop-then-copy makes the running DB safe to clone.
+    expect(composeModule.composeStop).toHaveBeenCalledTimes(1)
+    expect(volumeModule.copyVolume).toHaveBeenCalledTimes(1)
+    expect(composeModule.composeStart).toHaveBeenCalledTimes(1)
+    // The SOURCE stack (project + compose path + cwd), never the target, is acted on.
+    expect(composeModule.composeStop).toHaveBeenCalledWith(
+      "/repo/docker-compose.yml",
+      "source_proj",
+      "/repo"
+    )
+    expect(composeModule.composeStart).toHaveBeenCalledWith(
+      "/repo/docker-compose.yml",
+      "source_proj",
+      "/repo"
+    )
+    // Ordering: stop → copy → restart.
+    const stopOrder = vi.mocked(composeModule.composeStop).mock.invocationCallOrder[0]
+    const copyOrder = vi.mocked(volumeModule.copyVolume).mock.invocationCallOrder[0]
+    const startOrder = vi.mocked(composeModule.composeStart).mock.invocationCallOrder[0]
+    expect(stopOrder).toBeLessThan(copyOrder)
+    expect(copyOrder).toBeLessThan(startOrder)
+    const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
+    expect(messages).toContain("stopping it to clone volumes safely")
+    expect(messages).toContain("Source stack restarted")
+  })
+
+  it("restarts the source stack even when copyVolume throws (crash-safe finally)", async () => {
+    vi.mocked(volumeModule.getContainersUsingVolume)
+      .mockReturnValueOnce(["pg-main"])
+      .mockReturnValue([])
+    vi.mocked(volumeModule.copyVolume).mockRejectedValue(new Error("rsync exploded"))
+    await run(false)
+    expect(composeModule.composeStop).toHaveBeenCalledTimes(1)
+    // The finally block must bring the source stack back up despite the failure.
+    expect(composeModule.composeStart).toHaveBeenCalledTimes(1)
+    const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
+    expect(messages).toContain("Failed to clone postgres_data")
+    expect(messages).toContain("Source stack restarted")
+  })
+
+  it("skips (and still restarts) a shared volume still in use after stopping the stack", async () => {
+    // A foreign Compose project keeps holding the (explicitly-named) volume even
+    // after we stop OUR stack — composeStop(-p sourceProject) cannot release it.
+    // wtb must NOT live-copy it; it must skip, but still restart our stack.
+    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue(["other-proj-db"])
+    await run(false)
+    expect(composeModule.composeStop).toHaveBeenCalledTimes(1)
+    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+    expect(composeModule.composeStart).toHaveBeenCalledTimes(1)
+    const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
+    expect(messages).toContain("still in use after stopping the source stack")
+  })
+
+  it("when composeStop throws, falls back to per-volume skip and does NOT restart", async () => {
+    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue(["pg-main"])
+    vi.mocked(composeModule.composeStop).mockImplementation(() => {
+      throw new Error("docker daemon down")
+    })
+    await run(false)
+    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+    // Nothing was stopped, so nothing must be (re)started.
+    expect(composeModule.composeStart).not.toHaveBeenCalled()
+    const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
+    expect(messages).toContain("Could not stop source stack")
+    expect(messages).toContain("is in use by pg-main")
+  })
+
+  it("with --no-stop, skips a running source volume (preserves old behavior)", async () => {
+    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue(["pg-main"])
+    await run(false, baseConfig(), false)
+    expect(composeModule.composeStop).not.toHaveBeenCalled()
     expect(volumeModule.copyVolume).not.toHaveBeenCalled()
     const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
     expect(messages).toContain("is in use by pg-main")
-    expect(messages).toContain("--force-volume-copy")
+    expect(messages).toContain("--no-stop set")
   })
 
-  it("clones when source container is running and force=true", async () => {
+  it("does not stop the stack when no source volume is in use", async () => {
+    // Default mock: getContainersUsingVolume returns [] — nothing running.
+    await run(false)
+    expect(composeModule.composeStop).not.toHaveBeenCalled()
+    expect(composeModule.composeStart).not.toHaveBeenCalled()
+    expect(volumeModule.copyVolume).toHaveBeenCalledTimes(1)
+  })
+
+  it("clones live without stopping when force=true (live-copy path preserved)", async () => {
     vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue(["pg-main"])
     await run(true)
+    expect(composeModule.composeStop).not.toHaveBeenCalled()
     expect(volumeModule.copyVolume).toHaveBeenCalledTimes(1)
   })
 
@@ -120,6 +204,30 @@ describe("setupVolumeCopy orchestration", () => {
     expect(volumeModule.copyVolume).not.toHaveBeenCalled()
     const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
     expect(messages).toContain("already has data — skipping")
+  })
+
+  it("skips when target volume size cannot be determined and force=false", async () => {
+    // getVolumeSize returns null on a probe failure — must NOT be treated as empty
+    // (which would silently overwrite). Skip instead.
+    vi.mocked(volumeModule.getVolumeSize).mockImplementation((name) =>
+      name === "target_proj_postgres_data" ? null : 0
+    )
+    await run(false)
+    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+    const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
+    expect(messages).toContain("size could not be determined")
+  })
+
+  it("overwrites when target size is unknown and force=true", async () => {
+    vi.mocked(volumeModule.getVolumeSize).mockImplementation((name) =>
+      name === "target_proj_postgres_data" ? null : 0
+    )
+    await run(true)
+    expect(volumeModule.copyVolume).toHaveBeenCalledWith(
+      "source_proj_postgres_data",
+      "target_proj_postgres_data",
+      expect.objectContaining({ clearTarget: true })
+    )
   })
 
   it("clears target and clones when target has data and force=true", async () => {
@@ -146,13 +254,28 @@ describe("setupVolumeCopy orchestration", () => {
     )
   })
 
-  it("reports failure when copyVolume throws", async () => {
+  it("reports failure when copyVolume throws (counted as failed, not skipped)", async () => {
     vi.mocked(volumeModule.copyVolume).mockRejectedValue(new Error("rsync exploded"))
-    await run()
+    const result = await run()
+    // No container running → stack never stopped → restart must not fire.
+    expect(composeModule.composeStart).not.toHaveBeenCalled()
     const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
     expect(messages).toContain("Failed to clone postgres_data")
     expect(messages).toContain("rsync exploded")
-    expect(messages).toContain("0 volume(s) cloned, 1 skipped")
+    expect(messages).toContain("0 volume(s) cloned, 0 skipped, 1 failed")
+    // The parsable result distinguishes a real failure from an intentional skip,
+    // so the create banner can be qualified instead of reporting clean success.
+    expect(result).toEqual({ copied: 0, skipped: 0, failed: 1 })
+  })
+
+  it("returns a counts summary distinguishing copied / skipped / failed", async () => {
+    // postgres_data clones; cache's source is absent (intentional skip).
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      composeFixture({ postgres_data: null, cache: null })
+    )
+    vi.mocked(volumeModule.volumeExists).mockImplementation((name) => name !== "source_proj_cache")
+    const result = await run()
+    expect(result).toEqual({ copied: 1, skipped: 1, failed: 0 })
   })
 
   it("respects volumes.exclude", async () => {

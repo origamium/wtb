@@ -34,12 +34,15 @@ export interface VolumeCopyOptions {
 }
 
 /**
- * ボリュームのサイズを取得
+ * ボリュームのサイズを取得する。
  *
  * @param volumeName - ボリューム名
- * @returns サイズ（バイト）
+ * @returns サイズ(バイト)。空の volume は `0`。**サイズを確定できなかった場合
+ *   (docker エラー / 出力が数値でない) は `null`** を返す。`null` と `0` を区別
+ *   することが重要: コピーの skip / 破壊的な上書き判定はこの値に依存するため、
+ *   「プローブ失敗」を「空」と取り違えると既存データを誤って消しかねない。
  */
-export function getVolumeSize(volumeName: string): number {
+export function getVolumeSize(volumeName: string): number | null {
   try {
     const output = execDockerSafe(
       [
@@ -54,9 +57,10 @@ export function getVolumeSize(volumeName: string): number {
       ],
       {}
     )
-    return parseInt(output, 10) || 0
+    const size = parseInt(output, 10)
+    return Number.isNaN(size) ? null : size
   } catch {
-    return 0
+    return null
   }
 }
 
@@ -68,6 +72,53 @@ export function getVolumeSize(volumeName: string): number {
  */
 export function createVolume(volumeName: string, driver: string = "local"): void {
   execDockerSafe(["volume", "create", "--driver", driver, volumeName], {})
+}
+
+/**
+ * volume を削除する (best-effort)。
+ *
+ * atomic overwrite の一時 volume の後始末に使う。存在しない / 使用中などで失敗
+ * しても例外は投げない (元のエラーを隠さないため)。
+ */
+export function removeVolume(volumeName: string): void {
+  try {
+    execDockerSafe(["volume", "rm", "-f", volumeName], {})
+  } catch {
+    // best-effort cleanup; 失敗しても呼び出し側の処理は続行する
+  }
+}
+
+/**
+ * volume の中身を全削除する (`find /target -mindepth 1 -delete` 相当)。
+ *
+ * `cp -a /source/. /target/` 単体では target の余剰ファイルが残るため、上書き
+ * セマンティクスを保つコピー前のクリアに使う。copyVolumeWithCp と atomic
+ * overwrite の commit 段階で共有する。
+ */
+function clearVolume(volumeName: string): void {
+  execDockerSafe(
+    [
+      "run",
+      "--rm",
+      "-v",
+      `${volumeName}:/target`,
+      "alpine",
+      "sh",
+      "-c",
+      "find /target -mindepth 1 -delete",
+    ],
+    {}
+  )
+}
+
+/**
+ * atomic overwrite 用の一時 volume 名を生成する。
+ * pid + 時刻 + 乱数で衝突を実質回避する (並行 create / リトライ対策)。
+ * Docker volume 名の許容文字 [a-zA-Z0-9_.-] のみを使う。
+ */
+function makeTempVolumeName(targetVolume: string): string {
+  const suffix = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  return `${targetVolume}__wtbtmp_${suffix}`
 }
 
 /**
@@ -91,7 +142,7 @@ export async function copyVolumeWithRsync(
     // 既に存在する場合は無視
   }
 
-  const totalBytes = getVolumeSize(sourceVolume)
+  const totalBytes = getVolumeSize(sourceVolume) ?? 0
 
   const rsyncFlags = ["-a", "--info=progress2", "--no-inc-recursive"]
 
@@ -226,7 +277,7 @@ export async function copyVolumeWithCp(
     // 既に存在する場合は無視
   }
 
-  const totalBytes = getVolumeSize(sourceVolume)
+  const totalBytes = getVolumeSize(sourceVolume) ?? 0
 
   if (onProgress) {
     onProgress({
@@ -243,19 +294,7 @@ export async function copyVolumeWithCp(
   // force 時は target の既存ファイルを先に消す。
   // `cp -a /source/. /target/` 単体では target の余分なファイルが残るため。
   if (clearTarget) {
-    execDockerSafe(
-      [
-        "run",
-        "--rm",
-        "-v",
-        `${targetVolume}:/target`,
-        "alpine",
-        "sh",
-        "-c",
-        "find /target -mindepth 1 -delete",
-      ],
-      {}
-    )
+    clearVolume(targetVolume)
   }
 
   execDockerSafe(
@@ -303,18 +342,92 @@ export async function copyVolume(
   targetVolume: string,
   options: VolumeCopyOptions & { clearTarget?: boolean } = {}
 ): Promise<void> {
+  // 既存データの上書き (clearTarget=true) は破壊的なので atomic 経路を使う。
+  // 「先に target を消してからコピー」だとコピー途中で失敗したとき target が空に
+  // なって復旧不能になるため、完全な staged コピーが出来てから初めて target を
+  // 置換する。
+  if (options.clearTarget === true) {
+    return copyVolumeAtomicOverwrite(sourceVolume, targetVolume, options)
+  }
+
   try {
     await copyVolumeWithRsync(sourceVolume, targetVolume, {
       ...options,
-      // clearTarget=true のとき rsync は incremental(=delete) で動かす
-      incremental: options.clearTarget ?? options.incremental,
+      incremental: options.incremental,
     })
   } catch (error) {
     console.warn("rsync copy failed, falling back to cp:", error)
     await copyVolumeWithCp(sourceVolume, targetVolume, {
       onProgress: options.onProgress,
-      clearTarget: options.clearTarget,
     })
+  }
+}
+
+/**
+ * 既存データを持つ target を atomic に上書きする。
+ *
+ * 1. stage  : source を新しい空の一時 volume へ完全コピー (本番の転送)。target には
+ *             一切触れないので、ここで失敗しても target の既存データは無傷。
+ * 2. verify : source に中身があるのに staged コピーが空なら中断 (中途半端な上書き防止)。
+ * 3. commit : ここで初めて target を消し、検証済みの一時 volume から埋め直す
+ *             (ローカル間コピーなので高速で、source 側の事情では失敗しない)。
+ * 4. cleanup: 一時 volume は finally で必ず削除する (best-effort)。
+ *
+ * Docker には volume rename が無いため真の O(1) swap は不可能。この設計は target が
+ * 空になる窓を「検証済みデータからのローカルコピー」だけに最小化し、ネットワーク /
+ * source 読み取りの失敗で target を空にすることは決してない。
+ */
+async function copyVolumeAtomicOverwrite(
+  sourceVolume: string,
+  targetVolume: string,
+  options: VolumeCopyOptions
+): Promise<void> {
+  const tmp = makeTempVolumeName(targetVolume)
+  // commit (target の clear+refill) が始まったか / 完了したか。commit が始まった後に
+  // 失敗した場合は target が空/中途半端で、検証済みの完全なコピーは tmp にしか無い。
+  // この時 tmp を消すと唯一の正データを失うため、cleanup では tmp を残して復旧手順を出す。
+  let commitStarted = false
+  let commitDone = false
+  try {
+    createVolume(tmp)
+    // 1. stage
+    await copyVolume(sourceVolume, tmp, { onProgress: options.onProgress })
+    // 2. verify — この gate だけが破壊的な commit を守る。サイズを確定できない
+    //    (getVolumeSize が null) 場合は「空かもしれない」を「空でない」と誤認して
+    //    target を消すことがないよう、確認できないなら必ず abort する。
+    const sourceSize = getVolumeSize(sourceVolume)
+    const stagedSize = getVolumeSize(tmp)
+    if (sourceSize === null || stagedSize === null) {
+      throw new Error(
+        `Cannot verify staged copy of '${sourceVolume}' (volume size probe failed) — aborting overwrite to protect '${targetVolume}'`
+      )
+    }
+    if (sourceSize > 0 && stagedSize === 0) {
+      throw new Error(
+        `Staged copy of '${sourceVolume}' is empty — aborting overwrite to protect '${targetVolume}'`
+      )
+    }
+    // 3. commit (target を消すのはここが初めて)
+    commitStarted = true
+    await copyVolumeWithCp(tmp, targetVolume, { clearTarget: true })
+    commitDone = true
+  } finally {
+    // 4. cleanup。commit 開始後に失敗した場合だけは tmp を残す (target が壊れていて
+    //    tmp が唯一の完全コピーのため)。それ以外 (staging/verify 失敗 = target 無傷、
+    //    または commit 成功) では tmp は不要なので削除する。
+    if (commitStarted && !commitDone) {
+      console.log(
+        `  ⚠️  Overwrite of '${targetVolume}' failed mid-commit — its data may be incomplete.`
+      )
+      console.log(
+        `      A verified full copy is preserved in temp volume '${tmp}'. Recover with:`
+      )
+      console.log(
+        `        docker run --rm -v ${tmp}:/from -v ${targetVolume}:/to alpine sh -c 'find /to -mindepth 1 -delete && cp -a /from/. /to/' && docker volume rm ${tmp}`
+      )
+    } else {
+      removeVolume(tmp)
+    }
   }
 }
 
