@@ -21,6 +21,7 @@ A CLI tool built on Git worktrees that gives every branch its own isolated worki
 - [Commands](#commands)
   - [`create`](#wtb-create-branch)
   - [`remove`](#wtb-remove-branch)
+  - [`reclone`](#wtb-reclone-branch)
   - [`ls` / `list`](#wtb-ls-alias-list)
   - [`ports`](#wtb-ports)
   - [`status`](#wtb-status)
@@ -194,6 +195,24 @@ Ordering: Docker teardown → `end_command` → `git worktree remove`. If `end_c
 wtb remove feature/old --no-docker          # Docker daemon already stopped
 wtb remove feature/abandoned -f --no-end    # force-remove, skip cleanup
 ```
+
+### `wtb reclone [branch]`
+
+Re-runs **only the volume-clone phase** for an existing worktree — useful when a clone previously failed or was skipped (empty/stale volumes) and you want to recover the data **without** removing and recreating the worktree (so uncommitted work is safe). Defaults to the current worktree; pass a branch to target another.
+
+| Option | Description |
+|--------|-------------|
+| `--force-volume-copy` | Clone even when the source container is running or the target already has data (overwrite is atomic) |
+| `--no-stop` | Don't auto-stop the source Compose stack; skip in-use volumes instead |
+| `--dry-run` | Print which volumes would be cloned; make no changes |
+
+```bash
+wtb reclone                       # current worktree
+wtb reclone feature/auth          # a specific worktree
+wtb reclone feature/auth --force-volume-copy   # overwrite stale target data
+```
+
+Prints the same `N cloned, N skipped, N failed` summary as `create`; a failure exits `0` with the loud `⚠️  … data is NOT fully isolated` line (resolve and re-run). Refuses to target the main repository worktree (source and target would be the same project). If `docker_compose_file` isn't configured, it's a no-op with a message. To re-*seed* instead of re-clone, run your `volumes.seed_command` inside the worktree.
 
 ### `wtb ls` (alias: `list`)
 
@@ -463,7 +482,7 @@ Script failures are **non-fatal** — wtb prints a warning and the worktree is l
 ```
 src/
 ├── cli/
-│   ├── commands/      create, remove, ls, ports, status, init-claude
+│   ├── commands/      create, remove, reclone, ls, ports, status, init-claude
 │   ├── utils/         worktree/ports renderers, command error wrapper, claude skill installer
 │   └── index.ts       commander wiring + global error handlers
 ├── core/

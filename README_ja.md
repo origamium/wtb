@@ -21,6 +21,7 @@ Git worktree をベースにした CLI ツールで、ブランチごとに独�
 - [コマンド](#コマンド)
   - [`create`](#wtb-create-branch)
   - [`remove`](#wtb-remove-branch)
+  - [`reclone`](#wtb-reclone-branch)
   - [`ls` / `list`](#wtb-ls-alias-list)
   - [`ports`](#wtb-ports)
   - [`status`](#wtb-status)
@@ -229,6 +230,24 @@ wtb remove feature/old-branch --no-docker
 # 強制削除、クリーンアップもスキップ
 wtb remove feature/abandoned -f --no-end
 ```
+
+### `wtb reclone [branch]`
+
+既存 worktree の **volume クローンフェーズだけ**を再実行します。クローンが失敗/skip された(volume が空/古い)ときに、worktree を作り直さずに(=未コミットの作業を失わずに)データを復旧できます。デフォルトは現在の worktree、branch 指定で別の worktree を対象にできます。
+
+| オプション | 説明 |
+|-----------|------|
+| `--force-volume-copy` | source 稼働中・target に既存データがあってもクローン(上書きは atomic) |
+| `--no-stop` | source Compose スタックを自動 stop せず、稼働中 volume を skip |
+| `--dry-run` | クローン対象をプレビューし、変更しない |
+
+```bash
+wtb reclone                       # 現在の worktree
+wtb reclone feature/auth          # 特定の worktree
+wtb reclone feature/auth --force-volume-copy   # 古い target データを上書き
+```
+
+`create` と同じ `N cloned, N skipped, N failed` サマリを出力します。failure があっても exit `0` で、`⚠️  … data is NOT fully isolated` を明示します(解消して再実行)。main リポジトリ worktree は対象にできません(source と target が同一 project になるため)。`docker_compose_file` 未設定なら no-op(メッセージのみ)。再クローンではなく再 seed したい場合は worktree 内で `volumes.seed_command` を実行してください。
 
 ### `wtb ls` (alias: `list`)
 
@@ -538,7 +557,7 @@ wtb create feature/clean-db --seed
 ```
 src/
 ├── cli/
-│   ├── commands/      create, remove, ls, ports, status, init-claude
+│   ├── commands/      create, remove, reclone, ls, ports, status, init-claude
 │   ├── utils/         worktree/ports レンダラ、共通エラーラッパー、Claude Skill インストーラ
 │   └── index.ts       commander の組み立て + グローバルエラーハンドラ
 ├── core/

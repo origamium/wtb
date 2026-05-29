@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`wtb reclone [branch]`** — re-run only the volume-clone phase on an existing
+  worktree to recover empty/failed/stale volumes, without removing and recreating
+  it (keeps uncommitted work). Reuses the create pipeline's volume logic; accepts
+  `--force-volume-copy` / `--no-stop` / `--dry-run`; refuses the main worktree;
+  same `N cloned/skipped/failed` summary and exit-0-on-failure contract.
 - **`wtb status --json`** — machine-readable status. Emits a single structured
   object (`{ worktrees, docker }`) on stdout, valid JSON even when Docker is down
   (`docker.available: false`). Completes the agent-friendly machine-readable trio

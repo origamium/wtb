@@ -29,8 +29,9 @@ Also activate when `wtb.yaml`, `.wtb.yaml`, `.wtb.yml`, or `.wtb/config.yaml` ex
 | "Show me everything (incl. Docker state)" | `wtb status -a` | Human-readable, includes containers/volumes |
 | "Make a worktree" | `wtb create <branch>` | Always preview with `--dry-run` first if config is unfamiliar |
 | "Remove a worktree" | `wtb remove <branch>` | **Destructive** — confirm with the user first |
+| "Its DB/volumes are empty or the clone failed" | `wtb reclone [branch]` | Re-runs just the volume-clone phase; recovers data without recreating the worktree |
 
-Read-only commands (`ls`, `ports`, `status`) are safe to run autonomously. Mutating commands (`create`, `remove`) require explicit user intent.
+Read-only commands (`ls`, `ports`, `status`) are safe to run autonomously. Mutating commands (`create`, `remove`, `reclone`) require explicit user intent.
 
 ## Discovering the current worktree's endpoints
 
@@ -116,7 +117,18 @@ After creation, the new worktree path is printed at the end. `cd` there, then re
 
 ### Recovering a skipped/empty volume clone
 
-There is **no standalone re-clone subcommand** — volume cloning only happens during `create`. Two distinct signals matter, and `create` keeps the worktree either way:
+Use **`wtb reclone [branch]`** to re-run *only* the volume-clone phase on an existing worktree — no need to remove and recreate it (so uncommitted work is safe). Defaults to the current worktree; pass a branch to target another. Accepts the same `--force-volume-copy` / `--no-stop` / `--dry-run` flags as `create`, and prints the same `N cloned, N skipped, N failed` summary (a failure still exits `0` with the loud not-ready line). This is the preferred recovery primitive for agents.
+
+```bash
+wtb reclone                      # re-clone volumes for the current worktree
+wtb reclone feature/auth         # ...for a specific worktree
+wtb reclone feature/auth --force-volume-copy   # overwrite stale target data (atomic)
+wtb reclone --dry-run            # preview which volumes would be cloned
+```
+
+(`reclone` refuses to target the main repository worktree, since source and target would be the same project. To *re-seed* instead of re-clone, just run the configured `volumes.seed_command` inside the worktree.)
+
+Two distinct signals matter, and `create`/`reclone` keep the worktree either way:
 
 - **Failure** — if a clone errors, the per-volume line is `❌ Failed to clone …`, the summary shows `… N failed`, and the final banner is **`⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`** (instead of the `🎉` success banner). Treat this as data-not-ready: surface it, don't proceed as if clean.
 - **Skip** — an intentional skip (`source volume … does not exist`, `is in use by …`, or `target … already has data`) means the volume was deliberately not copied; the worktree's DB volume is empty or stale.
@@ -124,8 +136,8 @@ There is **no standalone re-clone subcommand** — volume cloning only happens d
 To recover from either:
 
 - **Default runs no longer skip just because the source is running** — wtb stops/restarts it automatically. On a default run a skip means one of: `--no-stop` was used; the source stack couldn't be stopped (e.g. Docker daemon error — look for "Could not stop source stack"); the volume is *still* in use after stopping (a shared, explicitly-`name:`d volume held by another Compose project); the target already had data; or the source volume didn't exist yet. The exact reason is printed on the skip line.
-- If skipped due to `--no-stop` + a running source: `docker compose stop` the source stack, then re-run the clone by removing and recreating the worktree (`wtb remove <branch>` → `wtb create <branch>`), or copy the volume manually with `docker run --rm -v <src>:/from -v <dst>:/to alpine cp -a /from/. /to/`.
-- If skipped because the target already had data: pass `--force-volume-copy` on a recreate to overwrite.
+- If skipped due to `--no-stop` + a running source: `docker compose stop` the source stack, then `wtb reclone <branch>` (no `--no-stop`) to auto stop-then-copy. (Or copy manually: `docker run --rm -v <src>:/from -v <dst>:/to alpine cp -a /from/. /to/`.)
+- If skipped because the target already had data: `wtb reclone <branch> --force-volume-copy` to overwrite (atomic).
 - If a `--force-volume-copy` overwrite **fails mid-commit** (rare: e.g. disk full while replacing the target), wtb keeps the verified copy in a temp volume (`<target>__wtbtmp_*`) and prints an exact `docker run … && docker volume rm …` recovery command — run it to finish restoring the target. Don't delete that temp volume until the target is restored.
 - Confirm the data landed with `wtb status` (shows volumes) or `docker compose ps` in the worktree.
 

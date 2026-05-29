@@ -522,8 +522,9 @@ async function setupDockerCompose(
 
 /**
  * dry-run 時の volume clone プレビュー。実 Docker は触らない。
+ * `wtb reclone --dry-run` からも再利用する。
  */
-function previewVolumeCopy(gitRoot: string, config: WtbConfig): void {
+export function previewVolumeCopy(gitRoot: string, config: WtbConfig): void {
   if (!config.docker_compose_file) return
   const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
   if (!existsSync(sourceComposePath)) {

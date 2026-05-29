@@ -767,6 +767,56 @@ describe("Status Command - No Docker Project", () => {
 })
 
 // =============================================================================
+// RECLONE COMMAND
+// =============================================================================
+
+describe("Reclone Command", () => {
+  it("is listed in top-level help", () => {
+    const testRepo = createTestRepo("basic", "reclone-help")
+    try {
+      const result = testRepo.runCLI("--help")
+      expect(result.combined).toContain("reclone")
+    } finally {
+      testRepo.cleanup()
+    }
+  })
+
+  describe("No Docker project", () => {
+    let testRepo: TestRepo
+    beforeEach(() => {
+      testRepo = createTestRepo("no-docker", "reclone-no-docker")
+    })
+    afterEach(() => {
+      testRepo.cleanup()
+    })
+
+    it("reports nothing to clone when docker_compose_file is unset (exit 0)", () => {
+      testRepo.runCLI("create feature/x")
+      // run reclone targeting the created worktree by branch
+      const result = testRepo.runCLI("reclone feature/x")
+
+      expect(result.exitCode).toBe(0)
+      expect(result.combined).toContain("No docker_compose_file configured")
+    })
+
+    it("fails with exit 1 for an unknown branch", () => {
+      const result = testRepo.runCLI("reclone does/not/exist")
+
+      expect(result.exitCode).toBe(1)
+      expect(result.combined).toContain("No worktree found for branch")
+    })
+
+    it("refuses to reclone the main repository worktree", () => {
+      // run with no branch arg from the main repo root → resolves to main worktree
+      const result = testRepo.runCLI("reclone")
+
+      expect(result.exitCode).toBe(1)
+      expect(result.combined).toContain("main repository worktree")
+    })
+  })
+})
+
+// =============================================================================
 // FULL WORKFLOW TESTS
 // =============================================================================
 
