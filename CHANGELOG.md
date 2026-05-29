@@ -64,10 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   label, `reclone --force-volume-copy` atomic overwrite, `--seed`,
   `status --json`, `remove --remove-volumes` cleanup (verifying the clone target
   name aligns with Docker's own `down -v` project resolution — no silent
-  orphans), and the two safety guards (`--no-stop` skips an in-use source volume
-  without corruption or stopping the source; a populated target is skipped
-  without `--force`, preserving its data). 9 checks total. Skips cleanly when
-  Docker is absent, so it stays out of the mocked unit/e2e CI suites.
+  orphans), the safety guards (`--no-stop` skips an in-use source volume without
+  corruption or stopping the source; a populated target is skipped without
+  `--force`, preserving its data), and the escape hatch (`--force-volume-copy`
+  live-clones a running source without stopping it). 10 checks — the full
+  volume-clone decision matrix. Skips cleanly when Docker is absent, so it stays
+  out of the mocked unit/e2e CI suites.
 
 ### Fixed
 - **`remove --remove-volumes` silently ignored.** `--remove-volumes` only acts via

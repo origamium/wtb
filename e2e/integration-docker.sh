@@ -35,11 +35,11 @@ SEED_VOL="worktree-feat-seed_data"
 
 cleanup() {
   ( cd "$PROJ" 2>/dev/null && docker compose down >/dev/null 2>&1 ) || true
-  for b in feat-stop feat-x feat-seed feat-safe feat-pop; do
+  for b in feat-stop feat-x feat-seed feat-safe feat-pop feat-force; do
     git -C "$PROJ" worktree remove --force "$BASE/worktree-$b" 2>/dev/null || true
   done
-  for v in "$SRC_VOL" "$X_VOL" "$SEED_VOL" \
-           worktree-feat-stop_data worktree-feat-safe_data worktree-feat-pop_data; do
+  for v in "$SRC_VOL" "$X_VOL" "$SEED_VOL" worktree-feat-stop_data \
+           worktree-feat-safe_data worktree-feat-pop_data worktree-feat-force_data; do
     docker volume rm -f "$v" >/dev/null 2>&1 || true
   done
   rm -rf "$BASE"
@@ -100,6 +100,21 @@ if echo "$safe_out" | grep -q "is in use by" \
 else
   fail "--no-stop did not skip the in-use volume safely (running=$running_safe)"
 fi
+
+# 0b2) ESCAPE HATCH: --force-volume-copy live-clones a RUNNING source WITHOUT stopping it
+#      (confirms the opt-in unsafe path works and is distinct from stop-then-copy)
+docker run --rm -v "$SRC_VOL:/d" busybox sh -c 'echo SRC-LIVE > /d/marker.txt'
+force_out="$( cd "$PROJ" && node "$CLI" create feat/force --force-volume-copy 2>&1 )"
+running_force="$(docker compose -p srcproj ps --format '{{.State}}' 2>/dev/null | grep -c running || true)"
+if [ "$(vol_read worktree-feat-force_data)" = "SRC-LIVE" ] \
+   && [ "$running_force" -ge 1 ] \
+   && ! echo "$force_out" | grep -q "stopping it to clone"; then
+  pass "--force-volume-copy live-clones a running source without stopping it"
+else
+  fail "--force-volume-copy did not live-clone as expected (running=$running_force, data=$(vol_read worktree-feat-force_data))"
+fi
+git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-force" 2>/dev/null || true
+docker volume rm -f worktree-feat-force_data >/dev/null 2>&1 || true
 
 # tear the stack down so the remaining (--no-stop) checks run against a stopped source
 ( cd "$PROJ" && docker compose down >/dev/null 2>&1 )
