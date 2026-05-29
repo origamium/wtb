@@ -24,8 +24,20 @@ export function execSafeSync(file: string, args: string[], options?: SafeExecOpt
       ...(options?.env && { env: { ...process.env, ...options.env } }),
     }).trim()
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    throw new Error(`Command failed: ${file} ${args.join(" ")}\n${message}`)
+    const base = `Command failed: ${file} ${args.join(" ")}`
+    // execFileSync の throw には .stderr (コマンドの実エラー出力) が載る。これを優先して
+    // 単一の "Command failed: <cmd>\n<stderr>" にする。execFileSync の .message は既に
+    // "Command failed: <cmd>" を含むため、そのまま連結すると prefix が重複していた。
+    const e = error as { stderr?: Buffer | string }
+    const stderr = e.stderr ? e.stderr.toString().trim() : ""
+    let detail = stderr
+    if (!detail) {
+      // stderr が無い失敗 (例: docker/git 未インストールの spawn ENOENT) は message を
+      // 使う。ただし既に "Command failed:" で始まる場合は重複させない。
+      const msg = error instanceof Error ? error.message : String(error)
+      detail = msg.startsWith("Command failed:") ? "" : msg
+    }
+    throw new Error(detail ? `${base}\n${detail}` : base)
   }
 }
 
