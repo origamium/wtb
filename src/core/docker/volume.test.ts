@@ -235,6 +235,9 @@ describe("copyVolume atomic overwrite", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {})
+    // staging-failure tests deliberately fail rsync → copyVolume logs a
+    // "rsync copy failed, falling back to cp" warning. Silence it for clean output.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
     // default: rsync succeeds; source & temp both non-empty
     vi.mocked(spawn).mockImplementation(() => fakeRsyncProc(0) as never)
     vi.mocked(execDockerSafe).mockImplementation((args: string[]) => {
