@@ -607,6 +607,7 @@ npm run test                   # vitest watch
 npm run test:run               # vitest 1 回
 npm run test:unit              # ユニットテスト(src/)
 npm run test:e2e               # E2E(test-repos/ 配下に実 git repo を作る)
+npm run test:integration       # 実 Docker での volume クローン検証(Docker 無しなら skip)
 npm run test:ui                # vitest UI
 
 npm run typecheck              # tsc --noEmit

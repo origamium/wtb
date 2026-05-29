@@ -532,6 +532,7 @@ npm run test                   # vitest watch
 npm run test:run               # vitest once
 npm run test:unit              # unit tests (src/)
 npm run test:e2e               # e2e (creates real git repos under test-repos/)
+npm run test:integration       # real-Docker volume-clone checks (skips if Docker is absent)
 npm run test:ui                # vitest UI
 
 npm run typecheck              # tsc --noEmit

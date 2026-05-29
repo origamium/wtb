@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of a generic `1`, so scripts and agents can branch on a config mistake. Exit
   code `5` is documented as reserved (Docker degrades gracefully, never hard-fails).
 
+- Added `npm run test:integration` (`e2e/integration-docker.sh`) — a real-Docker
+  end-to-end check of volume-clone carryover, `reclone --force-volume-copy` atomic
+  overwrite, `--seed`, and `status --json`. Skips cleanly when Docker is absent, so
+  it stays out of the mocked unit/e2e CI suites.
+
 ### Fixed
 - **Docker Compose project-name precedence** in `resolveComposeProjectName`:
   `COMPOSE_PROJECT_NAME` now correctly beats the compose file's `name:` attribute

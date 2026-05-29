@@ -26,6 +26,7 @@
     "test:run": "vitest run",
     "test:unit": "vitest run src/",
     "test:e2e": "vitest run e2e/",
+    "test:integration": "bash e2e/integration-docker.sh",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build && npm run test:run"
   },
