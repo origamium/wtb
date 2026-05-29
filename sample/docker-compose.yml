@@ -1,10 +1,12 @@
-version: "3.8"
+# NOTE: no top-level `container_name:` on any service. wtb runs each worktree as
+# its own Compose project, and a fixed `container_name:` is GLOBAL — it would
+# collide across worktrees and break parallel `docker compose up`. Letting Compose
+# auto-name containers (<project>-<service>-N) keeps every worktree isolated.
 
 services:
   # PostgreSQL Database
   postgres:
     image: postgres:16-alpine
-    container_name: sample_postgres
     environment:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
@@ -27,7 +29,6 @@ services:
     build:
       context: ./next-app
       dockerfile: Dockerfile
-    container_name: sample_nextjs
     environment:
       NODE_ENV: ${NODE_ENV:-development}
       DATABASE_URL: postgres://${DB_USER:-postgres}:${DB_PASSWORD:-secret}@postgres:5432/${DB_NAME:-sample_db}
@@ -47,7 +48,6 @@ services:
   # Debian Development Container
   debian:
     image: debian:bookworm-slim
-    container_name: sample_debian
     command: tail -f /dev/null
     environment:
       APP_ENV: ${APP_ENV:-development}
