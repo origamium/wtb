@@ -61,9 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `npm run test:integration` (`e2e/integration-docker.sh`) — a real-Docker
   end-to-end check of the **auto stop-then-copy** path (a running source stack is
   stopped, cloned, and restarted), volume-clone carryover, the `wtb.managed=true`
-  label, `reclone --force-volume-copy` atomic overwrite, `--seed`, and
-  `status --json`. Skips cleanly when Docker is absent, so it stays out of the
-  mocked unit/e2e CI suites.
+  label, `reclone --force-volume-copy` atomic overwrite, `--seed`,
+  `status --json`, and `remove --remove-volumes` cleanup (verifying the clone
+  target name aligns with Docker's own `down -v` project resolution — no silent
+  orphans). Skips cleanly when Docker is absent, so it stays out of the mocked
+  unit/e2e CI suites.
 
 ### Fixed
 - **`remove --remove-volumes` silently ignored.** `--remove-volumes` only acts via

@@ -123,4 +123,11 @@ node -e '
 ' "$BASE/status.json" && pass "status --json emits valid JSON with live Docker state" \
   || fail "status --json output invalid"
 
+# 5) remove --remove-volumes actually deletes the cloned volume (lifecycle cleanup;
+#    confirms wtb's clone-target name aligns with Docker's `down -v` project resolution)
+( cd "$PROJ" && node "$CLI" remove feat/x --remove-volumes --force >/dev/null 2>&1 )
+[ "$(docker volume ls -q | grep -cx "$X_VOL")" = "0" ] \
+  && pass "remove --remove-volumes deletes the cloned volume (no silent orphan)" \
+  || fail "remove --remove-volumes left '$X_VOL' behind"
+
 echo "🎉 All real-Docker integration checks passed."
