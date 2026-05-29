@@ -6,54 +6,68 @@
 ```bash
 npm run typecheck
 ```
-- TypeScriptコンパイルエラーがないことを確認
-- 必須：エラーがあれば修正
+Must pass with zero errors.
 
-### 2. Code Quality
+### 2. Lint / Format
 ```bash
-npm run check
+npm run check     # biome check --write (auto-fix lint + format)
 ```
-- Biomeでリント・フォーマット自動修正
-- 警告がないことを確認
+Or just `npm run lint` to verify without writing.
 
-### 3. Build Verification
+### 3. Build
 ```bash
 npm run build
 ```
-- コンパイル成功を確認
-- dist/ディレクトリに出力されることを確認
+Must compile cleanly to `dist/`. `prepublishOnly` runs this anyway.
 
-### 4. Test Execution
+### 4. Tests
 ```bash
-npm run test:run
+npm run test:run    # full suite (unit + e2e); same as prepublishOnly
+# or split:
+npm run test:unit
+npm run test:e2e    # may flake on disk-IO race; rerun once if it does
 ```
-- 全テストがパスすることを確認
-- 新機能にはテストを追加
+Add unit tests for new pure logic. Add e2e cases for new commands/flags.
 
-### 5. Functional Testing
+### 5. Functional smoke test (when changing CLI behavior)
 ```bash
-# sampleディレクトリで動作確認
-cd sample
-../dist/index.js status
-../dist/index.js create test-branch
-../dist/index.js remove test-branch
+node dist/cli/index.js --help              # commands list
+node dist/cli/index.js <changed-cmd> --help  # verify new flags
+# end-to-end in /tmp scratch dir or sample/
 ```
 
-## 変更時の注意事項
+## Common modification patterns
 
-### 型定義を変更した場合 (src/types/index.ts)
-- 関連するテストファイルの更新を忘れずに
-- DEFAULT_CONFIG (constants/index.ts) の更新
-- loader.ts の mergeWithDefaults 関数の更新
-- validator.ts のバリデーション追加
+### Adding a new field to `WtbConfig`
 
-### コマンドを追加/変更した場合 (src/cli/commands/)
-- src/cli/index.ts でコマンド登録を確認
-- README.md のコマンド説明を更新
+Touch all 5 files (forgetting any of them silently breaks the feature — this happened with `volumes.exclude` and was caught by Codex/Copilot review):
 
-### 設定項目を追加した場合
-1. types/index.ts - WtbConfig に型追加
-2. constants/index.ts - DEFAULT_CONFIG にデフォルト値追加
-3. core/config/loader.ts - mergeWithDefaults 更新
-4. core/config/validator.ts - バリデーション追加
-5. テストファイルのモックデータ更新
+1. `src/types/index.ts` — interface field
+2. `src/constants/index.ts` — `DEFAULT_CONFIG.<field>`
+3. **`src/core/config/loader.ts` — extend `mergeWithDefaults` to carry the new field** ← easy to forget
+4. `src/core/config/validator.ts` — type/shape validation
+5. `src/core/config/loader.test.ts` — regression test that user value survives merge
+
+Then docs:
+
+- README.md (Configuration table + relevant section)
+- README_ja.md (parity)
+- `templates/claude/skills/wtb/SKILL.md` (Config quick reference table)
+- CHANGELOG.md (`Unreleased` section)
+
+### Adding a new CLI command
+
+1. `src/cli/commands/<name>.ts` — exports a `<name>Command(): Command` factory
+2. Register via `program.addCommand(<name>Command())` in `src/cli/index.ts`
+3. Use `withErrorHandling(...)` from `src/cli/utils/command-helpers.ts` for the `.action()` body, not a hand-rolled try/catch
+4. Use `getGitRootOrThrow()` from `src/core/git/repository.ts` if the command requires a git repo; do not call `isGitRepository` + `getGitRoot` separately
+5. JSON-mode commands: write the JSON body to `process.stdout.write(...)` and any informational logs to **stderr**, so `2>/dev/null` keeps pipes valid
+6. Unit-test pure renderers under `src/cli/utils/<command>-render.ts`; e2e-test via Commander's `parseAsync` with `vi.mock` of git/docker layers
+
+### Adding a new exec call
+
+Always go through `execGitSafe` / `execDockerSafe` / `execSafeSync` from `src/utils/exec.ts`. Do **not** use `execSync(...)` directly — exception is `executeLifecycleCommand` which is the single sanctioned `/bin/sh` exec for user-supplied lifecycle scripts.
+
+## Publishing
+
+`npm publish --access public` — `prepublishOnly` runs `clean && build && test:run` first. If publishing manually, ensure the working tree is clean and on the intended tag.
