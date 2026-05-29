@@ -185,6 +185,6 @@ Use `wtb status` for diagnosis when ports look wrong or services are missing —
 ## Conventions
 
 - All read-only commands (`ls`, `ports`, `status`) are safe to run without confirmation. `create` and `remove` mutate state — confirm first.
-- `wtb ports` and `wtb ls --json` produce **valid JSON on stdout even when Docker is unavailable**. Warnings and progress logs go to stderr, so `2>/dev/null` keeps pipes clean.
-- Exit codes: `0` success, `1` general error, `2` usage, `3` not-a-git-repo, `4` config error, `5` Docker error.
+- `wtb ports` and `wtb ls --json` produce **valid JSON on stdout even when Docker is unavailable**. For these JSON read-commands, warnings/progress go to stderr, so `2>/dev/null` keeps pipes clean. (`create`/`remove` print human-readable output — including the volume-clone banner and `❌`/`⚠️` lines — to **stdout**; don't `2>/dev/null` those expecting to hide them.)
+- Exit codes: `0` success, `1` general error, `2` usage, `3` not-a-git-repo, `4` config error, `5` Docker error. **Caveat:** `wtb create` exits `0` even when a volume clone *failed* (the worktree is still created). Do **not** gate data-readiness on `$?` alone — detect the `⚠️  Worktree created, but N volume(s) FAILED to clone` banner on stdout (see [Recovering a skipped/empty volume clone](#recovering-a-skippedempty-volume-clone)).
 - `wtb --help` and `wtb <command> --help` are always available for live reference.

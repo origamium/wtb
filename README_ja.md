@@ -502,6 +502,8 @@ volumes:
 
 その実行回だけスキップしたいときは `wtb create <branch> --no-volume-copy`、ソーススタックを止めずに稼働中 volume を skip したいときは `--no-stop`、稼働中ソースを止めずに強制ライブコピーしたい (dev のみ・データ破損リスクあり) ときは `--force-volume-copy`。
 
+volume ごとのサマリは `N cloned, N skipped, N failed` の形式で出力されます。いずれかの volume のクローンが **failed** になった場合、worktree 自体は作成されますが、最後のバナーが `🎉 Worktree created successfully!` から `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated` に変わり、不完全な状態が明示されます(なお終了コードは `0` のまま — worktree は存在するため)。*skip* は意図的(external/除外 volume、source 不在、`--no-stop` 下での稼働中、target に既存データ)、*failure* はコピー自体がエラーになったことを意味します。
+
 `wtb remove <branch>` はデフォルトでは clone した volume を削除しません(`docker compose down` のデフォルト挙動と整合)。`wtb remove <branch> --remove-volumes` で `docker compose down -v` 相当に切り替わり volume も削除されます。
 
 ## アーキテクチャ

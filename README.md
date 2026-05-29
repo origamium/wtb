@@ -416,6 +416,8 @@ volumes:
 
 Disable the whole phase per-invocation with `wtb create <branch> --no-volume-copy`. Keep the source stack running and skip in-use volumes with `--no-stop`. Force-clone running source volumes live (data-loss risk, dev only) with `--force-volume-copy`.
 
+The per-volume summary reports `N cloned, N skipped, N failed`. If any volume **fails** to clone, the worktree is still created but the final banner changes from `🎉 Worktree created successfully!` to `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`, so the incomplete state is obvious (note: the command still exits `0` — the worktree exists). A *skip* is intentional (external/excluded volume, missing source, in-use under `--no-stop`, or a target that already has data); a *failure* means the copy itself errored.
+
 `wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`).
 
 ## Lifecycle scripts
