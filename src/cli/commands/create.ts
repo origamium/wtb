@@ -750,14 +750,16 @@ export async function setupVolumeCopy(
 }
 
 /**
- * 他のworktreeの環境変数ファイルから既に使われているポート番号を収集する
- * （数値調整キーに対応するポートのみ収集）
+ * 既存の各 worktree (main/source を含む) の環境変数ファイルから、既に使われている
+ * ポート番号を収集する（数値調整キーに対応するポートのみ）。
+ *
+ * source(main) も必ず含めること: main の起動中サービスは自分のポートを占有している
+ * ため、新 worktree がそれらと**別キー間で**衝突しないよう避ける必要がある。例えば
+ * source が APP_PORT=3000 / DB_PORT=3001 のように隣接ポートを使う場合、source を除外
+ * すると新 worktree の APP が 3001 に bump して source の DB と衝突する。target だけ
+ * を除外する (まだポート未確定 / これから書き込むため)。
  */
-function collectWorktreeEnvPorts(
-  sourceRoot: string,
-  targetRoot: string,
-  config: WtbConfig
-): number[] {
+function collectWorktreeEnvPorts(targetRoot: string, config: WtbConfig): number[] {
   const adjustedKeys = new Set(
     Object.entries(config.env.adjust)
       .filter(([, v]) => typeof v === "number")
@@ -768,13 +770,14 @@ function collectWorktreeEnvPorts(
 
   const usedPorts: number[] = []
   const resolvedTarget = path.resolve(targetRoot)
-  const resolvedSource = path.resolve(sourceRoot)
 
   try {
     const worktrees = listWorktrees()
     for (const worktree of worktrees) {
       const resolvedPath = path.resolve(worktree.path)
-      if (resolvedPath === resolvedTarget || resolvedPath === resolvedSource) continue
+      // target だけ除外 (これから書き込むため)。source(main) を含む他の全 worktree の
+      // ポートは衝突回避の対象。
+      if (resolvedPath === resolvedTarget) continue
 
       for (const relativePath of config.env.file) {
         const envPath = path.resolve(worktree.path, relativePath)
@@ -809,8 +812,8 @@ async function applyEnvAdjustments(
   targetRoot: string,
   config: WtbConfig
 ): Promise<void> {
-  // 他のworktreeで使用中のポートを収集（衝突防止）
-  const usedPorts = collectWorktreeEnvPorts(sourceRoot, targetRoot, config)
+  // 他の全 worktree (main 含む) で使用中のポートを収集（衝突防止）
+  const usedPorts = collectWorktreeEnvPorts(targetRoot, config)
 
   for (const relativePath of config.env.file) {
     const sourcePath = path.resolve(sourceRoot, relativePath)

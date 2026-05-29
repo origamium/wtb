@@ -1165,6 +1165,43 @@ describe("Create Command - env.adjust", () => {
     expect(envContent).toContain("REDIS_PORT=6380")
   })
 
+  it("avoids colliding with the main worktree's other ports (adjacent-port config)", () => {
+    // Regression: when main uses adjacent ports (APP=3000, DB=3001), a new
+    // worktree's APP must NOT bump to 3001 and collide with main's running DB.
+    // The main/source worktree's ports must be in the collision-avoidance set.
+    testRepo.writeFile(
+      ".env",
+      ["APP_PORT=3000", "DB_PORT=3001", ""].join("\n")
+    )
+    testRepo.writeFile(
+      "wtb.yaml",
+      [
+        'base_branch: "main"',
+        "env:",
+        "  file: [./.env]",
+        "  adjust:",
+        "    APP_PORT: 1",
+        "    DB_PORT: 1",
+        "",
+      ].join("\n")
+    )
+
+    const result = testRepo.runCLI("create test/adjacent --no-docker --no-start")
+    expect(result.exitCode).toBe(0)
+
+    const envContent = fs.readFileSync(
+      path.join(testRepo.getWorktreePath("test/adjacent"), ".env"),
+      "utf-8"
+    )
+    const get = (k: string) => envContent.match(new RegExp(`^${k}=(\\d+)`, "m"))?.[1]
+    const app = Number(get("APP_PORT"))
+    const db = Number(get("DB_PORT"))
+    // new worktree's ports must avoid BOTH of main's ports (3000, 3001) and each other
+    expect([3000, 3001]).not.toContain(app)
+    expect([3000, 3001]).not.toContain(db)
+    expect(app).not.toBe(db)
+  })
+
   it("should copy env file even when adjust is empty", () => {
     // Create a project with env.file set but adjust empty via CLI
     // Use the basic project which has env.file: [] to verify no env copy

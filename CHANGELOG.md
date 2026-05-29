@@ -57,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it stays out of the mocked unit/e2e CI suites.
 
 ### Fixed
+- **Cross-worktree port collision with the main worktree.** `create`'s env-file
+  port adjustment scanned other worktrees for in-use ports but **excluded the
+  main/source worktree**, so with an adjacent-port config (e.g. main `APP_PORT=3000`,
+  `DB_PORT=3001`) a new worktree's `APP_PORT` could bump to 3001 and collide with
+  main's running DB. The main worktree's ports are now included in the
+  collision-avoidance set. (Configs with well-separated ports were unaffected.)
 - **Docker Compose project-name precedence** in `resolveComposeProjectName`:
   `COMPOSE_PROJECT_NAME` now correctly beats the compose file's `name:` attribute
   (matching Docker Compose v2). The previous inversion silently resolved the wrong
