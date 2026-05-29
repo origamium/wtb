@@ -35,10 +35,11 @@ SEED_VOL="worktree-feat-seed_data"
 
 cleanup() {
   ( cd "$PROJ" 2>/dev/null && docker compose down >/dev/null 2>&1 ) || true
-  git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-stop" 2>/dev/null || true
-  git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-x"    2>/dev/null || true
-  git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-seed" 2>/dev/null || true
-  for v in "$SRC_VOL" "$X_VOL" "$SEED_VOL" worktree-feat-stop_data; do
+  for b in feat-stop feat-x feat-seed feat-safe feat-pop; do
+    git -C "$PROJ" worktree remove --force "$BASE/worktree-$b" 2>/dev/null || true
+  done
+  for v in "$SRC_VOL" "$X_VOL" "$SEED_VOL" \
+           worktree-feat-stop_data worktree-feat-safe_data worktree-feat-pop_data; do
     docker volume rm -f "$v" >/dev/null 2>&1 || true
   done
   rm -rf "$BASE"
@@ -87,10 +88,35 @@ if echo "$stop_out" | grep -q "stopping it to clone" \
 else
   fail "stop-then-copy failed (running_after=$running_after, data=$(vol_read worktree-feat-stop_data))"
 fi
+
+# 0b) SAFETY: --no-stop against a RUNNING source must SKIP the in-use volume (no live-copy
+#     corruption) and must NOT stop the source. (stack still up from check 0)
+safe_out="$( cd "$PROJ" && node "$CLI" create feat/safe --no-stop 2>&1 )"
+running_safe="$(docker compose -p srcproj ps --format '{{.State}}' 2>/dev/null | grep -c running || true)"
+if echo "$safe_out" | grep -q "is in use by" \
+   && [ "$(docker volume ls -q | grep -cx worktree-feat-safe_data || true)" = "0" ] \
+   && [ "$running_safe" -ge 1 ]; then
+  pass "--no-stop skips an in-use source volume (corruption-safe; source left running)"
+else
+  fail "--no-stop did not skip the in-use volume safely (running=$running_safe)"
+fi
+
 # tear the stack down so the remaining (--no-stop) checks run against a stopped source
 ( cd "$PROJ" && docker compose down >/dev/null 2>&1 )
 git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-stop" 2>/dev/null || true
+git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-safe" 2>/dev/null || true
 docker volume rm -f worktree-feat-stop_data >/dev/null 2>&1 || true
+
+# 0c) SAFETY: a target volume that already has data is SKIPPED without --force (no data loss)
+docker volume create worktree-feat-pop_data >/dev/null
+docker run --rm -v worktree-feat-pop_data:/d busybox sh -c 'echo PREEXISTING > /d/marker.txt'
+pop_out="$( cd "$PROJ" && node "$CLI" create feat/pop --no-stop 2>&1 )"
+if echo "$pop_out" | grep -q "already has data" \
+   && [ "$(vol_read worktree-feat-pop_data)" = "PREEXISTING" ]; then
+  pass "populated target volume is skipped without --force (existing data preserved)"
+else
+  fail "populated target was not preserved (got '$(vol_read worktree-feat-pop_data)')"
+fi
 
 # 1) clone carries data over
 docker run --rm -v "$SRC_VOL:/d" busybox sh -c 'echo V1 > /d/marker.txt'
