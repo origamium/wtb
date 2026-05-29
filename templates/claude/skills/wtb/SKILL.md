@@ -109,6 +109,7 @@ Useful flags:
 - `--no-volume-copy` — skip the volume-clone phase entirely (start with empty volumes).
 - `--no-stop` — don't auto-stop the source Compose stack; skip in-use volumes with a warning instead (the pre-stop-then-copy behavior). Use only when momentarily stopping the source services is unacceptable.
 - `--force-volume-copy` — clone even when source containers are running or the target already has data (clones *live* without stopping — data-corruption risk; dev only). Overwriting an existing target is atomic (staged via a temp volume, verified, then swapped), so a failed overwrite never empties the target.
+- `--seed` — **seed instead of clone.** Skips the volume-clone phase and runs `volumes.seed_command` in the new worktree instead, so the worktree starts from a *freshly seeded* DB rather than a copy of main's. Never reads the source volume, so the source stack is left running (no stop/restart). Requires `volumes.seed_command` in `wtb.yaml` (else exits `4` before creating the worktree); mutually exclusive with `--force-volume-copy` (passing both exits `1`). If the seed command fails the worktree is still created but the banner is `⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready` (exit `0`) — same not-ready contract as a failed clone.
 
 After creation, the new worktree path is printed at the end. `cd` there, then re-run `wtb ports` to see the *new* worktree's adjusted ports.
 
@@ -174,6 +175,7 @@ Use `wtb status` for diagnosis when ports look wrong or services are missing —
 | `env.file` | Env files processed per worktree. |
 | `env.adjust` | Per-key transform: `number` = auto-bump to next free port, `string` = literal replace, `null` = remove. |
 | `volumes.exclude` | Compose volume keys to exclude from auto-cloning. Default `[]` (clone every named non-`external` volume). |
+| `volumes.seed_command` | Command run in the worktree when `create --seed` is used, *instead of* cloning volume data (fresh-seeded DB rather than a copy of main's). |
 
 ## Troubleshooting hints
 
@@ -187,5 +189,5 @@ Use `wtb status` for diagnosis when ports look wrong or services are missing —
 
 - All read-only commands (`ls`, `ports`, `status`) are safe to run without confirmation. `create` and `remove` mutate state — confirm first.
 - `wtb ports` and `wtb ls --json` produce **valid JSON on stdout even when Docker is unavailable**. For these JSON read-commands, warnings/progress go to stderr, so `2>/dev/null` keeps pipes clean. (`create`/`remove` print human-readable output — including the volume-clone banner and `❌`/`⚠️` lines — to **stdout**; don't `2>/dev/null` those expecting to hide them.)
-- Exit codes: `0` success, `1` general error, `2` usage, `3` not-a-git-repo, `4` config error (invalid/unparseable `wtb.yaml`). Code `5` (Docker error) is **reserved and not currently emitted** — Docker is optional and degrades gracefully, so Docker trouble either just warns (command still succeeds) or surfaces as `1`. **Caveat:** `wtb create` exits `0` even when a volume clone *failed* (the worktree is still created). Do **not** gate data-readiness on `$?` alone — detect the `⚠️  Worktree created, but N volume(s) FAILED to clone` banner on stdout (see [Recovering a skipped/empty volume clone](#recovering-a-skippedempty-volume-clone)).
+- Exit codes: `0` success, `1` general error, `2` usage, `3` not-a-git-repo, `4` config error (invalid/unparseable `wtb.yaml`). Code `5` (Docker error) is **reserved and not currently emitted** — Docker is optional and degrades gracefully, so Docker trouble either just warns (command still succeeds) or surfaces as `1`. **Caveat:** `wtb create` exits `0` even when a volume clone *failed* OR a `--seed` seed command *failed* (the worktree is still created). Do **not** gate data-readiness on `$?` alone — detect the `⚠️  Worktree created, but N volume(s) FAILED to clone` / `⚠️  Worktree created, but the seed command FAILED … data is NOT ready` banner on stdout (see [Recovering a skipped/empty volume clone](#recovering-a-skippedempty-volume-clone)).
 - `wtb --help` and `wtb <command> --help` are always available for live reference.

@@ -162,6 +162,7 @@ Creates a new worktree for `<branch>`, branching from `base_branch` unless the b
 | `--no-volume-copy` | Skip cloning Docker volumes from the source project |
 | `--force-volume-copy` | Clone volumes even when the source container is running or the target volume already has data |
 | `--no-stop` | Don't auto-stop the source Compose stack before cloning; skip in-use volumes instead (the old behavior) |
+| `--seed` | Seed the data instead of cloning: skip the volume-clone phase and run `volumes.seed_command` in the new worktree. Never touches the source volume, so the source stack is left running. Requires `volumes.seed_command` in the config; mutually exclusive with `--force-volume-copy`. See [Volume cloning](#volume-cloning) |
 | `--dry-run` | Print the plan, make no changes |
 
 Examples:
@@ -311,6 +312,7 @@ If nothing is found, wtb still runs with defaults (prints a warning to stderr). 
 | `env.file` | string[] | `["./.env"]` | Env files to copy into the worktree |
 | `env.adjust` | map | `{}` | Per-key adjustment (see [Environment variable adjustment](#environment-variable-adjustment)) |
 | `volumes.exclude` | string[] | `[]` | Compose volume keys to **exclude** from auto-cloning. Default: every named non-`external` volume in the Compose file is cloned. See [Volume cloning](#volume-cloning) |
+| `volumes.seed_command` | string | — | Command run in the new worktree (via `/bin/sh`) when `wtb create --seed` is used, **instead of** cloning volume data. Lets a worktree start from a freshly seeded DB rather than a copy of main's. See [Volume cloning](#volume-cloning) |
 
 ### Validation
 
@@ -419,6 +421,28 @@ Disable the whole phase per-invocation with `wtb create <branch> --no-volume-cop
 The per-volume summary reports `N cloned, N skipped, N failed`. If any volume **fails** to clone, the worktree is still created but the final banner changes from `🎉 Worktree created successfully!` to `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`, so the incomplete state is obvious (note: the command still exits `0` — the worktree exists). A *skip* is intentional (external/excluded volume, missing source, in-use under `--no-stop`, or a target that already has data); a *failure* means the copy itself errored.
 
 `wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`).
+
+### Seed instead of clone (`--seed`)
+
+Sometimes you don't want a copy of main's data — you want a **freshly seeded** database in the new worktree (a clean migration target, a deterministic test fixture, etc.). Configure a seed command and pass `--seed`:
+
+```yaml
+# wtb.yaml
+volumes:
+  seed_command: docker compose up -d db && npm run db:migrate && npm run db:seed
+```
+
+```bash
+wtb create feature/clean-db --seed
+```
+
+With `--seed`, wtb **skips the volume-clone phase entirely** and runs `volumes.seed_command` in the new worktree (via `/bin/sh`, `cwd` = worktree root, same path-or-shell resolution as `start_command`). Because nothing is ever read off a live source volume, this path **never stops the source stack** — your main services keep running untouched. This is the "data-autonomous by construction" path: the worktree's data is built fresh, not copied.
+
+Notes:
+
+- `--seed` requires `volumes.seed_command` to be set; otherwise `create` fails with exit `4` before creating the worktree.
+- `--seed` and `--force-volume-copy` are mutually exclusive (one seeds, the other clones) — passing both fails with exit `1`.
+- If the seed command fails, the worktree is still created but the banner becomes `⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready` (exit stays `0`, same contract as a failed clone). Re-run the seed inside the worktree after fixing it.
 
 ## Lifecycle scripts
 
@@ -624,10 +648,11 @@ Short for "worktree turbo" — git worktrees, but with the environment-wrangling
 
 Planned, **not yet implemented** — listed so the intended direction is on record.
 
-- **Seed instead of copy (opt-in).** A flag will let `create` run a seed step instead of cloning volume data — useful when you want a freshly seeded DB rather than a clone of main's. Because nothing is copied off a live volume, this path does *not* stop the stack.
+- _Nothing currently on the list — the previously-planned items have shipped (see below). Open an issue with what you'd like to see next._
 
 Recently shipped (was on this list):
 
+- **Seed instead of copy (opt-in).** ✅ `wtb create --seed` runs `volumes.seed_command` in the new worktree instead of cloning volume data — for a freshly seeded DB rather than a clone of main's. Because nothing is copied off a live volume, this path does *not* stop the source stack. See [Volume cloning → Seed instead of clone](#seed-instead-of-clone---seed).
 - **Stop-then-copy for DB integrity.** ✅ `create` now auto-stops the source Compose stack before cloning live volumes and restarts it afterward (crash-safe), so a running dev DB clones with no manual step. Opt out with `--no-stop`.
 
 ## Changelog

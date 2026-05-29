@@ -204,6 +204,105 @@ describe("Create Command - Basic Project", () => {
 })
 
 // =============================================================================
+// CREATE COMMAND - SEED INSTEAD OF CLONE (--seed)
+// =============================================================================
+
+describe("Create Command - Seed instead of clone (--seed)", () => {
+  let testRepo: TestRepo
+
+  beforeEach(() => {
+    // no-docker project: no docker_compose_file, so the data phase is purely seed.
+    testRepo = createTestRepo("no-docker", "seed")
+  })
+
+  afterEach(() => {
+    testRepo.cleanup()
+  })
+
+  it("runs volumes.seed_command instead of cloning when --seed is passed", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      [
+        'base_branch: "main"',
+        "copy_files: []",
+        "env:",
+        "  file: []",
+        "  adjust: {}",
+        "volumes:",
+        '  seed_command: "echo seeded > seeded.marker"',
+        "",
+      ].join("\n")
+    )
+
+    const result = testRepo.runCLI("create feature/seeded --seed")
+
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("Seeding data instead of cloning volumes")
+    expect(result.combined).toContain("Seed command completed successfully")
+    expect(result.combined).toContain("Worktree created successfully")
+    // The seed command wrote its marker into the new worktree (cwd = worktree root).
+    expect(testRepo.worktreeFileExists("feature/seeded", "seeded.marker")).toBe(true)
+  })
+
+  it("dry-run previews the seed command without running it", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      ['base_branch: "main"', "volumes:", '  seed_command: "echo seeded > seeded.marker"', ""].join(
+        "\n"
+      )
+    )
+
+    const result = testRepo.runCLI("create feature/seed-dry --seed --dry-run")
+
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("Would seed data instead of cloning volumes")
+    expect(testRepo.worktreeFileExists("feature/seed-dry", "seeded.marker")).toBe(false)
+  })
+
+  it("fails with exit 4 when --seed is used without volumes.seed_command", () => {
+    // no-docker project's default wtb.yaml has no volumes.seed_command
+    const result = testRepo.runCLI("create feature/no-seed --seed")
+
+    expect(result.exitCode).toBe(4)
+    expect(result.combined).toContain("--seed requires `volumes.seed_command`")
+    // worktree must NOT have been created (validation runs before worktree add)
+    expect(testRepo.worktreeFileExists("feature/no-seed", "")).toBe(false)
+  })
+
+  it("fails with exit 1 when --seed is combined with --force-volume-copy", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      ['base_branch: "main"', "volumes:", '  seed_command: "true"', ""].join("\n")
+    )
+
+    const result = testRepo.runCLI("create feature/seed-conflict --seed --force-volume-copy")
+
+    expect(result.exitCode).toBe(1)
+    expect(result.combined).toContain("mutually exclusive")
+  })
+
+  it("surfaces a NOT-ready banner (exit 0) when the seed command fails", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      ['base_branch: "main"', "volumes:", '  seed_command: "exit 7"', ""].join("\n")
+    )
+
+    const result = testRepo.runCLI("create feature/seed-fail --seed")
+
+    // worktree is still created (consistent with start_command / volume-clone contract)
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("Seed command failed")
+    expect(result.combined).toContain("data is NOT ready")
+    expect(existsSync(testRepo.getWorktreePath("feature/seed-fail"))).toBe(true)
+  })
+
+  it("lists --seed in create --help", () => {
+    const result = testRepo.runCLI("create --help")
+    expect(result.combined).toContain("--seed")
+  })
+})
+
+// =============================================================================
 // CREATE COMMAND - FULL-FEATURED PROJECT
 // =============================================================================
 

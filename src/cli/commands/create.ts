@@ -46,6 +46,7 @@ interface CreateOptions {
   volumeCopy?: boolean
   forceVolumeCopy?: boolean
   stop?: boolean
+  seed?: boolean
   dryRun?: boolean
 }
 
@@ -86,6 +87,10 @@ export function createCommand(): Command {
       "--no-stop",
       "Don't auto-stop the source Compose stack before cloning live volumes (skip in-use volumes instead)"
     )
+    .option(
+      "--seed",
+      "Seed the data instead of cloning volumes: skip the volume-clone phase and run `volumes.seed_command` in the new worktree (never touches the source volume, so the source stack is left running)"
+    )
     .option("--dry-run", "Show what would be done without making changes")
     .action(withErrorHandling(executeCreateCommand))
 }
@@ -120,6 +125,7 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
   const skipStart = options.start === false
   const skipVolumeCopy = options.volumeCopy === false
   const forceVolumeCopy = options.forceVolumeCopy === true
+  const useSeed = options.seed === true
   const dryRun = options.dryRun === true
 
   if (dryRun) {
@@ -150,6 +156,23 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
 
   // 設定ファイルを先に読み込み（base_branch を worktree 作成前に取得するため）
   const config = loadConfig(gitRoot)
+
+  // --seed の前提条件チェック (worktree を作る前に弾く)。
+  const seedCommand = config.volumes?.seed_command
+  if (useSeed) {
+    if (!seedCommand || seedCommand.trim() === "") {
+      throw new CLIError(
+        "--seed requires `volumes.seed_command` to be set in wtb.yaml (the command that seeds a fresh DB in the worktree)",
+        EXIT_CODES.CONFIG_ERROR
+      )
+    }
+    if (forceVolumeCopy) {
+      throw new CLIError(
+        "--seed and --force-volume-copy are mutually exclusive: --seed skips volume cloning entirely and seeds fresh data instead",
+        EXIT_CODES.GENERAL_ERROR
+      )
+    }
+  }
 
   // worktreeを作成（新規ブランチの場合は base_branch を使用）
   if (dryRun) {
@@ -228,10 +251,21 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
     }
   }
 
-  // Volume clone phase (named volumes from compose are auto-cloned to the new
-  // worktree's project so e.g. PostgreSQL data carries over).
+  // Data phase: either SEED (run a seed command, never touching the source volume)
+  // or CLONE (auto-copy named compose volumes so e.g. PostgreSQL data carries over).
+  // --seed replaces cloning entirely, so the source stack is never stopped.
   let volumeFailures = 0
-  if (config.docker_compose_file && !skipDocker) {
+  let seedFailed = false
+  if (useSeed) {
+    // seedCommand is guaranteed non-empty here (validated above).
+    console.log("")
+    if (dryRun) {
+      console.log(`🌱 Would seed data instead of cloning volumes: ${seedCommand}`)
+    } else {
+      console.log(`🌱 Seeding data instead of cloning volumes: ${seedCommand}`)
+      seedFailed = !(await executeSeedCommand(seedCommand as string, worktreePath))
+    }
+  } else if (config.docker_compose_file && !skipDocker) {
     console.log("")
     if (skipVolumeCopy) {
       console.log("⏭️  Skipping volume clone (--no-volume-copy)")
@@ -269,6 +303,12 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
       // loud and machine-parsable so an autonomous agent doesn't treat it as clean.
       console.log(
         `⚠️  Worktree created, but ${volumeFailures} volume(s) FAILED to clone — this worktree's data is NOT fully isolated. See the errors above; re-run the clone after resolving them.`
+      )
+    } else if (seedFailed) {
+      // Same contract as a volume-clone failure: worktree exists but its data is
+      // not ready. Keep the signal loud and machine-parsable for autonomous agents.
+      console.log(
+        "⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready. See the error above; re-run the seed in the worktree after resolving it."
       )
     } else {
       console.log("🎉 Worktree created successfully!")
@@ -405,6 +445,28 @@ async function executeStartCommand(command: string, worktreePath: string): Promi
   } catch (error) {
     console.log(`  ⚠️  Start command failed: ${getErrorMessage(error)}`)
     console.log("  (Worktree was created, but start command had issues)")
+  }
+}
+
+/**
+ * --seed 用の seed コマンドを worktree 内で実行する。
+ * start_command と同じく文字列をまず worktree 相対パスとして解決し、無ければ
+ * そのままシェルへ渡す。戻り値は成功なら true、失敗なら false (呼び出し側が
+ * 「データ未準備」のバナーを出すために使う)。
+ *
+ * @returns 実行に成功したか
+ */
+async function executeSeedCommand(command: string, worktreePath: string): Promise<boolean> {
+  try {
+    const commandPath = path.resolve(worktreePath, command)
+    const actualCommand = existsSync(commandPath) ? commandPath : command
+
+    executeLifecycleCommand(actualCommand, worktreePath)
+    console.log("  ✅ Seed command completed successfully")
+    return true
+  } catch (error) {
+    console.log(`  ❌ Seed command failed: ${getErrorMessage(error)}`)
+    return false
   }
 }
 

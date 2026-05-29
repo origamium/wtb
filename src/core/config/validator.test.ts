@@ -103,6 +103,32 @@ describe("Config Validator (Refactored)", () => {
       // docker_compose_file not found is now a warning, not an error
       expect(() => validateConfig(invalidConfig, configFile)).not.toThrow()
     })
+
+    it("should throw when volumes.seed_command is not a string", () => {
+      const invalidConfig = {
+        base_branch: "main",
+        docker_compose_file: "",
+        copy_files: [],
+        link_files: [],
+        env: { file: [], adjust: {} },
+        volumes: { exclude: [], seed_command: 123 as unknown as string },
+      } as WtbConfig
+      expect(() => validateConfig(invalidConfig, configFile)).toThrow(/seed_command must be a string/)
+    })
+
+    it("should accept a string volumes.seed_command", () => {
+      const validConfig = {
+        base_branch: "main",
+        docker_compose_file: "",
+        copy_files: [],
+        link_files: [],
+        env: { file: [], adjust: {} },
+        volumes: { exclude: [], seed_command: "npm run db:seed" },
+      } as WtbConfig
+      const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+      expect(() => validateConfig(validConfig, configFile)).not.toThrow()
+      stderrSpy.mockRestore()
+    })
   })
 
   describe("validateEnvVarName", () => {

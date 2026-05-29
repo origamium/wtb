@@ -128,6 +128,29 @@ env:
       expect(config.volumes?.exclude).toEqual(["cache_data", "tmp_data"])
     })
 
+    it("preserves volumes.seed_command through mergeWithDefaults", () => {
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue("…")
+      vi.mocked(parse).mockReturnValue({
+        base_branch: "main",
+        volumes: { exclude: [], seed_command: "npm run db:seed" },
+      })
+
+      const config = loadConfig(testRepoPath)
+
+      expect(config.volumes?.seed_command).toBe("npm run db:seed")
+    })
+
+    it("leaves volumes.seed_command undefined when not configured", () => {
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue("base_branch: main")
+      vi.mocked(parse).mockReturnValue({ base_branch: "main" })
+
+      const config = loadConfig(testRepoPath)
+
+      expect(config.volumes?.seed_command).toBeUndefined()
+    })
+
     it("throws a CLIError with exit code 4 (CONFIG_ERROR) on invalid config", async () => {
       const { CLIError } = await import("../../utils/error.js")
       const { EXIT_CODES } = await import("../../constants/index.js")

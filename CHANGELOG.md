@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`wtb create --seed`** — seed instead of clone. Skips the volume-clone phase
+  and runs the new `volumes.seed_command` config key in the worktree, so a
+  worktree can start from a freshly seeded DB rather than a copy of main's.
+  Never reads the source volume, so the source stack is left running. Requires
+  `volumes.seed_command` (else exits `4`); mutually exclusive with
+  `--force-volume-copy` (else exits `1`). A failed seed surfaces a loud
+  data-NOT-ready banner (exit stays `0`, same contract as a failed clone).
+  Completes the last "Seed instead of copy" roadmap item.
 - **Docker volume auto-cloning** in `wtb create`: every named (non-`external`)
   Docker volume declared in `docker_compose_file` is now copied from the source
   project to the new worktree's project, so e.g. PostgreSQL data carries over
@@ -30,6 +38,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `process.exit` directly, matching the other commands.
 - `package.json#prepublishOnly` now runs the test suite in addition to clean+build,
   preventing publishes with a red test status.
+- Invalid/unparseable `wtb.yaml` now exits with code `4` (`CONFIG_ERROR`) instead
+  of a generic `1`, so scripts and agents can branch on a config mistake. Exit
+  code `5` is documented as reserved (Docker degrades gracefully, never hard-fails).
+
+### Fixed
+- **Docker Compose project-name precedence** in `resolveComposeProjectName`:
+  `COMPOSE_PROJECT_NAME` now correctly beats the compose file's `name:` attribute
+  (matching Docker Compose v2). The previous inversion silently resolved the wrong
+  project when both were set, making volume cloning skip with a misleading
+  "source volume does not exist".
+- **SIGTERM safety for stop-then-copy**: a `kill` (not just Ctrl-C/SIGINT) during a
+  volume clone now restarts the stopped source Compose stack before exiting.
+- rsync copy failures now include the captured rsync stderr in the thrown error
+  instead of an opaque "exit code N".
+- The rsync→`cp` fallback now starts from a clean target, discarding any partial
+  tree a failed rsync left behind.
 
 ## [1.0.1] – 2026-05-03
 

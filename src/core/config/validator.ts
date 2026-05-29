@@ -204,6 +204,16 @@ export function validateConfig(config: WtbConfig, configFile: string): void {
           })
         }
       }
+      if (
+        config.volumes.seed_command !== undefined &&
+        typeof config.volumes.seed_command !== "string"
+      ) {
+        errors.push({
+          message: "volumes.seed_command must be a string",
+          field: "volumes.seed_command",
+          severity: "error",
+        })
+      }
     }
   }
 

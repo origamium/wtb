@@ -66,6 +66,10 @@ export function mergeWithDefaults(partial: Partial<WtbConfig>): WtbConfig {
     },
     volumes: {
       exclude: partial.volumes?.exclude ?? [...DEFAULT_CONFIG.volumes.exclude],
+      // seed_command はデフォルト無し。設定されていれば保持する (--seed 用)。
+      ...(partial.volumes?.seed_command !== undefined
+        ? { seed_command: partial.volumes.seed_command }
+        : {}),
     },
   }
 }

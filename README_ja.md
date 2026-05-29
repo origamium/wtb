@@ -173,6 +173,7 @@ wtb create bugfix/urgent-fix
 | `--no-volume-copy` | Docker volume の自動クローンをスキップ |
 | `--force-volume-copy` | 稼働中コンテナや既存 target volume があってもクローンを試行（dev のみ・データ破損リスクあり） |
 | `--no-stop` | クローン前にソース Compose スタックを自動 stop せず、稼働中 volume を skip する（旧挙動） |
+| `--seed` | クローンの代わりに seed する: volume クローンフェーズをスキップし、新 worktree 内で `volumes.seed_command` を実行する。ソース volume に一切触れないためソーススタックは止めない。`volumes.seed_command` の設定が必須で、`--force-volume-copy` とは排他。詳細は [Volume の自動クローン](#volume-の自動クローン) |
 | `--dry-run` | 実際の変更を行わず、実行内容をプレビュー |
 
 **使用例:**
@@ -466,6 +467,7 @@ env:
 | `env.file` | string[] | `["./.env"]` | 処理する環境変数ファイルのリスト |
 | `env.adjust` | object | `{}` | 調整設定（数値: 空きポート検索, 文字列: 置換, null: 削除） |
 | `volumes.exclude` | string[] | `[]` | 自動クローンから**除外**する compose volume key 一覧。デフォルトでは Compose の named non-`external` volume をすべて自動クローンする |
+| `volumes.seed_command` | string | — | `wtb create --seed` 指定時に、volume データのクローンの**代わりに**新 worktree 内(`/bin/sh`)で実行するコマンド。main のクローンではなく新規 seed された DB から worktree を始められる。詳細は [Volume の自動クローン](#volume-の自動クローン) |
 
 ### バリデーション
 
@@ -505,6 +507,28 @@ volumes:
 volume ごとのサマリは `N cloned, N skipped, N failed` の形式で出力されます。いずれかの volume のクローンが **failed** になった場合、worktree 自体は作成されますが、最後のバナーが `🎉 Worktree created successfully!` から `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated` に変わり、不完全な状態が明示されます(なお終了コードは `0` のまま — worktree は存在するため)。*skip* は意図的(external/除外 volume、source 不在、`--no-stop` 下での稼働中、target に既存データ)、*failure* はコピー自体がエラーになったことを意味します。
 
 `wtb remove <branch>` はデフォルトでは clone した volume を削除しません(`docker compose down` のデフォルト挙動と整合)。`wtb remove <branch> --remove-volumes` で `docker compose down -v` 相当に切り替わり volume も削除されます。
+
+### クローンの代わりに seed する(`--seed`)
+
+main のデータのコピーではなく、新 worktree に**新規 seed された**データベースが欲しいことがあります(クリーンなマイグレーション先、決定的なテストフィクスチャなど)。seed コマンドを設定して `--seed` を渡します:
+
+```yaml
+# wtb.yaml
+volumes:
+  seed_command: docker compose up -d db && npm run db:migrate && npm run db:seed
+```
+
+```bash
+wtb create feature/clean-db --seed
+```
+
+`--seed` を付けると wtb は **volume クローンフェーズを完全にスキップ**し、新 worktree 内で `volumes.seed_command` を実行します(`/bin/sh`・`cwd` は worktree ルート・`start_command` と同じパス/シェル解決)。ライブのソース volume から一切読み取らないため、この経路は**ソーススタックを止めません** — メインのサービスは稼働したままです。データを「コピー」ではなく「新規構築」する、構造的にデータ自律な経路です。
+
+注意:
+
+- `--seed` は `volumes.seed_command` の設定が必須です。未設定なら worktree を作る前に exit `4` で失敗します。
+- `--seed` と `--force-volume-copy` は排他です(片方は seed、もう片方は clone)。両方渡すと exit `1` で失敗します。
+- seed コマンドが失敗した場合、worktree 自体は作成されますがバナーが `⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready` に変わります(終了コードは `0` のまま — 失敗クローンと同じ契約)。修正後に worktree 内で seed を再実行してください。
 
 ## アーキテクチャ
 
@@ -698,10 +722,11 @@ wtb は内部で `git worktree add` を使い、その上に git 単体ではカ
 
 以下は **今後の予定であり、まだ実装されていません**。意図する方向性を記録するために記載しています。
 
-- **コピーの代わりに seed(オプション)。** オプションにより、`create` 時に volume データのクローンではなく seed を走らせられるようにします。main のクローンではなく、新規に seed した DB が欲しいときに便利です。稼働中 volume からのコピーが発生しないため、この経路では stop しません。
+- _現在リストにある項目はありません — 予定していた項目はすべて実装済みです(下記参照)。次に欲しい機能があれば issue を立ててください。_
 
 最近実装済み(このリストにあった項目):
 
+- **コピーの代わりに seed(オプション)。** ✅ `wtb create --seed` は volume データのクローンではなく、新 worktree 内で `volumes.seed_command` を実行します。main のクローンではなく新規に seed した DB が欲しいときに。稼働中 volume からのコピーが発生しないため、この経路では stop しません。詳細は [Volume の自動クローン → クローンの代わりに seed する](#クローンの代わりに-seed-する--seed)。
 - **DB の完全性のための stop-then-copy。** ✅ `create` は稼働中のソース Compose スタックを自動で stop してから volume をクローンし、その後 restart します(クラッシュセーフ)。稼働中のライブ DB も手動操作ゼロでクローンできます。`--no-stop` で従来挙動にできます。
 
 ## Changelog
