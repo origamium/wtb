@@ -7,6 +7,16 @@ description: Use this skill when working in a repository that contains a wtb.yam
 
 wtb gives every git branch its own isolated working directory with remapped ports and copied `.env` files. Each worktree's concrete port numbers are only discoverable at runtime — that is what this skill is for.
 
+## Operating model (how to think about worktrees)
+
+This is the mental model that makes autonomous work in a worktree safe — internalize it before acting:
+
+- **Each worktree is a fully self-contained mini-environment for one branch:** its own working dir (sharing the same `.git`), its own collision-free ports, its own copied `.env`, and its own **cloned copy of the DB/Docker-volume data** (or a freshly seeded DB with `--seed`). It is independent of every other worktree.
+- **You can build, run, migrate, and mutate data freely inside it** without affecting `main` or any sibling worktree — the data is a full copy (or fresh seed), not shared. This is the point: parallel, DB-touching changes run in true isolation.
+- **Conflicts between worktrees are expected and fine.** wtb deliberately does not resolve them; don't try to reconcile sibling worktrees.
+- **Scope:** wtb covers Docker Compose stacks only. No coding-agent orchestration is built in.
+- **When you (an agent) are working inside a worktree, treat the task as done once you've finished it** — the recommended pattern is to run all the way to opening a pull request. If more work is needed afterward, a human picks it up; don't spin up or manage other worktrees unless asked.
+
 ## When to use
 
 Activate this skill when the user says or implies any of:
