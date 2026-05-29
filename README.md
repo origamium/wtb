@@ -265,6 +265,7 @@ Richer inspection: worktrees + Docker Compose services + running containers + vo
 |--------|-------------|
 | `-a, --all` | Show all worktrees (default: current branch only) |
 | `--docker-only` | Suppress worktree section, show only Docker info |
+| `--json` | Machine-readable JSON (worktrees + Docker state) on stdout — for scripts/agents |
 
 ```
 📁 Git Worktrees Status
@@ -274,6 +275,13 @@ Richer inspection: worktrees + Docker Compose services + running containers + vo
    🐳 Docker: docker-compose.yml
    📦 Services: 3
    🔧 Environment: .env, .env.local
+```
+
+`--json` returns one structured object (`{ worktrees: [...], docker: {...} }`) and stays valid JSON even when Docker is down (`docker.available: false`). This completes the machine-readable trio with `wtb ls --json` and `wtb ports`.
+
+```bash
+wtb status --json | jq '.docker.containers[] | select(.isWtb) | .name'   # this project's containers
+wtb status -a --json | jq '.worktrees[] | {branch, services: .compose.services}'
 ```
 
 ### `wtb init-claude`

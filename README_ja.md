@@ -302,6 +302,9 @@ wtb status
 |-----------|------|
 | `-a, --all` | 現在のブランチだけでなく、全てのworktreeを表示 |
 | `--docker-only` | Docker関連の情報のみ表示 |
+| `--json` | 機械可読な JSON(worktree + Docker 状態)を stdout に出力 — スクリプト / agent 向け |
+
+`--json` は 1 つの構造化オブジェクト(`{ worktrees: [...], docker: {...} }`)を返し、Docker が止まっていても valid JSON のまま(`docker.available: false`)です。`wtb ls --json` / `wtb ports` と合わせて機械可読の三点セットを構成します。
 
 出力例:
 ```

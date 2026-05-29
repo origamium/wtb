@@ -158,9 +158,30 @@ Ordering is: Docker teardown → `end_command` → `git worktree remove`. Settin
 wtb status              # current branch + Docker state (human-readable)
 wtb status -a           # all worktrees
 wtb status --docker-only # skip the worktree section
+wtb status --json       # machine-readable JSON (worktrees + Docker state) — prefer this for agents
+wtb status -a --json    # all worktrees, JSON
 ```
 
-Use `wtb status` for diagnosis when ports look wrong or services are missing — it shells out to `docker ps` and `docker volume ls` to show what is actually running. There is no JSON mode; for scripting use `wtb ls --json` and `wtb ports --all`.
+Use `wtb status` for diagnosis when ports look wrong or services are missing — it shells out to `docker ps` and `docker volume ls` to show what is actually running. **For autonomous inspection, prefer `wtb status --json`** — it returns one structured object on stdout (valid JSON even when Docker is down):
+
+```json
+{
+  "worktrees": [
+    { "branch": "feature/auth", "path": "…", "isMain": false, "isCurrent": true,
+      "compose": { "file": "docker-compose.yml", "services": 3 },
+      "envFiles": [".env", ".env.local"] }
+  ],
+  "docker": {
+    "configured": true, "available": true,
+    "version": "Docker version 25.0", "composeVersion": "2.24.0",
+    "containers": [ { "name": "…", "image": "…", "status": "Up 3m", "ports": ["0.0.0.0:5433->5432/tcp"], "isWtb": true } ],
+    "volumes": { "total": 7, "wtb": [ { "name": "proj_pg", "driver": "local" } ] }
+  }
+}
+```
+
+- `docker.available` is `false` (not an error) when the daemon is down or Docker isn't installed; `docker.configured` reflects whether `docker_compose_file` is set. Check `available` before trusting `containers`/`volumes`.
+- This completes the machine-readable trio: `wtb ls --json` (worktrees), `wtb ports` (ports/endpoints, JSON by default), `wtb status --json` (live Docker state).
 
 ## Config quick reference
 
@@ -202,6 +223,6 @@ Because `.claude/skills/` is a regular tracked directory, every worktree created
 ## Conventions
 
 - All read-only commands (`ls`, `ports`, `status`) are safe to run without confirmation. `create` and `remove` mutate state — confirm first.
-- `wtb ports` and `wtb ls --json` produce **valid JSON on stdout even when Docker is unavailable**. For these JSON read-commands, warnings/progress go to stderr, so `2>/dev/null` keeps pipes clean. (`create`/`remove` print human-readable output — including the volume-clone banner and `❌`/`⚠️` lines — to **stdout**; don't `2>/dev/null` those expecting to hide them.)
+- `wtb ports`, `wtb ls --json`, and `wtb status --json` produce **valid JSON on stdout even when Docker is unavailable**. For these JSON read-commands, warnings/progress go to stderr, so `2>/dev/null` keeps pipes clean. (`create`/`remove` print human-readable output — including the volume-clone banner and `❌`/`⚠️` lines — to **stdout**; don't `2>/dev/null` those expecting to hide them.)
 - Exit codes: `0` success, `1` general error, `2` usage, `3` not-a-git-repo, `4` config error (invalid/unparseable `wtb.yaml`). Code `5` (Docker error) is **reserved and not currently emitted** — Docker is optional and degrades gracefully, so Docker trouble either just warns (command still succeeds) or surfaces as `1`. **Caveat:** `wtb create` exits `0` even when a volume clone *failed* OR a `--seed` seed command *failed* (the worktree is still created). Do **not** gate data-readiness on `$?` alone — detect the `⚠️  Worktree created, but N volume(s) FAILED to clone` / `⚠️  Worktree created, but the seed command FAILED … data is NOT ready` banner on stdout (see [Recovering a skipped/empty volume clone](#recovering-a-skippedempty-volume-clone)).
 - `wtb --help` and `wtb <command> --help` are always available for live reference.

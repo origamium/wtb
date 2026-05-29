@@ -22,6 +22,37 @@ import { listWorktrees } from "../../core/git/worktree.js"
 import type { CommandOptions } from "../../types/index.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
 
+/** `wtb status --json` の 1 worktree 分の形 */
+interface WorktreeStatusJson {
+  branch: string
+  path: string
+  isMain: boolean
+  isCurrent: boolean
+  compose: { file: string | null; services: number | null }
+  envFiles: string[]
+}
+
+/** `wtb status --json` の全体の形 */
+interface StatusJson {
+  worktrees: WorktreeStatusJson[]
+  docker: {
+    /** docker_compose_file が設定されているか */
+    configured: boolean
+    /** Docker daemon に到達できたか */
+    available: boolean
+    version: string | null
+    composeVersion: string | null
+    containers: Array<{
+      name: string
+      image: string
+      status: string
+      ports: string[]
+      isWtb: boolean
+    }>
+    volumes: { total: number; wtb: Array<{ name: string; driver: string }> }
+  }
+}
+
 /**
  * statusコマンドを作成
  *
@@ -38,6 +69,7 @@ export function statusCommand(): Command {
     .description("Show status of worktrees and their Docker environments")
     .option("-a, --all", "Show all worktrees, not just current")
     .option("--docker-only", "Show only Docker-related information")
+    .option("--json", "Output machine-readable JSON (worktrees + Docker state) on stdout")
     .action(withErrorHandling(executeStatusCommand))
 }
 
@@ -65,6 +97,14 @@ async function executeStatusCommand(options: CommandOptions): Promise<void> {
     // Config load error: treat Docker as unconfigured
   }
 
+  // JSON モード: 人間向け出力の代わりに 1 つの機械可読オブジェクトを stdout へ。
+  // ls --json / ports と揃え、coding agent が Docker 状態まで構造化して読めるようにする。
+  if (options.json) {
+    const payload = buildStatusJson(!!options.all, !!options.dockerOnly, dockerComposeFile)
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`)
+    return
+  }
+
   // Worktree 状態表示（--docker-only でない場合）
   if (!options.dockerOnly) {
     await showWorktreeStatus(!!options.all)
@@ -72,6 +112,99 @@ async function executeStatusCommand(options: CommandOptions): Promise<void> {
 
   // Docker 状態表示
   await showDockerStatus(dockerComposeFile)
+}
+
+/**
+ * `--json` 用の状態オブジェクトを組み立てる。Docker が無い/止まっていても
+ * 例外を投げず、`docker.available=false` で表現する (stdout は常に valid JSON)。
+ */
+function buildStatusJson(
+  showAll: boolean,
+  dockerOnly: boolean,
+  dockerComposeFile: string
+): StatusJson {
+  const worktreesJson: WorktreeStatusJson[] = []
+
+  if (!dockerOnly) {
+    const worktrees = listWorktrees()
+    const currentBranch = getCurrentBranch()
+    const gitRoot = getGitRoot()
+    const filtered = showAll
+      ? worktrees
+      : worktrees.filter((wt) => wt.branch === currentBranch)
+
+    for (const wt of filtered) {
+      const composeFilePath = findComposeFile(wt.path)
+      let serviceCount: number | null = null
+      if (composeFilePath) {
+        try {
+          serviceCount = Object.keys(readComposeFile(composeFilePath).services ?? {}).length
+        } catch {
+          serviceCount = null
+        }
+      }
+      const envFiles = ENV_FILE_NAMES.filter((name) => existsSync(path.join(wt.path, name)))
+      worktreesJson.push({
+        branch: wt.branch,
+        path: wt.path,
+        isMain: wt.path === gitRoot,
+        isCurrent: wt.branch === currentBranch,
+        compose: {
+          file: composeFilePath ? path.basename(composeFilePath) : null,
+          services: serviceCount,
+        },
+        envFiles,
+      })
+    }
+  }
+
+  const docker: StatusJson["docker"] = {
+    configured: !!dockerComposeFile,
+    available: false,
+    version: null,
+    composeVersion: null,
+    containers: [],
+    volumes: { total: 0, wtb: [] },
+  }
+
+  if (dockerComposeFile) {
+    try {
+      const info = getDockerInfo()
+      docker.available = info.isAvailable === true
+      docker.version = info.dockerVersion ?? null
+      docker.composeVersion = info.composeVersion ?? null
+    } catch {
+      docker.available = false
+    }
+
+    if (docker.available) {
+      try {
+        docker.containers = getRunningContainers().map((c) => ({
+          name: c.name,
+          image: c.image,
+          status: c.status,
+          ports: c.ports,
+          isWtb: isWtbContainer(c),
+        }))
+      } catch {
+        // leave containers empty on docker error
+      }
+      try {
+        const volumes = getDockerVolumes()
+        const wtbVolumes = volumes.filter(
+          (v) => v.name.includes("wtb") || v.name.includes("worktree")
+        )
+        docker.volumes = {
+          total: volumes.length,
+          wtb: wtbVolumes.map((v) => ({ name: v.name, driver: v.driver })),
+        }
+      } catch {
+        // leave volumes at defaults on docker error
+      }
+    }
+  }
+
+  return { worktrees: worktreesJson, docker }
 }
 
 /**

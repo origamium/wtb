@@ -251,6 +251,8 @@ export interface CommandOptions {
   all?: boolean
   /** Docker情報のみ表示するフラグ */
   dockerOnly?: boolean
+  /** 機械可読な JSON で出力するフラグ */
+  json?: boolean
 }
 
 /**

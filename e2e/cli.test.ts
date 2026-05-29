@@ -690,6 +690,31 @@ describe("Status Command", () => {
     })
   })
 
+  describe("--json flag", () => {
+    it("emits valid JSON with worktrees + docker keys on stdout", () => {
+      const result = testRepo.runCLI("status --json")
+
+      expect(result.exitCode).toBe(0)
+      // stdout must be parseable JSON on its own (warnings go to stderr)
+      const payload = JSON.parse(result.stdout)
+      expect(payload).toHaveProperty("worktrees")
+      expect(payload).toHaveProperty("docker")
+      expect(Array.isArray(payload.worktrees)).toBe(true)
+      // full-featured project configures docker_compose_file
+      expect(payload.docker.configured).toBe(true)
+      // human-readable banners must be absent in JSON mode
+      expect(result.combined).not.toContain("📁 Git Worktrees Status")
+    })
+
+    it("--docker-only --json yields an empty worktrees array", () => {
+      const result = testRepo.runCLI("status --docker-only --json")
+
+      expect(result.exitCode).toBe(0)
+      const payload = JSON.parse(result.stdout)
+      expect(payload.worktrees).toEqual([])
+    })
+  })
+
   describe("Environment file detection", () => {
     it("should detect and show environment files", () => {
       const result = testRepo.runCLI("status")

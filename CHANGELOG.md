@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`wtb status --json`** — machine-readable status. Emits a single structured
+  object (`{ worktrees, docker }`) on stdout, valid JSON even when Docker is down
+  (`docker.available: false`). Completes the agent-friendly machine-readable trio
+  alongside `wtb ls --json` and `wtb ports`. Respects `--all` / `--docker-only`.
 - **`wtb create --seed`** — seed instead of clone. Skips the volume-clone phase
   and runs the new `volumes.seed_command` config key in the worktree, so a
   worktree can start from a freshly seeded DB rather than a copy of main's.
