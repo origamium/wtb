@@ -187,7 +187,7 @@ Removes the worktree that owns `<branch>`. Guards against removing the main repo
 | `-f, --force` | Pass `--force` to `git worktree remove` (uncommitted changes) |
 | `--no-docker` | Skip `docker compose down` in the worktree |
 | `--no-end` | Skip `end_command` |
-| `--remove-volumes` | Also delete this worktree's Docker volumes (`docker compose down -v`) |
+| `--remove-volumes` | Also delete this worktree's Docker volumes (`docker compose down -v`). Has **no effect** (wtb warns) when teardown is skipped — i.e. with `--no-docker` or when `end_command` is set (your `end_command` must drop the volumes itself) |
 
 Ordering: Docker teardown → `end_command` → `git worktree remove`. If `end_command` is set, wtb assumes you own teardown and skips the automatic `docker compose down`.
 
@@ -447,7 +447,7 @@ Disable the whole phase per-invocation with `wtb create <branch> --no-volume-cop
 
 The per-volume summary reports `N cloned, N skipped, N failed`. If any volume **fails** to clone, the worktree is still created but the final banner changes from `🎉 Worktree created successfully!` to `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`, so the incomplete state is obvious (note: the command still exits `0` — the worktree exists). A *skip* is intentional (external/excluded volume, missing source, in-use under `--no-stop`, or a target that already has data); a *failure* means the copy itself errored.
 
-`wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`).
+`wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`). Because that runs through the automatic teardown, `--remove-volumes` is a no-op (with a warning) when teardown is skipped — under `--no-docker`, or when `end_command` is set (then your `end_command` owns volume removal).
 
 ### Seed instead of clone (`--seed`)
 

@@ -83,7 +83,23 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
     if (skipDocker) {
       console.log("")
       console.log("⏭️  Skipping Docker Compose teardown (--no-docker)")
-    } else if (!config.end_command) {
+      // --remove-volumes は down -v 経由でしか作用しないので、teardown を飛ばすと
+      // 黙って無視されてしまう。明示的な破壊フラグなので必ず警告する。
+      if (removeVolumes) {
+        console.log(
+          "  ⚠️  --remove-volumes had no effect: Docker teardown was skipped (--no-docker). Remove the volumes manually with 'docker compose down -v' in the worktree."
+        )
+      }
+    } else if (config.end_command) {
+      // end_command がある場合は teardown (= down -v) を行わないので、ここでも
+      // --remove-volumes は作用しない。end_command 側で削除する必要がある旨を伝える。
+      if (removeVolumes) {
+        console.log("")
+        console.log(
+          "  ⚠️  --remove-volumes had no effect: end_command is set, so wtb skips the automatic 'docker compose down'. Make your end_command remove volumes (e.g. 'docker compose down -v'), or run it manually."
+        )
+      }
+    } else {
       const worktreeComposePath = path.resolve(worktreePath, config.docker_compose_file)
       if (existsSync(worktreeComposePath)) {
         console.log("")
@@ -93,8 +109,20 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
           console.log("🐳 Stopping Docker Compose services...")
         }
         await runDockerComposeDown(worktreePath, removeVolumes)
+      } else if (removeVolumes) {
+        // compose file が worktree に無いと down -v を実行できない
+        console.log("")
+        console.log(
+          `  ⚠️  --remove-volumes had no effect: no compose file at ${config.docker_compose_file} in the worktree to run 'docker compose down -v'.`
+        )
       }
     }
+  } else if (removeVolumes) {
+    // docker_compose_file 自体が未設定なら管理対象の volume は無い
+    console.log("")
+    console.log(
+      "  ⚠️  --remove-volumes had no effect: no docker_compose_file is configured, so there are no wtb-managed volumes to remove."
+    )
   }
 
   // end_commandの実行（worktree削除前）

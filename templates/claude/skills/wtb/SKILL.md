@@ -163,7 +163,7 @@ Flags:
 - `-f, --force` — allow removal with uncommitted changes. (wtb does **not** run its own dirty-check; without `-f`, `git worktree remove` itself refuses a dirty worktree and the command fails. Run `wtb ls -l` first to see the `*` dirty flag before deciding.)
 - `--no-docker` — skip `docker compose down` (useful when the Docker daemon is already stopped).
 - `--no-end` — skip `end_command`.
-- `--remove-volumes` — also delete the worktree's Docker volumes (`docker compose down -v`). **Destructive for cloned data — confirm with the user.**
+- `--remove-volumes` — also delete the worktree's Docker volumes (`docker compose down -v`). **Destructive for cloned data — confirm with the user.** Note: it only works via the automatic teardown, so it has **no effect** (and wtb prints a `⚠️  --remove-volumes had no effect` warning) when teardown is skipped — i.e. with `--no-docker`, or when `end_command` is set (your `end_command` must run `docker compose down -v` itself). Watch for that warning if you intended to drop the data.
 
 Ordering is: Docker teardown → `end_command` → `git worktree remove`. Setting `end_command` in `wtb.yaml` suppresses the automatic Docker teardown (the user owns shutdown). The default leaves volumes intact (consistent with `docker compose down`); use `--remove-volumes` only if the user explicitly wants the data gone.
 

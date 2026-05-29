@@ -767,6 +767,56 @@ describe("Status Command - No Docker Project", () => {
 })
 
 // =============================================================================
+// REMOVE COMMAND - --remove-volumes guardrails
+// =============================================================================
+
+describe("Remove Command - --remove-volumes guardrails", () => {
+  let testRepo: TestRepo
+
+  beforeEach(() => {
+    testRepo = createTestRepo("basic", "rmvol-guard")
+  })
+
+  afterEach(() => {
+    testRepo.cleanup()
+  })
+
+  it("warns that --remove-volumes had no effect when end_command owns teardown", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      [
+        'base_branch: "main"',
+        "docker_compose_file: ./docker-compose.yml",
+        'end_command: "echo end-ran"',
+        "",
+      ].join("\n")
+    )
+    testRepo.runCLI("create test/x --no-docker --no-start")
+
+    const result = testRepo.runCLI("remove test/x --remove-volumes --force")
+
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("--remove-volumes had no effect")
+    expect(result.combined).toContain("end_command")
+    // end_command still runs
+    expect(result.combined).toContain("end-ran")
+  })
+
+  it("warns that --remove-volumes had no effect with --no-docker", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      ['base_branch: "main"', "docker_compose_file: ./docker-compose.yml", ""].join("\n")
+    )
+    testRepo.runCLI("create test/y --no-docker --no-start")
+
+    const result = testRepo.runCLI("remove test/y --remove-volumes --no-docker --force")
+
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("--remove-volumes had no effect")
+  })
+})
+
+// =============================================================================
 // RECLONE COMMAND
 // =============================================================================
 

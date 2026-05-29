@@ -57,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it stays out of the mocked unit/e2e CI suites.
 
 ### Fixed
+- **`remove --remove-volumes` silently ignored.** `--remove-volumes` only acts via
+  the automatic `docker compose down -v`, which is skipped under `--no-docker` or
+  when `end_command` is set — so the flag did nothing, with no feedback. wtb now
+  prints a clear `⚠️  --remove-volumes had no effect` warning in those cases
+  (telling you to drop the volumes via your `end_command` or manually).
 - **Cross-worktree port collision with the main worktree.** `create`'s env-file
   port adjustment scanned other worktrees for in-use ports but **excluded the
   main/source worktree**, so with an adjacent-port config (e.g. main `APP_PORT=3000`,
