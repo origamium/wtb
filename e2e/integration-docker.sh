@@ -34,9 +34,13 @@ X_VOL="worktree-feat-x_data"
 SEED_VOL="worktree-feat-seed_data"
 
 cleanup() {
+  ( cd "$PROJ" 2>/dev/null && docker compose down >/dev/null 2>&1 ) || true
+  git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-stop" 2>/dev/null || true
   git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-x"    2>/dev/null || true
   git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-seed" 2>/dev/null || true
-  for v in "$SRC_VOL" "$X_VOL" "$SEED_VOL"; do docker volume rm -f "$v" >/dev/null 2>&1 || true; done
+  for v in "$SRC_VOL" "$X_VOL" "$SEED_VOL" worktree-feat-stop_data; do
+    docker volume rm -f "$v" >/dev/null 2>&1 || true
+  done
   rm -rf "$BASE"
 }
 trap cleanup EXIT
@@ -70,8 +74,25 @@ vol_read() { docker run --rm -v "$1:/d" busybox cat /d/marker.txt 2>/dev/null ||
 
 echo "🔬 wtb real-Docker integration test"
 
+# 0) stop-then-copy: a RUNNING source stack is auto-stopped, cloned, and restarted
+#    (the headline crash-safe data-autonomy path — no --no-stop)
+( cd "$PROJ" && docker compose up -d >/dev/null 2>&1 )
+docker run --rm -v "$SRC_VOL:/d" busybox sh -c 'echo LIVE-DATA > /d/marker.txt'
+stop_out="$( cd "$PROJ" && node "$CLI" create feat/stop 2>&1 )"
+running_after="$(docker compose -p srcproj ps --format '{{.State}}' 2>/dev/null | grep -c running || true)"
+if echo "$stop_out" | grep -q "stopping it to clone" \
+   && [ "$(vol_read worktree-feat-stop_data)" = "LIVE-DATA" ] \
+   && [ "$running_after" -ge 1 ]; then
+  pass "running source stack is auto stop→clone→restart (data cloned, stack back up)"
+else
+  fail "stop-then-copy failed (running_after=$running_after, data=$(vol_read worktree-feat-stop_data))"
+fi
+# tear the stack down so the remaining (--no-stop) checks run against a stopped source
+( cd "$PROJ" && docker compose down >/dev/null 2>&1 )
+git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-stop" 2>/dev/null || true
+docker volume rm -f worktree-feat-stop_data >/dev/null 2>&1 || true
+
 # 1) clone carries data over
-docker volume create "$SRC_VOL" >/dev/null
 docker run --rm -v "$SRC_VOL:/d" busybox sh -c 'echo V1 > /d/marker.txt'
 ( cd "$PROJ" && node "$CLI" create feat/x --no-stop >/dev/null 2>&1 )
 [ "$(vol_read "$X_VOL")" = "V1" ] && pass "create clones source data into the new worktree volume" \
