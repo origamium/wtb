@@ -624,6 +624,8 @@ With the skill installed, typical prompts just work:
 | "List the worktrees." | `wtb ls -l` |
 | "Make a worktree for feature/login." | `wtb create feature/login` (prompts you first if destructive) |
 | "Clean up feature/old." | `wtb ls -l` to show the target → confirms → `wtb remove feature/old` |
+| "This worktree's DB is empty / the clone failed." | `wtb reclone` → re-runs just the volume-clone phase, no worktree recreation |
+| "What's actually running for this worktree?" | `wtb status --json` → live containers/volumes as structured data |
 
 The skill's `description` triggers automatically when `wtb.yaml` is in the repo, so you usually don't need to invoke it by hand.
 

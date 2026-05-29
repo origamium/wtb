@@ -699,6 +699,8 @@ Skill インストール後は、次のような依頼が自然に通ります:
 | 「worktree 一覧見せて」 | `wtb ls -l` |
 | 「feature/login の worktree 作って」 | `wtb create feature/login`(破壊的変更は事前確認) |
 | 「feature/old 片付けて」 | `wtb ls -l` で対象表示 → 確認 → `wtb remove feature/old` |
+| 「この worktree の DB が空/クローン失敗した」 | `wtb reclone` → volume クローンフェーズだけ再実行(worktree は作り直さない) |
+| 「この worktree で実際に何が動いてる?」 | `wtb status --json` → コンテナ/volume を構造化データで取得 |
 
 Skill の `description` は `wtb.yaml` を含むリポジトリで自動発火するので、手動で呼び出す必要はほぼありません。
 
