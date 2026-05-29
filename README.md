@@ -15,6 +15,7 @@ A CLI tool built on Git worktrees that gives every branch its own isolated worki
 ## Table of contents
 
 - [Why wtb?](#why-wtb)
+- [Philosophy & scope](#philosophy--scope)
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [Commands](#commands)
@@ -36,6 +37,7 @@ A CLI tool built on Git worktrees that gives every branch its own isolated worki
 - [Claude Code integration](#claude-code-integration)
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
+- [Roadmap](#roadmap)
 - [Changelog](#changelog)
 - [License](#license)
 
@@ -50,6 +52,18 @@ Typical use cases:
 - You need a clean checkout to review a PR without stashing, resetting, or killing your running dev server.
 - You'd like `.env`, local configs, or credentials automatically copied (and adjusted) to each new worktree.
 - You run Docker Compose and need each branch's services on their own ports.
+
+## Philosophy & scope
+
+wtb is built for a particular way of working: running many changes — including ones that touch the database and backend — in true parallel, one isolated worktree per change.
+
+- **Parallelism is the speedup.** In vibe-coding workflows, doing DB- and backend-touching changes in full parallel (a worktree per change) is where the time savings come from.
+- **Every worktree is fully autonomous on code.** Each worktree can change and run code on its own, completely independent of the others.
+- **Every worktree is fully autonomous on data.** Each worktree starts from a complete copy of the DB state, so it can write migrations and mutate data freely without affecting any other worktree.
+- **Conflicts are expected — and that's fine.** Working this way, conflicts are the norm; the best code emerges from the collision of competing requirements. wtb deliberately does *not* try to resolve them for you.
+- **Docker Compose only, for now.** wtb currently supports Docker Compose plus its YAML and env files only. Other stacks are out of scope at this stage.
+- **No coding-agent orchestration (yet).** wtb does not orchestrate coding agents. A coding agent launched inside a worktree should treat its job as done once it finishes the task; if more work is needed, a human is expected to go in and pick it up. In practice the recommended pattern is to let the agent run all the way to opening a pull request.
+- _The author is partial to the V6 hybrid power units used in F1._
 
 ## How it works
 
@@ -600,6 +614,13 @@ Yes — but lifecycle scripts, Docker integration, and port remapping are mostly
 
 **Why the "wtb" name?**
 Short for "worktree turbo" — git worktrees, but with the environment-wrangling turbocharged.
+
+## Roadmap
+
+Planned, **not yet implemented** — listed so the intended direction is on record. Today's behavior is still what the [Volume cloning](#volume-cloning) section describes: a volume whose source container is running is skipped with a warning, never stopped automatically.
+
+- **Stop-then-copy for DB integrity.** On `create`, wtb will bring the source Compose stack down *before* cloning volumes, then copy. This is required because Postgres can't be copied safely while its container is live. (Today that stop is manual.)
+- **Seed instead of copy (opt-in).** A flag will let `create` run a seed step instead of cloning volume data — useful when you want a freshly seeded DB rather than a clone of main's. Because nothing is copied off a live volume, this path does *not* stop the stack.
 
 ## Changelog
 
