@@ -1,6 +1,6 @@
 ---
 name: wtb
-description: Use this skill when working in a repository that contains a wtb.yaml or .wtb.yaml config. wtb is a CLI that manages multiple git worktrees with per-worktree environment and port isolation. Activate this skill when the user asks about - this worktree's local ports, endpoints, or URLs; which worktrees exist or which is main/current; creating, removing, or listing worktrees for a branch; why a dev server or Docker Compose service is reachable on a non-default port; setting up a new feature branch environment. The skill explains how to invoke the wtb CLI via Bash and how to interpret its JSON output.
+description: Use this skill when working in a repository that contains a wtb.yaml or .wtb.yaml config. wtb is a CLI that manages multiple git worktrees with per-worktree environment, port isolation, and Docker volume/database cloning. Activate this skill when the user asks about - this worktree's local ports, endpoints, or URLs; which worktrees exist or which is main/current; creating, removing, or listing worktrees for a branch; why a dev server or Docker Compose service is reachable on a non-default port; setting up a new feature branch environment; this worktree's database/volume being empty or its data not carrying over from main; cloning, re-cloning, recovering, or seeding a worktree's Docker volumes (e.g. PostgreSQL data); a failed or skipped volume clone; or inspecting Docker/container state per worktree. The skill explains how to invoke the wtb CLI via Bash and how to interpret its JSON output.
 ---
 
 # wtb skill
@@ -17,6 +17,9 @@ Activate this skill when the user says or implies any of:
 - "Tear down / remove / clean up the worktree for feature/X."
 - "Why is the service on port 3002 not 3000?" — wtb auto-bumps ports to avoid collisions.
 - Any time the user wants to hit a local URL and you do not already know the port.
+- "This worktree's database / volume is empty" / "the data didn't carry over from main" / "the volume clone failed or was skipped." → re-clone the data (`wtb reclone`).
+- "Clone / copy / re-clone / recover the DB (PostgreSQL/MySQL/Redis) data into this worktree" or "seed a fresh DB for this worktree" (`wtb create --seed` / `volumes.seed_command`).
+- "What containers/volumes is this worktree running?" / inspecting per-worktree Docker state programmatically (`wtb status --json`).
 
 Also activate when `wtb.yaml`, `.wtb.yaml`, `.wtb.yml`, or `.wtb/config.yaml` exists at the repo root, even without an explicit trigger — that config is the sign wtb is in use.
 
