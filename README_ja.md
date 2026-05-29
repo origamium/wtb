@@ -89,7 +89,7 @@ worktree-feature-auth/          ← `wtb create feature/auth` で作成
 3. **シンボリックリンク** — `link_files` のエントリをソースリポジトリへ symlink(既存のファイル/ディレクトリ/symlink は安全に置き換え)。
 4. **環境変数ファイル** — `env.file` をコピーし、`env.adjust` が空でなければポート風の値を他 worktree とぶつからない次の空きポートまでずらす。
 5. **Docker Compose** — `docker_compose_file` 設定があれば、稼働中コンテナを避けつつ host ポートを再マッピングして worktree に書き出し。
-6. **Volume クローン** — Compose の `volumes:` セクションに定義された non-`external` な named volume を、新 worktree の project に自動コピー。これで例えば PostgreSQL の中身がそのまま新 worktree でも使える。**稼働中ソースコンテナがある volume は破損リスク回避のため skip + 警告**(まずメイン側を `docker compose down` してから、または `--force-volume-copy` で強制)。詳細は [Volume の自動クローン](#volume-の自動クローン)。
+6. **Volume クローン** — Compose の `volumes:` セクションに定義された non-`external` な named volume を、新 worktree の project に自動コピー。これで例えば PostgreSQL の中身がそのまま新 worktree でも使える。**ソーススタックが稼働中(ライブ DB では通常そう)なら、wtb が自動で stop → コピー → restart する**ので破損なく手動操作ゼロでクローンできる。`--no-stop` で稼働中 volume を skip する旧挙動に、`--force-volume-copy` でライブコピーに切り替えられる。詳細は [Volume の自動クローン](#volume-の自動クローン)。
 7. **Start command** — `start_command` 設定があれば、新しい worktree 内で `/bin/sh` 経由で実行。
 
 `wtb remove <branch>` は逆順で動作: `docker compose down`(`--remove-volumes` で `down -v`、`end_command` 未設定時) → `end_command` → `git worktree remove`。
@@ -172,6 +172,7 @@ wtb create bugfix/urgent-fix
 | `--no-start` | `start_command` の実行をスキップ |
 | `--no-volume-copy` | Docker volume の自動クローンをスキップ |
 | `--force-volume-copy` | 稼働中コンテナや既存 target volume があってもクローンを試行（dev のみ・データ破損リスクあり） |
+| `--no-stop` | クローン前にソース Compose スタックを自動 stop せず、稼働中 volume を skip する（旧挙動） |
 | `--dry-run` | 実際の変更を行わず、実行内容をプレビュー |
 
 **使用例:**
@@ -482,8 +483,10 @@ Compose ファイルが remap された後、wtb は **Compose の `volumes:` �
 1. wtb は Compose の `volumes:` キーを列挙します。
 2. `external: true` のものは **対象外** (共有意図のため)。
 3. ソース volume 名は `<source_project>_<key>` (もしくは `volumes.<key>.name` で明示されていればそれ)、ターゲットも同様に新 worktree の project name を使って解決。
-4. 各 volume について:
-   - **稼働中コンテナがソース volume を使用中** なら skip + 警告 (Postgres/MySQL/Redis などはライブコピーで破損する可能性があるため)。メイン側で `docker compose down` してから再実行するか、`--force-volume-copy` で強制実行可能。
+4. **stop-then-copy。** クローン対象のソース volume を稼働中コンテナが使用していれば、wtb は **ソース Compose スタックを stop**(`docker compose stop` — コンテナ・ネットワーク・volume は保持)してからコピーし、**restart**(`docker compose start`)します。restart は `finally` で実行され、さらに `SIGINT` にも結線されているため、コピーが途中で失敗しても・Ctrl-C で中断してもソースのサービスが落ちたまま放置されることはありません。これでライブ DB も手動操作ゼロで安全にクローンできます。`--no-stop` で stop せず稼働中 volume を skip(警告つき)、`--force-volume-copy` で stop せずライブコピー(破損リスクあり)に切り替えられます。なお `docker compose start` はプロジェクト内の停止中サービスを**すべて**起動するため、意図的に落としていたサービスがあればクローン後に再度停止してください。
+5. 各 volume について:
+   - **ソーススタックを stop した場合**(または `--force-volume-copy`、もしくは何も稼働していない場合)はクローンします。
+   - **`--no-stop` 指定かつ稼働中コンテナがソース volume を使用中** なら skip + 警告 (Postgres/MySQL/Redis などはライブコピーで破損する可能性があるため)。`docker compose stop` してから、`--no-stop` を外して、または `--force-volume-copy` で実行してください。
    - **ターゲット volume が既に中身を持っていれば** skip (二度走らせて上書きしないため)。`--force-volume-copy` で上書きできます。
    - それ以外は `instrumentisto/rsync-ssh` の使い捨てサイドカーコンテナで再帰コピー (rsync が無ければ Alpine の `cp -a` にフォールバック)。
 
@@ -497,7 +500,7 @@ volumes:
     - tmp_data
 ```
 
-その実行回だけスキップしたいときは `wtb create <branch> --no-volume-copy`、稼働中ソースを強制コピーしたい (dev のみ・データ破損リスクあり) ときは `--force-volume-copy`。
+その実行回だけスキップしたいときは `wtb create <branch> --no-volume-copy`、ソーススタックを止めずに稼働中 volume を skip したいときは `--no-stop`、稼働中ソースを止めずに強制ライブコピーしたい (dev のみ・データ破損リスクあり) ときは `--force-volume-copy`。
 
 `wtb remove <branch>` はデフォルトでは clone した volume を削除しません(`docker compose down` のデフォルト挙動と整合)。`wtb remove <branch> --remove-volumes` で `docker compose down -v` 相当に切り替わり volume も削除されます。
 
@@ -691,10 +694,13 @@ wtb は内部で `git worktree add` を使い、その上に git 単体ではカ
 
 ## ロードマップ
 
-以下は **今後の予定であり、まだ実装されていません**。意図する方向性を記録するために記載しています。現時点の挙動は [Volume の自動クローン](#volume-の自動クローン) セクションの記述どおり — 稼働中ソースコンテナの volume は skip + 警告であり、自動で stop はしません。
+以下は **今後の予定であり、まだ実装されていません**。意図する方向性を記録するために記載しています。
 
-- **DB の完全性のための stop-then-copy。** `create` 時に、volume をコピーする *前に* ソースの Compose を stop してからコピーします。Postgres はコンテナが稼働中だと安全にコピーできないため必要です(現状この stop は手動)。
 - **コピーの代わりに seed(オプション)。** オプションにより、`create` 時に volume データのクローンではなく seed を走らせられるようにします。main のクローンではなく、新規に seed した DB が欲しいときに便利です。稼働中 volume からのコピーが発生しないため、この経路では stop しません。
+
+最近実装済み(このリストにあった項目):
+
+- **DB の完全性のための stop-then-copy。** ✅ `create` は稼働中のソース Compose スタックを自動で stop してから volume をクローンし、その後 restart します(クラッシュセーフ)。稼働中のライブ DB も手動操作ゼロでクローンできます。`--no-stop` で従来挙動にできます。
 
 ## Changelog
 

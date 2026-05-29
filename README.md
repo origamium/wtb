@@ -89,7 +89,7 @@ When you run `wtb create <branch>`, the tool walks these phases in order:
 3. **Symlink** — `link_files` entries are symlinked back to the source (existing files/dirs/symlinks are replaced safely).
 4. **Environment files** — `env.file` entries are copied; if `env.adjust` is non-empty, port-style values are bumped to the next free port that doesn't collide with other worktrees' `.env` files.
 5. **Docker Compose** — if `docker_compose_file` is configured, wtb reads it, remaps host ports around running containers, and writes the adjusted copy into the worktree.
-6. **Volume clone** — every named (non-`external`) Docker volume declared in the Compose file is cloned to the new worktree's project, so e.g. PostgreSQL data carries over without re-seeding. Volumes whose source container is currently running are skipped (with a warning) to avoid corruption — stop the source side first, or pass `--force-volume-copy`. See [Volume cloning](#volume-cloning).
+6. **Volume clone** — every named (non-`external`) Docker volume declared in the Compose file is cloned to the new worktree's project, so e.g. PostgreSQL data carries over without re-seeding. If the source stack is running (the usual case for a live dev DB), wtb **automatically stops it, clones, and restarts it** so the copy is corruption-safe — no manual step. Pass `--no-stop` to skip in-use volumes instead, or `--force-volume-copy` to clone live. See [Volume cloning](#volume-cloning).
 7. **Start command** — `start_command`, if configured, runs inside the new worktree with `/bin/sh`.
 
 `wtb remove <branch>` runs in reverse: `docker compose down` (or `down -v` with `--remove-volumes`, unless `end_command` is set), then `end_command`, then `git worktree remove`.
@@ -161,6 +161,7 @@ Creates a new worktree for `<branch>`, branching from `base_branch` unless the b
 | `--no-start` | Skip `start_command` |
 | `--no-volume-copy` | Skip cloning Docker volumes from the source project |
 | `--force-volume-copy` | Clone volumes even when the source container is running or the target volume already has data |
+| `--no-stop` | Don't auto-stop the source Compose stack before cloning; skip in-use volumes instead (the old behavior) |
 | `--dry-run` | Print the plan, make no changes |
 
 Examples:
@@ -396,8 +397,10 @@ How it works:
 1. wtb enumerates `volumes:` keys from the Compose file.
 2. Volumes marked `external: true` are **skipped** (they're shared by design).
 3. Source volume name is resolved as `<source_project>_<key>` (or the explicit `volumes.<key>.name` if set). Same for the target with the new worktree's project name.
-4. For each volume:
-   - **If a running container is using the source volume**, wtb skips it with a warning (live filesystem copy of an active database is unsafe — Postgres/MySQL/Redis can corrupt). Stop the source side with `docker compose down` first, or pass `--force-volume-copy` to clone live anyway.
+4. **Stop-then-copy.** If any cloneable source volume is in use by a running container, wtb **stops the source Compose stack** (`docker compose stop` — containers/networks are preserved), clones, then **restarts it** (`docker compose start`). The restart runs in a `finally` block and is also wired to `SIGINT`, so an interrupted clone (Ctrl-C) never leaves your source services down. This makes a live dev DB clone safely with no manual step. Opt out with `--no-stop` (then in-use volumes are skipped with a warning instead), or use `--force-volume-copy` to clone live without stopping (data-corruption risk). Note: `docker compose start` brings up *every* stopped service in the project — if you had intentionally left some down, re-stop them after.
+5. For each volume:
+   - **If the source stack was stopped** (or `--force-volume-copy` was passed, or nothing was running), wtb clones it.
+   - **If `--no-stop` is set and a running container is using the source volume**, wtb skips it with a warning (a live filesystem copy of an active database can corrupt — Postgres/MySQL/Redis). Stop the source side with `docker compose stop` first, drop `--no-stop`, or pass `--force-volume-copy`.
    - **If the target volume already has data**, wtb skips it (assumes you've already populated it). Pass `--force-volume-copy` to overwrite.
    - Otherwise, wtb does a recursive copy via a transient `instrumentisto/rsync-ssh` sidecar container (with an Alpine `cp -a` fallback if rsync isn't available).
 
@@ -411,7 +414,7 @@ volumes:
     - tmp_data
 ```
 
-Disable the whole phase per-invocation with `wtb create <branch> --no-volume-copy`. Force-clone running source volumes (data-loss risk, dev only) with `--force-volume-copy`.
+Disable the whole phase per-invocation with `wtb create <branch> --no-volume-copy`. Keep the source stack running and skip in-use volumes with `--no-stop`. Force-clone running source volumes live (data-loss risk, dev only) with `--force-volume-copy`.
 
 `wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`).
 
@@ -617,10 +620,13 @@ Short for "worktree turbo" — git worktrees, but with the environment-wrangling
 
 ## Roadmap
 
-Planned, **not yet implemented** — listed so the intended direction is on record. Today's behavior is still what the [Volume cloning](#volume-cloning) section describes: a volume whose source container is running is skipped with a warning, never stopped automatically.
+Planned, **not yet implemented** — listed so the intended direction is on record.
 
-- **Stop-then-copy for DB integrity.** On `create`, wtb will bring the source Compose stack down *before* cloning volumes, then copy. This is required because Postgres can't be copied safely while its container is live. (Today that stop is manual.)
 - **Seed instead of copy (opt-in).** A flag will let `create` run a seed step instead of cloning volume data — useful when you want a freshly seeded DB rather than a clone of main's. Because nothing is copied off a live volume, this path does *not* stop the stack.
+
+Recently shipped (was on this list):
+
+- **Stop-then-copy for DB integrity.** ✅ `create` now auto-stops the source Compose stack before cloning live volumes and restarts it afterward (crash-safe), so a running dev DB clones with no manual step. Opt out with `--no-stop`.
 
 ## Changelog
 

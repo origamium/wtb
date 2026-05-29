@@ -98,7 +98,7 @@ wtb create feature/my-new-feature
 
 Phases (in order): `git worktree add` → copy gitignored files → create symlinks → copy-and-adjust `.env` → rewrite Compose ports → **clone Docker named volumes** → run `start_command`.
 
-The volume-clone step is automatic when `docker_compose_file` is set: every named (non-`external`) Docker volume is copied from the source project to the new worktree's project, so e.g. PostgreSQL data carries over. **Volumes whose source container is running are skipped with a warning** to avoid corruption. If the user reports an unexpected skip, suggest they `docker compose down` on the source side first, or use `--force-volume-copy` if they accept the data-loss risk.
+The volume-clone step is automatic when `docker_compose_file` is set: every named (non-`external`) Docker volume is copied from the source project to the new worktree's project, so e.g. PostgreSQL data carries over. **If the source stack is running, wtb automatically stops it, clones, then restarts it** (`docker compose stop` → copy → `docker compose start`). The restart is guaranteed by a `finally` block, so even if the copy fails partway the source services are brought back up — they're never left down. This is what makes a worktree *data-autonomous* with no manual step: the new worktree starts from a full copy of the DB.
 
 Useful flags:
 
@@ -107,9 +107,21 @@ Useful flags:
 - `--no-create-branch` — attach to an existing branch instead of creating a new one.
 - `--no-docker` / `--no-env` / `--no-copy` / `--no-link` / `--no-start` — skip individual phases.
 - `--no-volume-copy` — skip the volume-clone phase entirely (start with empty volumes).
-- `--force-volume-copy` — clone even when source containers are running or the target already has data (data-loss risk; dev only).
+- `--no-stop` — don't auto-stop the source Compose stack; skip in-use volumes with a warning instead (the pre-stop-then-copy behavior). Use only when momentarily stopping the source services is unacceptable.
+- `--force-volume-copy` — clone even when source containers are running or the target already has data (clones *live* without stopping — data-corruption risk; dev only).
 
 After creation, the new worktree path is printed at the end. `cd` there, then re-run `wtb ports` to see the *new* worktree's adjusted ports.
+
+### Recovering a skipped/empty volume clone
+
+There is **no standalone re-clone subcommand** — volume cloning only happens during `create`. If the volume-clone output shows a skip (`source volume … does not exist`, `is in use by …`, or `target … already has data`), the worktree is already created but its DB volume is empty or stale. To recover:
+
+- **Default runs no longer skip just because the source is running** — wtb stops/restarts it automatically. On a default run a skip means one of: `--no-stop` was used; the source stack couldn't be stopped (e.g. Docker daemon error — look for "Could not stop source stack"); the volume is *still* in use after stopping (a shared, explicitly-`name:`d volume held by another Compose project); the target already had data; or the source volume didn't exist yet. The exact reason is printed on the skip line.
+- If skipped due to `--no-stop` + a running source: `docker compose stop` the source stack, then re-run the clone by removing and recreating the worktree (`wtb remove <branch>` → `wtb create <branch>`), or copy the volume manually with `docker run --rm -v <src>:/from -v <dst>:/to alpine cp -a /from/. /to/`.
+- If skipped because the target already had data: pass `--force-volume-copy` on a recreate to overwrite.
+- Confirm the data landed with `wtb status` (shows volumes) or `docker compose ps` in the worktree.
+
+Note: the auto-restart runs `docker compose start` on the whole source project, so any service that was stopped before wtb ran is brought back up too. If you had deliberately left some services down, re-stop them after the clone.
 
 ## Removing a worktree (destructive — confirm first)
 
