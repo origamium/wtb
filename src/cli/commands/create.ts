@@ -631,9 +631,9 @@ export async function setupVolumeCopy(
             skippedCount++
             continue
           }
-          // force=true: target に古いファイルが残ったままにならないよう、コピー前に
-          // target を消去する (rsync は --delete、cp は find -delete でこの semantics
-          // を実現)。これがないと cp フォールバック時に "上書き" の約束が破れる。
+          // force=true: 既存データを上書きする。clearTarget=true を渡すと copyVolume が
+          // atomic 経路 (一時 volume にステージング→検証→target を置換) を使うので、
+          // コピーが途中で失敗しても target の既存データが空になることはない。
           targetHadData = true
         }
       }

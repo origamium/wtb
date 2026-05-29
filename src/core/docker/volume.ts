@@ -71,6 +71,53 @@ export function createVolume(volumeName: string, driver: string = "local"): void
 }
 
 /**
+ * volume を削除する (best-effort)。
+ *
+ * atomic overwrite の一時 volume の後始末に使う。存在しない / 使用中などで失敗
+ * しても例外は投げない (元のエラーを隠さないため)。
+ */
+export function removeVolume(volumeName: string): void {
+  try {
+    execDockerSafe(["volume", "rm", "-f", volumeName], {})
+  } catch {
+    // best-effort cleanup; 失敗しても呼び出し側の処理は続行する
+  }
+}
+
+/**
+ * volume の中身を全削除する (`find /target -mindepth 1 -delete` 相当)。
+ *
+ * `cp -a /source/. /target/` 単体では target の余剰ファイルが残るため、上書き
+ * セマンティクスを保つコピー前のクリアに使う。copyVolumeWithCp と atomic
+ * overwrite の commit 段階で共有する。
+ */
+function clearVolume(volumeName: string): void {
+  execDockerSafe(
+    [
+      "run",
+      "--rm",
+      "-v",
+      `${volumeName}:/target`,
+      "alpine",
+      "sh",
+      "-c",
+      "find /target -mindepth 1 -delete",
+    ],
+    {}
+  )
+}
+
+/**
+ * atomic overwrite 用の一時 volume 名を生成する。
+ * pid + 時刻 + 乱数で衝突を実質回避する (並行 create / リトライ対策)。
+ * Docker volume 名の許容文字 [a-zA-Z0-9_.-] のみを使う。
+ */
+function makeTempVolumeName(targetVolume: string): string {
+  const suffix = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  return `${targetVolume}__wtbtmp_${suffix}`
+}
+
+/**
  * rsyncを使用した高速ボリュームコピー
  *
  * @param sourceVolume - コピー元ボリューム名
@@ -243,19 +290,7 @@ export async function copyVolumeWithCp(
   // force 時は target の既存ファイルを先に消す。
   // `cp -a /source/. /target/` 単体では target の余分なファイルが残るため。
   if (clearTarget) {
-    execDockerSafe(
-      [
-        "run",
-        "--rm",
-        "-v",
-        `${targetVolume}:/target`,
-        "alpine",
-        "sh",
-        "-c",
-        "find /target -mindepth 1 -delete",
-      ],
-      {}
-    )
+    clearVolume(targetVolume)
   }
 
   execDockerSafe(
@@ -303,18 +338,62 @@ export async function copyVolume(
   targetVolume: string,
   options: VolumeCopyOptions & { clearTarget?: boolean } = {}
 ): Promise<void> {
+  // 既存データの上書き (clearTarget=true) は破壊的なので atomic 経路を使う。
+  // 「先に target を消してからコピー」だとコピー途中で失敗したとき target が空に
+  // なって復旧不能になるため、完全な staged コピーが出来てから初めて target を
+  // 置換する。
+  if (options.clearTarget === true) {
+    return copyVolumeAtomicOverwrite(sourceVolume, targetVolume, options)
+  }
+
   try {
     await copyVolumeWithRsync(sourceVolume, targetVolume, {
       ...options,
-      // clearTarget=true のとき rsync は incremental(=delete) で動かす
-      incremental: options.clearTarget ?? options.incremental,
+      incremental: options.incremental,
     })
   } catch (error) {
     console.warn("rsync copy failed, falling back to cp:", error)
     await copyVolumeWithCp(sourceVolume, targetVolume, {
       onProgress: options.onProgress,
-      clearTarget: options.clearTarget,
     })
+  }
+}
+
+/**
+ * 既存データを持つ target を atomic に上書きする。
+ *
+ * 1. stage  : source を新しい空の一時 volume へ完全コピー (本番の転送)。target には
+ *             一切触れないので、ここで失敗しても target の既存データは無傷。
+ * 2. verify : source に中身があるのに staged コピーが空なら中断 (中途半端な上書き防止)。
+ * 3. commit : ここで初めて target を消し、検証済みの一時 volume から埋め直す
+ *             (ローカル間コピーなので高速で、source 側の事情では失敗しない)。
+ * 4. cleanup: 一時 volume は finally で必ず削除する (best-effort)。
+ *
+ * Docker には volume rename が無いため真の O(1) swap は不可能。この設計は target が
+ * 空になる窓を「検証済みデータからのローカルコピー」だけに最小化し、ネットワーク /
+ * source 読み取りの失敗で target を空にすることは決してない。
+ */
+async function copyVolumeAtomicOverwrite(
+  sourceVolume: string,
+  targetVolume: string,
+  options: VolumeCopyOptions
+): Promise<void> {
+  const tmp = makeTempVolumeName(targetVolume)
+  createVolume(tmp)
+  try {
+    // 1. stage
+    await copyVolume(sourceVolume, tmp, { onProgress: options.onProgress })
+    // 2. verify
+    if (getVolumeSize(sourceVolume) > 0 && getVolumeSize(tmp) === 0) {
+      throw new Error(
+        `Staged copy of '${sourceVolume}' is empty — aborting overwrite to protect '${targetVolume}'`
+      )
+    }
+    // 3. commit (target を消すのはここが初めて)
+    await copyVolumeWithCp(tmp, targetVolume, { clearTarget: true })
+  } finally {
+    // 4. cleanup
+    removeVolume(tmp)
   }
 }
 

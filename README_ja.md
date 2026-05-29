@@ -487,7 +487,7 @@ Compose ファイルが remap された後、wtb は **Compose の `volumes:` �
 5. 各 volume について:
    - **ソーススタックを stop した場合**(または `--force-volume-copy`、もしくは何も稼働していない場合)はクローンします。
    - **`--no-stop` 指定かつ稼働中コンテナがソース volume を使用中** なら skip + 警告 (Postgres/MySQL/Redis などはライブコピーで破損する可能性があるため)。`docker compose stop` してから、`--no-stop` を外して、または `--force-volume-copy` で実行してください。
-   - **ターゲット volume が既に中身を持っていれば** skip (二度走らせて上書きしないため)。`--force-volume-copy` で上書きできます。
+   - **ターゲット volume が既に中身を持っていれば** skip (二度走らせて上書きしないため)。`--force-volume-copy` で上書きできます。この上書きは **atomic** です: 新しいデータを一時 volume にステージングし、検証してから target を置換するため、コピーが途中で失敗しても target が空になることはありません。
    - それ以外は `instrumentisto/rsync-ssh` の使い捨てサイドカーコンテナで再帰コピー (rsync が無ければ Alpine の `cp -a` にフォールバック)。
 
 特定の volume を除外したい (例: 再生成可能なキャッシュ):

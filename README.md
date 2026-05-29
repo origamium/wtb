@@ -401,7 +401,7 @@ How it works:
 5. For each volume:
    - **If the source stack was stopped** (or `--force-volume-copy` was passed, or nothing was running), wtb clones it.
    - **If `--no-stop` is set and a running container is using the source volume**, wtb skips it with a warning (a live filesystem copy of an active database can corrupt — Postgres/MySQL/Redis). Stop the source side with `docker compose stop` first, drop `--no-stop`, or pass `--force-volume-copy`.
-   - **If the target volume already has data**, wtb skips it (assumes you've already populated it). Pass `--force-volume-copy` to overwrite.
+   - **If the target volume already has data**, wtb skips it (assumes you've already populated it). Pass `--force-volume-copy` to overwrite. The overwrite is **atomic**: wtb stages the new data into a temporary volume and verifies it before replacing the target, so a failed copy never leaves the target emptied.
    - Otherwise, wtb does a recursive copy via a transient `instrumentisto/rsync-ssh` sidecar container (with an Alpine `cp -a` fallback if rsync isn't available).
 
 Selectively exclude volumes you don't want to clone (e.g. regenerable caches):

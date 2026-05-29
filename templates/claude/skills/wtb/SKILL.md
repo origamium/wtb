@@ -108,7 +108,7 @@ Useful flags:
 - `--no-docker` / `--no-env` / `--no-copy` / `--no-link` / `--no-start` — skip individual phases.
 - `--no-volume-copy` — skip the volume-clone phase entirely (start with empty volumes).
 - `--no-stop` — don't auto-stop the source Compose stack; skip in-use volumes with a warning instead (the pre-stop-then-copy behavior). Use only when momentarily stopping the source services is unacceptable.
-- `--force-volume-copy` — clone even when source containers are running or the target already has data (clones *live* without stopping — data-corruption risk; dev only).
+- `--force-volume-copy` — clone even when source containers are running or the target already has data (clones *live* without stopping — data-corruption risk; dev only). Overwriting an existing target is atomic (staged via a temp volume, verified, then swapped), so a failed overwrite never empties the target.
 
 After creation, the new worktree path is printed at the end. `cd` there, then re-run `wtb ports` to see the *new* worktree's adjusted ports.
 
