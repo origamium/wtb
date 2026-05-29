@@ -13,6 +13,7 @@ import {
   getDockerInfo,
   getDockerVolumes,
   getRunningContainers,
+  getWtbManagedVolumeNames,
   isWtbContainer,
 } from "../../core/docker/client.js"
 import { findComposeFile, readComposeFile } from "../../core/docker/compose.js"
@@ -51,6 +52,15 @@ interface StatusJson {
     }>
     volumes: { total: number; wtb: Array<{ name: string; driver: string }> }
   }
+}
+
+/**
+ * volume が wtb 管理かどうかを判定する。
+ * `wtb.managed=true` ラベル (正確) を優先し、ラベル付与より前に作られた volume の
+ * ため旧来の命名ヒューリスティック (wtb / worktree を含む) もフォールバックで併用する。
+ */
+function isWtbVolume(name: string, managedLabelSet: Set<string>): boolean {
+  return managedLabelSet.has(name) || name.includes("wtb") || name.includes("worktree")
 }
 
 /**
@@ -191,9 +201,8 @@ function buildStatusJson(
       }
       try {
         const volumes = getDockerVolumes()
-        const wtbVolumes = volumes.filter(
-          (v) => v.name.includes("wtb") || v.name.includes("worktree")
-        )
+        const managed = new Set(getWtbManagedVolumeNames())
+        const wtbVolumes = volumes.filter((v) => isWtbVolume(v.name, managed))
         docker.volumes = {
           total: volumes.length,
           wtb: wtbVolumes.map((v) => ({ name: v.name, driver: v.driver })),
@@ -374,9 +383,8 @@ async function showRunningContainers(): Promise<void> {
  */
 async function showDockerVolumes(): Promise<void> {
   const volumes = getDockerVolumes()
-  const wtbVolumes = volumes.filter(
-    (v) => v.name.includes("wtb") || v.name.match(/.*-.*wtb.*/) || v.name.includes("worktree")
-  )
+  const managed = new Set(getWtbManagedVolumeNames())
+  const wtbVolumes = volumes.filter((v) => isWtbVolume(v.name, managed))
 
   console.log(`🗂️  Total Volumes: ${volumes.length}`)
 

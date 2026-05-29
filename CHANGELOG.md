@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **wtb-created volumes are now labelled `wtb.managed=true`.** Every volume wtb
+  creates (cloned targets, atomic-overwrite temps) carries the label, so it is
+  self-identifying regardless of project/path naming. `wtb status` now detects
+  wtb-managed volumes by label (with the old name heuristic as a fallback for
+  pre-label volumes) — fixing under-reporting for worktrees created with a custom
+  `-p` path. Users/agents can list them with
+  `docker volume ls --filter label=wtb.managed=true`.
 - **`wtb reclone [branch]`** — re-run only the volume-clone phase on an existing
   worktree to recover empty/failed/stale volumes, without removing and recreating
   it (keeps uncommitted work). Reuses the create pipeline's volume logic; accepts

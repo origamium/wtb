@@ -334,6 +334,29 @@ describe("Status Command (Refactored)", () => {
       expect(payload.docker.containers).toEqual([])
     })
 
+    it("detects wtb volumes by label even when the name doesn't match the heuristic", async () => {
+      // A custom -p path yields a project/volume name without "wtb"/"worktree".
+      vi.mocked(dockerClientModule.getDockerInfo).mockReturnValue({
+        dockerVersion: "x",
+        composeVersion: "y",
+        isAvailable: true,
+      })
+      vi.mocked(dockerClientModule.getDockerVolumes).mockReturnValue([
+        { name: "customproj_data", driver: "local", mountpoint: "/v/customproj_data" },
+        { name: "unrelated_cache", driver: "local", mountpoint: "/v/unrelated_cache" },
+      ])
+      // only the wtb-created one carries the label
+      vi.mocked(dockerClientModule.getWtbManagedVolumeNames).mockReturnValue(["customproj_data"])
+
+      await command.parseAsync(["--json"], { from: "user" })
+
+      const payload = parseStdout()
+      const names = payload.docker.volumes.wtb.map((v: { name: string }) => v.name)
+      expect(names).toContain("customproj_data") // matched by label
+      expect(names).not.toContain("unrelated_cache") // neither label nor name heuristic
+      expect(payload.docker.volumes.total).toBe(2)
+    })
+
     it("omits worktrees with --docker-only", async () => {
       vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
         { path: "/project", branch: "main", head: "abc" },

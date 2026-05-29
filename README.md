@@ -433,6 +433,8 @@ How it works:
    - **If the target volume already has data**, wtb skips it (assumes you've already populated it). Pass `--force-volume-copy` to overwrite. The overwrite is **atomic**: wtb stages the new data into a temporary volume and verifies it before replacing the target, so a failed copy never leaves the target emptied.
    - Otherwise, wtb does a recursive copy via a transient `instrumentisto/rsync-ssh` sidecar container (with an Alpine `cp -a` fallback if rsync isn't available).
 
+Every volume wtb creates is labelled **`wtb.managed=true`**, so it is self-identifying regardless of how the project/path is named. `wtb status` uses this label to report wtb-managed volumes accurately (even for custom `-p` paths), and you can list them yourself with `docker volume ls --filter label=wtb.managed=true`.
+
 Selectively exclude volumes you don't want to clone (e.g. regenerable caches):
 
 ```yaml

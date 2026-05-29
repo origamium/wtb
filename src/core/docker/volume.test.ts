@@ -6,6 +6,7 @@ import { execDockerSafe } from "../../utils/exec.js"
 import {
   copyVolume,
   copyVolumeWithRsync,
+  createVolume,
   discoverCloneableVolumes,
   formatBytes,
   formatEta,
@@ -342,6 +343,21 @@ describe("copyVolume atomic overwrite", () => {
     expect(removedTemp()).toBe(false)
     // and the user is told how to recover from the temp volume
     expect(logged()).toContain("preserved in temp volume")
+  })
+})
+
+describe("createVolume", () => {
+  it("creates the volume with the wtb.managed=true label (self-identifying)", () => {
+    vi.clearAllMocks()
+    vi.mocked(execDockerSafe).mockReturnValue("")
+    createVolume("some_vol")
+    const args = vi.mocked(execDockerSafe).mock.calls[0][0] as string[]
+    expect(args[0]).toBe("volume")
+    expect(args[1]).toBe("create")
+    expect(args).toContain("--label")
+    expect(args).toContain("wtb.managed=true")
+    // the volume name remains the final argument
+    expect(args.at(-1)).toBe("some_vol")
   })
 })
 

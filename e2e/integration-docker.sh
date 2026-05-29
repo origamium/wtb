@@ -77,6 +77,11 @@ docker run --rm -v "$SRC_VOL:/d" busybox sh -c 'echo V1 > /d/marker.txt'
 [ "$(vol_read "$X_VOL")" = "V1" ] && pass "create clones source data into the new worktree volume" \
   || fail "clone did not carry data over (got '$(vol_read "$X_VOL")')"
 
+# 1b) the cloned (wtb-created) volume carries the wtb.managed=true label
+docker volume ls --filter label=wtb.managed=true --format '{{.Name}}' | grep -qx "$X_VOL" \
+  && pass "cloned volume is labelled wtb.managed=true (discoverable regardless of name)" \
+  || fail "cloned volume '$X_VOL' is missing the wtb.managed=true label"
+
 # 2) reclone --force-volume-copy atomically overwrites with updated source
 docker run --rm -v "$SRC_VOL:/d" busybox sh -c 'echo V2-UPDATED > /d/marker.txt'
 ( cd "$PROJ" && node "$CLI" reclone feat/x --no-stop --force-volume-copy >/dev/null 2>&1 )

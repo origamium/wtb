@@ -514,6 +514,8 @@ Compose ファイルが remap された後、wtb は **Compose の `volumes:` �
    - **ターゲット volume が既に中身を持っていれば** skip (二度走らせて上書きしないため)。`--force-volume-copy` で上書きできます。この上書きは **atomic** です: 新しいデータを一時 volume にステージングし、検証してから target を置換するため、コピーが途中で失敗しても target が空になることはありません。
    - それ以外は `instrumentisto/rsync-ssh` の使い捨てサイドカーコンテナで再帰コピー (rsync が無ければ Alpine の `cp -a` にフォールバック)。
 
+wtb が作成する volume には必ず **`wtb.managed=true`** ラベルが付くため、project/パスの命名に依存せず自己識別できます。`wtb status` はこのラベルで wtb 管理 volume を正確に列挙し (カスタム `-p` パスでも)、`docker volume ls --filter label=wtb.managed=true` で自分でも一覧できます。
+
 特定の volume を除外したい (例: 再生成可能なキャッシュ):
 
 ```yaml

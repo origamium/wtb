@@ -180,6 +180,7 @@ enrichWorktree(wt: WorktreeInfo): Promise<EnrichedWorktreeInfo>   // ls -l 用
 // client.ts
 getRunningContainers(opts?): ContainerInfo[]              // docker ps をパース
 getDockerVolumes(opts?): VolumeInfo[]
+getWtbManagedVolumeNames(opts?): string[]                 // label=wtb.managed=true で正確に列挙
 getUsedPorts(opts?): number[]                             // 稼働中コンテナの host port 一覧
 isWtbContainer(c: ContainerInfo): boolean                 // 名前に "wtb" を含む or WTB_* env と一致
 

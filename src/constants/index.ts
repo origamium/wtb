@@ -76,6 +76,7 @@ export const DOCKER_COMMANDS = {
   CONTAINER_NETWORKS:
     'docker inspect --format="{{range $key, $value := .NetworkSettings.Networks}}{{$key}},{{end}}" {containerId}',
   VOLUMES: 'docker volume ls --format "{{.Name}}\t{{.Driver}}\t{{.Mountpoint}}"',
+  MANAGED_VOLUMES: 'docker volume ls --filter label=wtb.managed=true --format "{{.Name}}"',
   VERSION: "docker --version",
   COMPOSE_VERSION: "docker-compose --version",
 } as const

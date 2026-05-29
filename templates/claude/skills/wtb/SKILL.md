@@ -197,6 +197,7 @@ Use `wtb status` for diagnosis when ports look wrong or services are missing —
 
 - `docker.available` is `false` (not an error) when the daemon is down or Docker isn't installed; `docker.configured` reflects whether `docker_compose_file` is set. Check `available` before trusting `containers`/`volumes`.
 - This completes the machine-readable trio: `wtb ls --json` (worktrees), `wtb ports` (ports/endpoints, JSON by default), `wtb status --json` (live Docker state).
+- `docker.volumes.wtb` lists wtb-created volumes. wtb labels every volume it creates with `wtb.managed=true`, so detection is reliable even for custom `-p` paths. To find them directly: `docker volume ls --filter label=wtb.managed=true`.
 
 ## Config quick reference
 

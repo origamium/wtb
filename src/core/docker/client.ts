@@ -191,6 +191,26 @@ export function getDockerVolumes(options?: ExecOptions): VolumeInfo[] {
 }
 
 /**
+ * wtb が作成した（`wtb.managed=true` ラベル付き）volume 名の一覧を取得する。
+ * 名前の命名規則に依存せず wtb 管理 volume を正確に特定できる。
+ * Docker が使えない場合は空配列。
+ *
+ * @param options - 実行オプション
+ * @returns wtb 管理 volume 名の配列
+ */
+export function getWtbManagedVolumeNames(options?: ExecOptions): string[] {
+  try {
+    const output = execDockerCommand(DOCKER_COMMANDS.MANAGED_VOLUMES, options)
+    return output
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0)
+  } catch {
+    return []
+  }
+}
+
+/**
  * docker volume lsの出力をパースしてボリューム情報配列に変換
  *
  * @param output - docker volume lsの出力

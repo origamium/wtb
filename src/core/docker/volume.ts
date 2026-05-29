@@ -71,7 +71,14 @@ export function getVolumeSize(volumeName: string): number | null {
  * @param driver - ドライバー（デフォルト: local）
  */
 export function createVolume(volumeName: string, driver: string = "local"): void {
-  execDockerSafe(["volume", "create", "--driver", driver, volumeName], {})
+  // wtb が作成した volume には `wtb.managed=true` ラベルを付け、自己識別できるようにする。
+  // これで `wtb status` はディレクトリ名の命名規則に依存せず (カスタム -p パスでも)
+  // wtb 管理 volume を正確に列挙でき、ユーザ/agent も
+  // `docker volume ls --filter label=wtb.managed=true` で発見・整理できる。
+  execDockerSafe(
+    ["volume", "create", "--driver", driver, "--label", "wtb.managed=true", volumeName],
+    {}
+  )
 }
 
 /**
