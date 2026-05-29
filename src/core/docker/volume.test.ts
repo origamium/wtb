@@ -9,6 +9,7 @@ import {
   discoverCloneableVolumes,
   formatBytes,
   formatEta,
+  parseRsyncProgress,
   resolveVolumeName,
 } from "./volume"
 
@@ -341,6 +342,45 @@ describe("copyVolume atomic overwrite", () => {
     expect(removedTemp()).toBe(false)
     // and the user is told how to recover from the temp volume
     expect(logged()).toContain("preserved in temp volume")
+  })
+})
+
+describe("parseRsyncProgress", () => {
+  it("parses a full progress2 line with ETA", () => {
+    const r = parseRsyncProgress("      1,234,567  45%   12.34MB/s    0:00:12")
+    expect(r).toEqual({
+      bytesTransferred: 1234567,
+      percentage: 45,
+      speed: 12.34 * 1024 * 1024,
+      eta: 12,
+    })
+  })
+
+  it("computes ETA across hours/minutes/seconds", () => {
+    const r = parseRsyncProgress("100 50% 1.0kB/s 1:02:03")
+    expect(r?.eta).toBe(3600 + 2 * 60 + 3)
+    expect(r?.speed).toBe(1024)
+  })
+
+  it("tolerates a missing ETA (eta=0)", () => {
+    const r = parseRsyncProgress("  9,999  88%   5.00GB/s")
+    expect(r).not.toBeNull()
+    expect(r?.percentage).toBe(88)
+    expect(r?.bytesTransferred).toBe(9999)
+    expect(r?.speed).toBe(5 * 1024 * 1024 * 1024)
+    expect(r?.eta).toBe(0)
+  })
+
+  it("reports speed=0 for an unknown unit instead of misreading it as bytes", () => {
+    // a hypothetical/unknown unit must NOT be silently treated as B/s (×1)
+    const r = parseRsyncProgress("500 10% 3.00pb/s 0:00:01")
+    expect(r).not.toBeNull()
+    expect(r?.speed).toBe(0)
+  })
+
+  it("returns null for a non-progress line", () => {
+    expect(parseRsyncProgress("sending incremental file list")).toBeNull()
+    expect(parseRsyncProgress("")).toBeNull()
   })
 })
 

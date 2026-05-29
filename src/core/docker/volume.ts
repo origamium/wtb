@@ -121,6 +121,46 @@ function makeTempVolumeName(targetVolume: string): string {
   return `${targetVolume}__wtbtmp_${suffix}`
 }
 
+/** rsync の速度単位 → bytes/sec 倍率。未知の単位は「不明」(0) として扱い、勝手に bytes と誤認しない。 */
+const RSYNC_SPEED_UNITS: Record<string, number> = {
+  "b/s": 1,
+  "kb/s": 1024,
+  "mb/s": 1024 * 1024,
+  "gb/s": 1024 * 1024 * 1024,
+  "tb/s": 1024 * 1024 * 1024 * 1024,
+}
+
+/**
+ * rsync `--info=progress2` の 1 行から進捗を抽出する純粋関数。
+ *
+ * 例: `  1,234,567  45%   12.34MB/s    0:00:12`
+ * - ETA (`H:M:S`) は rsync のビルド差で欠ける場合があるため任意とし、無ければ `eta=0`。
+ * - 速度単位が未知 (上記マップ外) のときは `speed=0` を返す。0 を「不明」として
+ *   扱い、未知単位を bytes と誤って巨大な速度に化けさせない。
+ *
+ * @returns 進捗。行が進捗フォーマットでなければ `null`。
+ */
+export function parseRsyncProgress(
+  line: string
+): { bytesTransferred: number; percentage: number; speed: number; eta: number } | null {
+  const m = line.match(/(\d[\d,]*)\s+(\d+)%\s+([\d.]+)([A-Za-z]+\/s)(?:\s+(\d+):(\d+):(\d+))?/)
+  if (!m) return null
+
+  const bytesTransferred = parseInt(m[1].replace(/,/g, ""), 10)
+  const percentage = parseInt(m[2], 10)
+  const value = parseFloat(m[3])
+  const unit = m[4].toLowerCase()
+  const multiplier = RSYNC_SPEED_UNITS[unit]
+  const speed = multiplier !== undefined ? value * multiplier : 0
+
+  let eta = 0
+  if (m[5] !== undefined) {
+    eta = Number(m[5]) * 3600 + Number(m[6]) * 60 + Number(m[7])
+  }
+
+  return { bytesTransferred, percentage, speed, eta }
+}
+
 /**
  * rsyncを使用した高速ボリュームコピー
  *
@@ -182,39 +222,17 @@ export async function copyVolumeWithRsync(
     dockerProcess.stdout.on("data", (data: Buffer) => {
       const output = data.toString()
 
-      const progressMatch = output.match(/(\d[\d,]*)\s+(\d+)%\s+([\d.]+\w+\/s)\s+(\d+:\d+:\d+)/)
+      const progress = parseRsyncProgress(output)
 
-      if (progressMatch && onProgress) {
-        const bytesTransferred = parseInt(progressMatch[1].replace(/,/g, ""), 10)
-        const percentage = parseInt(progressMatch[2], 10)
-        const speedStr = progressMatch[3]
-        const etaStr = progressMatch[4]
-
-        const speedMatch = speedStr.match(/([\d.]+)(\w+)/)
-        let speed = 0
-        if (speedMatch) {
-          const value = parseFloat(speedMatch[1])
-          const unit = speedMatch[2].toLowerCase()
-          const multipliers: Record<string, number> = {
-            "b/s": 1,
-            "kb/s": 1024,
-            "mb/s": 1024 * 1024,
-            "gb/s": 1024 * 1024 * 1024,
-          }
-          speed = value * (multipliers[unit] || 1)
-        }
-
-        const etaParts = etaStr.split(":").map(Number)
-        const eta = etaParts[0] * 3600 + etaParts[1] * 60 + etaParts[2]
-
+      if (progress && onProgress) {
         lastProgress = {
           sourceVolume,
           targetVolume,
-          percentage,
-          bytesTransferred,
+          percentage: progress.percentage,
+          bytesTransferred: progress.bytesTransferred,
           totalBytes,
-          speed,
-          eta,
+          speed: progress.speed,
+          eta: progress.eta,
         }
 
         onProgress(lastProgress)
