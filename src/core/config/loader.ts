@@ -7,8 +7,9 @@ import { existsSync } from "node:fs"
 import * as path from "node:path"
 import fs from "fs-extra"
 import { parse } from "yaml"
-import { CONFIG_FILE_NAMES, DEFAULT_CONFIG } from "../../constants/index.js"
+import { CONFIG_FILE_NAMES, DEFAULT_CONFIG, EXIT_CODES } from "../../constants/index.js"
 import type { WtbConfig } from "../../types/index.js"
+import { CLIError } from "../../utils/error.js"
 import { validateConfig } from "./validator.js"
 
 /**
@@ -160,12 +161,22 @@ export function loadConfig(configDir: string = process.cwd()): WtbConfig {
     } catch (validationError) {
       const message =
         validationError instanceof Error ? validationError.message : String(validationError)
-      throw new Error(`Configuration validation failed: ${message}`)
+      // 設定不正は専用の exit code 4 (CONFIG_ERROR) で終了させ、一般エラー (1) と
+      // 区別する。coding agent / スクリプトが $? で設定ミスを判別できるようにする。
+      throw new CLIError(`Configuration validation failed: ${message}`, EXIT_CODES.CONFIG_ERROR)
     }
 
     return config
   } catch (error) {
+    // 既に CLIError (= 適切な exit code 付き、主に CONFIG_ERROR) ならそのまま伝播。
+    if (error instanceof CLIError) {
+      throw error
+    }
+    // パース失敗・読み込み失敗も設定起因なので CONFIG_ERROR(4) として扱う。
     const message = error instanceof Error ? error.message : String(error)
-    throw new Error(`Failed to load configuration from ${configResult.path}: ${message}`)
+    throw new CLIError(
+      `Failed to load configuration from ${configResult.path}: ${message}`,
+      EXIT_CODES.CONFIG_ERROR
+    )
   }
 }

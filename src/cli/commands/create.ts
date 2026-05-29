@@ -538,10 +538,12 @@ export async function setupVolumeCopy(
   // データ自律性のギャップ (README Roadmap) を解消する。
   const stopEnabled = options.stop !== false
   let stoppedStack = false
-  // process.exit() (e.g. the SIGINT handler in cli/index.ts) bypasses the finally
-  // below, so a Ctrl-C mid-copy would leave the source stack down. Restart it from
-  // a prepended SIGINT handler too — it runs before the index handler exits.
+  // process.exit() (e.g. the SIGINT/SIGTERM handlers in cli/index.ts) bypasses the
+  // finally below, so a Ctrl-C or kill mid-copy would leave the source stack down.
+  // Restart it from prepended signal handlers too — they run before the index
+  // handler exits. Both SIGINT (Ctrl-C) and SIGTERM (kill) are covered.
   let restartOnAbort: (() => void) | undefined
+  const abortSignals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"]
   if (stopEnabled && !options.force) {
     const anyInUse = cloneable.some((key) => {
       const source = resolveVolumeName(composeConfig, key, sourceProject)
@@ -566,7 +568,9 @@ export async function setupVolumeCopy(
             // best-effort restart on abort; nothing else we can do mid-signal
           }
         }
-        process.prependListener("SIGINT", restartOnAbort)
+        for (const sig of abortSignals) {
+          process.prependListener(sig, restartOnAbort)
+        }
       } catch (error) {
         console.log(
           `  ⚠️  Could not stop source stack (${getErrorMessage(error)}) — falling back to per-volume skip`
@@ -661,7 +665,9 @@ export async function setupVolumeCopy(
     )
   } finally {
     if (restartOnAbort) {
-      process.removeListener("SIGINT", restartOnAbort)
+      for (const sig of abortSignals) {
+        process.removeListener(sig, restartOnAbort)
+      }
     }
     if (stoppedStack) {
       console.log("  ▶️  Restarting source Compose stack...")

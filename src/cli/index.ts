@@ -49,10 +49,16 @@ function setupErrorHandling(): void {
     process.exit(EXIT_CODES.GENERAL_ERROR)
   })
 
-  process.on("SIGINT", () => {
+  // SIGINT (Ctrl-C) と SIGTERM (kill) の両方で同じ後始末経路を通す。
+  // 長時間処理 (volume clone 中の stop-then-copy など) は、コマンド側が
+  // process.prependListener でこれらのシグナルに復旧フック (source スタック
+  // 再開) を差し込む。prepend なのでここの exit より先に必ず走る。
+  const gracefulExit = () => {
     console.log("\n👋 Goodbye!")
     process.exit(EXIT_CODES.SUCCESS)
-  })
+  }
+  process.on("SIGINT", gracefulExit)
+  process.on("SIGTERM", gracefulExit)
 }
 
 /**

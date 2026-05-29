@@ -222,10 +222,13 @@ export async function copyVolumeWithRsync(
       }
     })
 
+    // rsync の stderr は全量バッファする。失敗時に診断できるよう、
+    // close ハンドラで例外メッセージへ畳み込む (末尾を切り詰めて肥大化を防ぐ)。
+    let stderrBuffer = ""
     dockerProcess.stderr.on("data", (data: Buffer) => {
-      const error = data.toString()
-      if (error.includes("error") || error.includes("failed")) {
-        console.error("rsync error:", error)
+      stderrBuffer += data.toString()
+      if (stderrBuffer.length > 8192) {
+        stderrBuffer = stderrBuffer.slice(-8192)
       }
     })
 
@@ -240,7 +243,12 @@ export async function copyVolumeWithRsync(
         }
         resolve()
       } else {
-        reject(new Error(`Volume copy failed with exit code ${code}`))
+        const detail = stderrBuffer.trim()
+        reject(
+          new Error(
+            `Volume copy failed with exit code ${code}${detail ? `: ${detail}` : ""}`
+          )
+        )
       }
     })
 
@@ -357,8 +365,14 @@ export async function copyVolume(
     })
   } catch (error) {
     console.warn("rsync copy failed, falling back to cp:", error)
+    // rsync は途中まで書き込んでから失敗している可能性があり、target に中途半端な
+    // ツリーが残る。cp フォールバックはこの非 clearTarget 経路では常に fresh/空の
+    // target に対して呼ばれる (既存データの上書きは atomic 経路へ分岐済み) ので、
+    // rsync の部分出力を捨てて clean な状態からコピーし直す。これで rsync の
+    // --delete (incremental) 相当の置換セマンティクスをフォールバックでも保つ。
     await copyVolumeWithCp(sourceVolume, targetVolume, {
       onProgress: options.onProgress,
+      clearTarget: true,
     })
   }
 }

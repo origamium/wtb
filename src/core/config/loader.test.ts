@@ -127,6 +127,23 @@ env:
 
       expect(config.volumes?.exclude).toEqual(["cache_data", "tmp_data"])
     })
+
+    it("throws a CLIError with exit code 4 (CONFIG_ERROR) on invalid config", async () => {
+      const { CLIError } = await import("../../utils/error.js")
+      const { EXIT_CODES } = await import("../../constants/index.js")
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue("base_branch: 42")
+      // invalid: base_branch must be a non-empty string
+      vi.mocked(parse).mockReturnValue({ base_branch: 42 as unknown as string })
+
+      try {
+        loadConfig(testRepoPath)
+        expect.unreachable("loadConfig should have thrown")
+      } catch (error) {
+        expect(error).toBeInstanceOf(CLIError)
+        expect((error as InstanceType<typeof CLIError>).exitCode).toBe(EXIT_CODES.CONFIG_ERROR)
+      }
+    })
   })
 
   describe("findConfigFile", () => {

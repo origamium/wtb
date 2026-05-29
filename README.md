@@ -463,8 +463,8 @@ Exit codes (`src/constants/index.ts`):
 | `1` | General error |
 | `2` | Invalid CLI usage |
 | `3` | Not in a git repository |
-| `4` | Configuration error |
-| `5` | Docker error |
+| `4` | Configuration error (config not found-but-invalid, parse failure, or validation failure) |
+| `5` | Docker error — **reserved.** Docker is optional and degrades gracefully (warn + continue), so wtb does not currently exit with this code; Docker problems either warn (and the command still succeeds) or surface as `1`. |
 
 ## Development
 
