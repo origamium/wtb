@@ -633,7 +633,7 @@ wtb init-claude --user                   # ~/.claude/skills/wtb/SKILL.md
 
 ### データソース: `wtb ports`
 
-Skill は `wtb ports --json` を呼び出して結果を読み取ります。シェルから直接使うこともできます:
+Skill は `wtb ports` を呼び出して結果を読み取ります(JSON がデフォルト出力 — `--json` フラグは存在しません)。シェルから直接使うこともできます:
 
 ```bash
 wtb ports                                # 現 worktree を JSON オブジェクトで
@@ -672,7 +672,7 @@ Skill インストール後は、次のような依頼が自然に通ります:
 
 | 発言 | Claude の挙動 |
 |-----|---------------|
-| 「ここの API のポート教えて」 | `wtb ports --json` を実行 → 該当ポートを返答 |
+| 「ここの API のポート教えて」 | `wtb ports` を実行(JSON がデフォルト)→ 該当ポートを返答 |
 | 「worktree 一覧見せて」 | `wtb ls -l` |
 | 「feature/login の worktree 作って」 | `wtb create feature/login`(破壊的変更は事前確認) |
 | 「feature/old 片付けて」 | `wtb ls -l` で対象表示 → 確認 → `wtb remove feature/old` |

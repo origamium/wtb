@@ -553,7 +553,7 @@ Flags: `-f, --force` (overwrite existing), `--user` (global), `--dry-run` (previ
 
 ### `wtb ports` — the data source
 
-The skill tells Claude to call `wtb ports --json`. The command is useful on its own too:
+The skill tells Claude to call `wtb ports` (JSON is the default output — there is no `--json` flag). The command is useful on its own too:
 
 ```bash
 wtb ports                                # current worktree as a JSON object
@@ -592,7 +592,7 @@ With the skill installed, typical prompts just work:
 
 | You say | Claude does |
 |---------|-------------|
-| "What port is the API on here?" | `wtb ports --json` → picks the right host port |
+| "What port is the API on here?" | `wtb ports` → picks the right host port (JSON by default) |
 | "List the worktrees." | `wtb ls -l` |
 | "Make a worktree for feature/login." | `wtb create feature/login` (prompts you first if destructive) |
 | "Clean up feature/old." | `wtb ls -l` to show the target → confirms → `wtb remove feature/old` |
