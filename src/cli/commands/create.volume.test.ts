@@ -206,6 +206,30 @@ describe("setupVolumeCopy orchestration", () => {
     expect(messages).toContain("already has data — skipping")
   })
 
+  it("skips when target volume size cannot be determined and force=false", async () => {
+    // getVolumeSize returns null on a probe failure — must NOT be treated as empty
+    // (which would silently overwrite). Skip instead.
+    vi.mocked(volumeModule.getVolumeSize).mockImplementation((name) =>
+      name === "target_proj_postgres_data" ? null : 0
+    )
+    await run(false)
+    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+    const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
+    expect(messages).toContain("size could not be determined")
+  })
+
+  it("overwrites when target size is unknown and force=true", async () => {
+    vi.mocked(volumeModule.getVolumeSize).mockImplementation((name) =>
+      name === "target_proj_postgres_data" ? null : 0
+    )
+    await run(true)
+    expect(volumeModule.copyVolume).toHaveBeenCalledWith(
+      "source_proj_postgres_data",
+      "target_proj_postgres_data",
+      expect.objectContaining({ clearTarget: true })
+    )
+  })
+
   it("clears target and clones when target has data and force=true", async () => {
     vi.mocked(volumeModule.getVolumeSize).mockImplementation((name) =>
       name === "target_proj_postgres_data" ? 1024 : 0

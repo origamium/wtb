@@ -619,15 +619,20 @@ export async function setupVolumeCopy(
         }
       }
 
-      // target に既にデータが入っているかチェック (空の volume ならコピーで上書き OK)
+      // target に既にデータが入っているかチェック (空の volume ならコピーで上書き OK)。
+      // getVolumeSize は確定できないと null を返す。null を「空」と誤認して上書き
+      // しないよう、null は「データがあるかもしれない」として扱う。
       let targetHadData = false
       if (volumeExists(target.name)) {
         const targetSize = getVolumeSize(target.name)
-        if (targetSize > 0) {
+        const targetMayHaveData = targetSize === null || targetSize > 0
+        if (targetMayHaveData) {
           if (!options.force) {
-            console.log(
-              `  ⚠️  ${key}: target volume '${target.name}' already has data — skipping (use --force-volume-copy to overwrite)`
-            )
+            const reason =
+              targetSize === null
+                ? "size could not be determined — skipping (use --force-volume-copy to overwrite anyway)"
+                : "already has data — skipping (use --force-volume-copy to overwrite)"
+            console.log(`  ⚠️  ${key}: target volume '${target.name}' ${reason}`)
             skippedCount++
             continue
           }

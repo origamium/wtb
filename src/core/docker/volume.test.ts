@@ -302,4 +302,16 @@ describe("copyVolume atomic overwrite", () => {
     expect(clearedTarget()).toBe(false)
     expect(spawn).toHaveBeenCalled()
   })
+
+  it("aborts without clearing the target when the volume-size probe fails", async () => {
+    // du errors → getVolumeSize returns null. The verify gate must treat 'cannot
+    // determine' as abort, NOT as 'empty', so the destructive commit never runs.
+    vi.mocked(execDockerSafe).mockImplementation((args: string[]) => {
+      if (args.includes(DU_CMD)) throw new Error("docker daemon hiccup")
+      return ""
+    })
+    await expect(copyVolume(SOURCE, TARGET, { clearTarget: true })).rejects.toThrow(/probe failed/)
+    expect(clearedTarget()).toBe(false)
+    expect(removedTemp()).toBe(true)
+  })
 })

@@ -34,12 +34,15 @@ export interface VolumeCopyOptions {
 }
 
 /**
- * ボリュームのサイズを取得
+ * ボリュームのサイズを取得する。
  *
  * @param volumeName - ボリューム名
- * @returns サイズ（バイト）
+ * @returns サイズ(バイト)。空の volume は `0`。**サイズを確定できなかった場合
+ *   (docker エラー / 出力が数値でない) は `null`** を返す。`null` と `0` を区別
+ *   することが重要: コピーの skip / 破壊的な上書き判定はこの値に依存するため、
+ *   「プローブ失敗」を「空」と取り違えると既存データを誤って消しかねない。
  */
-export function getVolumeSize(volumeName: string): number {
+export function getVolumeSize(volumeName: string): number | null {
   try {
     const output = execDockerSafe(
       [
@@ -54,9 +57,10 @@ export function getVolumeSize(volumeName: string): number {
       ],
       {}
     )
-    return parseInt(output, 10) || 0
+    const size = parseInt(output, 10)
+    return Number.isNaN(size) ? null : size
   } catch {
-    return 0
+    return null
   }
 }
 
@@ -138,7 +142,7 @@ export async function copyVolumeWithRsync(
     // 既に存在する場合は無視
   }
 
-  const totalBytes = getVolumeSize(sourceVolume)
+  const totalBytes = getVolumeSize(sourceVolume) ?? 0
 
   const rsyncFlags = ["-a", "--info=progress2", "--no-inc-recursive"]
 
@@ -273,7 +277,7 @@ export async function copyVolumeWithCp(
     // 既に存在する場合は無視
   }
 
-  const totalBytes = getVolumeSize(sourceVolume)
+  const totalBytes = getVolumeSize(sourceVolume) ?? 0
 
   if (onProgress) {
     onProgress({
@@ -379,12 +383,21 @@ async function copyVolumeAtomicOverwrite(
   options: VolumeCopyOptions
 ): Promise<void> {
   const tmp = makeTempVolumeName(targetVolume)
-  createVolume(tmp)
   try {
+    createVolume(tmp)
     // 1. stage
     await copyVolume(sourceVolume, tmp, { onProgress: options.onProgress })
-    // 2. verify
-    if (getVolumeSize(sourceVolume) > 0 && getVolumeSize(tmp) === 0) {
+    // 2. verify — この gate だけが破壊的な commit を守る。サイズを確定できない
+    //    (getVolumeSize が null) 場合は「空かもしれない」を「空でない」と誤認して
+    //    target を消すことがないよう、確認できないなら必ず abort する。
+    const sourceSize = getVolumeSize(sourceVolume)
+    const stagedSize = getVolumeSize(tmp)
+    if (sourceSize === null || stagedSize === null) {
+      throw new Error(
+        `Cannot verify staged copy of '${sourceVolume}' (volume size probe failed) — aborting overwrite to protect '${targetVolume}'`
+      )
+    }
+    if (sourceSize > 0 && stagedSize === 0) {
       throw new Error(
         `Staged copy of '${sourceVolume}' is empty — aborting overwrite to protect '${targetVolume}'`
       )
@@ -392,7 +405,7 @@ async function copyVolumeAtomicOverwrite(
     // 3. commit (target を消すのはここが初めて)
     await copyVolumeWithCp(tmp, targetVolume, { clearTarget: true })
   } finally {
-    // 4. cleanup
+    // 4. cleanup (createVolume も try 内に入れたので、途中失敗でも temp を掃除する)
     removeVolume(tmp)
   }
 }
