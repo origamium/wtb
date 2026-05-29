@@ -230,15 +230,28 @@ describe("setupVolumeCopy orchestration", () => {
     )
   })
 
-  it("reports failure when copyVolume throws", async () => {
+  it("reports failure when copyVolume throws (counted as failed, not skipped)", async () => {
     vi.mocked(volumeModule.copyVolume).mockRejectedValue(new Error("rsync exploded"))
-    await run()
+    const result = await run()
     // No container running → stack never stopped → restart must not fire.
     expect(composeModule.composeStart).not.toHaveBeenCalled()
     const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
     expect(messages).toContain("Failed to clone postgres_data")
     expect(messages).toContain("rsync exploded")
-    expect(messages).toContain("0 volume(s) cloned, 1 skipped")
+    expect(messages).toContain("0 volume(s) cloned, 0 skipped, 1 failed")
+    // The parsable result distinguishes a real failure from an intentional skip,
+    // so the create banner can be qualified instead of reporting clean success.
+    expect(result).toEqual({ copied: 0, skipped: 0, failed: 1 })
+  })
+
+  it("returns a counts summary distinguishing copied / skipped / failed", async () => {
+    // postgres_data clones; cache's source is absent (intentional skip).
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      composeFixture({ postgres_data: null, cache: null })
+    )
+    vi.mocked(volumeModule.volumeExists).mockImplementation((name) => name !== "source_proj_cache")
+    const result = await run()
+    expect(result).toEqual({ copied: 1, skipped: 1, failed: 0 })
   })
 
   it("respects volumes.exclude", async () => {

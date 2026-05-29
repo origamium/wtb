@@ -50,6 +50,20 @@ interface CreateOptions {
 }
 
 /**
+ * setupVolumeCopy の結果サマリ。
+ * - copied: 正常にクローンできた volume 数
+ * - skipped: 意図的に skip した数 (external / source 不在 / target にデータあり /
+ *   --no-stop で稼働中 / 停止後も別 project が使用中)
+ * - failed: copyVolume が例外を投げた数 (= データ分離が未達成)。これが 1 以上なら
+ *   worktree は作成されてもデータ的に半端な状態なので、呼び出し側で明示的に surface する。
+ */
+export interface VolumeCopyResult {
+  copied: number
+  skipped: number
+  failed: number
+}
+
+/**
  * createコマンドを作成
  */
 export function createCommand(): Command {
@@ -216,6 +230,7 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
 
   // Volume clone phase (named volumes from compose are auto-cloned to the new
   // worktree's project so e.g. PostgreSQL data carries over).
+  let volumeFailures = 0
   if (config.docker_compose_file && !skipDocker) {
     console.log("")
     if (skipVolumeCopy) {
@@ -223,10 +238,11 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
     } else if (dryRun) {
       previewVolumeCopy(gitRoot, config)
     } else {
-      await setupVolumeCopy(gitRoot, worktreePath, config, {
+      const volumeResult = await setupVolumeCopy(gitRoot, worktreePath, config, {
         force: forceVolumeCopy,
         stop: options.stop,
       })
+      volumeFailures = volumeResult.failed
     }
   }
 
@@ -248,7 +264,15 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
   if (dryRun) {
     console.log("🔍 Dry run complete — no changes were made")
   } else {
-    console.log("🎉 Worktree created successfully!")
+    if (volumeFailures > 0) {
+      // worktree itself is created, but its data isolation is incomplete. Make this
+      // loud and machine-parsable so an autonomous agent doesn't treat it as clean.
+      console.log(
+        `⚠️  Worktree created, but ${volumeFailures} volume(s) FAILED to clone — this worktree's data is NOT fully isolated. See the errors above; re-run the clone after resolving them.`
+      )
+    } else {
+      console.log("🎉 Worktree created successfully!")
+    }
     console.log("")
     console.log("Next steps:")
     console.log(`  cd ${worktreePath}`)
@@ -479,24 +503,25 @@ export async function setupVolumeCopy(
   worktreePath: string,
   config: WtbConfig,
   options: { force?: boolean; stop?: boolean }
-): Promise<void> {
-  if (!config.docker_compose_file) return
+): Promise<VolumeCopyResult> {
+  const NONE: VolumeCopyResult = { copied: 0, skipped: 0, failed: 0 }
+  if (!config.docker_compose_file) return NONE
 
   const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
-  if (!existsSync(sourceComposePath)) return
+  if (!existsSync(sourceComposePath)) return NONE
 
   let composeConfig: ReturnType<typeof readComposeFile>
   try {
     composeConfig = readComposeFile(sourceComposePath)
   } catch (error) {
     console.log(`📦 Volume clone skipped: cannot read compose file (${getErrorMessage(error)})`)
-    return
+    return NONE
   }
 
   const exclude = config.volumes?.exclude ?? []
   const cloneable = discoverCloneableVolumes(composeConfig, exclude)
   if (cloneable.length === 0) {
-    return // nothing to copy — silent
+    return NONE // nothing to copy — silent
   }
 
   // Compose の実際のプロジェクト名 (compose-spec 準拠) を解決する。
@@ -552,6 +577,7 @@ export async function setupVolumeCopy(
 
   let copiedCount = 0
   let skippedCount = 0
+  let failedCount = 0
 
   try {
     for (const key of cloneable) {
@@ -621,11 +647,13 @@ export async function setupVolumeCopy(
         copiedCount++
       } catch (error) {
         console.log(`  ❌ Failed to clone ${key}: ${getErrorMessage(error)}`)
-        skippedCount++
+        failedCount++
       }
     }
 
-    console.log(`  → ${copiedCount} volume(s) cloned, ${skippedCount} skipped`)
+    console.log(
+      `  → ${copiedCount} volume(s) cloned, ${skippedCount} skipped, ${failedCount} failed`
+    )
   } finally {
     if (restartOnAbort) {
       process.removeListener("SIGINT", restartOnAbort)
@@ -643,6 +671,8 @@ export async function setupVolumeCopy(
       }
     }
   }
+
+  return { copied: copiedCount, skipped: skippedCount, failed: failedCount }
 }
 
 /**

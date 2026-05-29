@@ -114,7 +114,12 @@ After creation, the new worktree path is printed at the end. `cd` there, then re
 
 ### Recovering a skipped/empty volume clone
 
-There is **no standalone re-clone subcommand** — volume cloning only happens during `create`. If the volume-clone output shows a skip (`source volume … does not exist`, `is in use by …`, or `target … already has data`), the worktree is already created but its DB volume is empty or stale. To recover:
+There is **no standalone re-clone subcommand** — volume cloning only happens during `create`. Two distinct signals matter, and `create` keeps the worktree either way:
+
+- **Failure** — if a clone errors, the per-volume line is `❌ Failed to clone …`, the summary shows `… N failed`, and the final banner is **`⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`** (instead of the `🎉` success banner). Treat this as data-not-ready: surface it, don't proceed as if clean.
+- **Skip** — an intentional skip (`source volume … does not exist`, `is in use by …`, or `target … already has data`) means the volume was deliberately not copied; the worktree's DB volume is empty or stale.
+
+To recover from either:
 
 - **Default runs no longer skip just because the source is running** — wtb stops/restarts it automatically. On a default run a skip means one of: `--no-stop` was used; the source stack couldn't be stopped (e.g. Docker daemon error — look for "Could not stop source stack"); the volume is *still* in use after stopping (a shared, explicitly-`name:`d volume held by another Compose project); the target already had data; or the source volume didn't exist yet. The exact reason is printed on the skip line.
 - If skipped due to `--no-stop` + a running source: `docker compose stop` the source stack, then re-run the clone by removing and recreating the worktree (`wtb remove <branch>` → `wtb create <branch>`), or copy the volume manually with `docker run --rm -v <src>:/from -v <dst>:/to alpine cp -a /from/. /to/`.
