@@ -190,20 +190,32 @@ export function adjustPortsInCompose(config: ComposeConfig, usedPorts: number[])
  * console.log(availablePort) // 3003
  * ```
  */
+/** 有効な TCP ポートの上限（host port の妥当性判定用）。 */
+const MAX_TCP_PORT = 65535
+
 export function findAvailablePort(basePort: number, usedPorts: number[]): number {
   const used = new Set(usedPorts)
-  // 元のポートを優先しつつ、レンジ上限まで探索する（旧実装は基準から 100 個しか
-  // 走査せず、すべて埋まっていると「使用中の basePort」をそのまま返していた）。
-  const start = Math.max(basePort, PORT_RANGE.MIN)
+
+  // README どおり「元の host port をまず試し、空いていればそのまま使う」。
+  // 80 や 443、あるいは 9999 超の有効ポートを、空いているのに wtb のレンジ
+  // [MIN, MAX] へ無理やり移動させてはいけない（旧実装はそうしていた）。
+  if (basePort >= 1 && basePort <= MAX_TCP_PORT && !used.has(basePort)) {
+    return basePort
+  }
+
+  // 使用中の場合のみ空きを探索する。特権ポートを避けるため、探索開始は
+  // max(basePort + 1, MIN) に寄せ、MAX まで上方向に探したのちレンジ内を巻き戻す。
+  // 旧実装は基準から 100 個しか走査せず、その後は「使用中かもしれない basePort」を
+  // 無検証で返していた（= 衝突するポートを返し得た）。
+  const start = Math.max(basePort + 1, PORT_RANGE.MIN)
   for (let p = start; p <= PORT_RANGE.MAX; p++) {
     if (!used.has(p)) return p
   }
-  // 上方向で見つからなければ MIN 〜 start の範囲も走査する。
-  for (let p = PORT_RANGE.MIN; p < start; p++) {
+  for (let p = PORT_RANGE.MIN; p < start && p <= PORT_RANGE.MAX; p++) {
     if (!used.has(p)) return p
   }
 
-  // レンジ全体が埋まっている場合のみ警告して basePort を返す（事実上到達しない）。
+  // wtb のレンジ全体が埋まっている場合のみ警告して basePort を返す（事実上到達しない）。
   console.warn(
     `⚠️  No free port available in range ${PORT_RANGE.MIN}-${PORT_RANGE.MAX}; keeping original port ${basePort}`
   )

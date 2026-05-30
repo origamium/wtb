@@ -1628,3 +1628,112 @@ describe("create command — init-claude tip", () => {
     expect(result.stdout).not.toContain('Run "wtb init-claude"')
   })
 })
+
+describe("Main-repository guards (real git, not mocked)", () => {
+  // Closes the unit-test blind spot where worktree.js is auto-mocked: here the real
+  // isSamePath canonical-path comparison runs against an actual repo.
+  let repo: TestRepo
+
+  beforeEach(() => {
+    repo = createTestRepo("basic", "main-guard")
+  })
+  afterEach(() => {
+    repo.cleanup()
+  })
+
+  it("`remove main` refuses to delete the main repository worktree", () => {
+    const r = repo.runCLI("remove main")
+    expect(r.exitCode).not.toBe(0)
+    expect(r.combined).toContain("Cannot remove the main repository worktree")
+    // the repo itself must still be intact
+    expect(existsSync(repo.path)).toBe(true)
+    expect(existsSync(path.join(repo.path, ".git"))).toBe(true)
+  })
+
+  it("`reclone main` refuses to target the main repository worktree", () => {
+    const r = repo.runCLI("reclone main")
+    expect(r.exitCode).not.toBe(0)
+    expect(r.combined).toContain("Refusing to reclone into the main repository worktree")
+  })
+})
+
+describe("Create — env.adjust value types (number / string / null), end to end", () => {
+  let repo: TestRepo
+
+  beforeEach(() => {
+    repo = createTestRepo("env-adjust", "adjust-types")
+    // Override config + env to drive all three value types through the real CLI.
+    repo.writeFile(
+      "wtb.yaml",
+      [
+        "base_branch: main",
+        "copy_files: []",
+        "env:",
+        "  file:",
+        "    - ./.env",
+        "  adjust:",
+        "    APP_PORT: 1", // number → next free port
+        '    API_KEY: "replaced-by-wtb"', // string → literal replacement
+        "    OLD_FLAG: null", // null → remove the key",
+        "",
+      ].join("\n")
+    )
+    repo.writeFile(
+      ".env",
+      ["APP_PORT=3000", "API_KEY=original-secret", "OLD_FLAG=enabled", "KEEP_ME=untouched", ""].join(
+        "\n"
+      )
+    )
+  })
+  afterEach(() => {
+    repo.cleanup()
+  })
+
+  it("bumps a number, replaces a string verbatim, removes a null key, and leaves others alone", () => {
+    const r = repo.runCLI("create test/adjust --no-docker --no-start")
+    expect(r.exitCode).toBe(0)
+    const env = repo.readWorktreeFile("test/adjust", ".env")
+    expect(env).toContain("APP_PORT=3001") // number → original+1
+    expect(env).toContain("API_KEY=replaced-by-wtb") // string → literal
+    expect(env).not.toMatch(/^OLD_FLAG=/m) // null → removed
+    expect(env).toContain("KEEP_ME=untouched") // untouched key preserved
+  })
+})
+
+describe("Create — skip flags actually skip their phase", () => {
+  it("--no-env leaves the worktree without an adjusted .env", () => {
+    const repo = createTestRepo("env-adjust", "no-env")
+    try {
+      const r = repo.runCLI("create test/no-env --no-env --no-docker --no-start")
+      expect(r.exitCode).toBe(0)
+      // .env is gitignored and only arrives via the env phase; --no-env skips it entirely.
+      expect(repo.worktreeFileExists("test/no-env", ".env")).toBe(false)
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("--no-copy does not copy a gitignored copy_files entry", () => {
+    const repo = createTestRepo("link-files", "no-copy")
+    try {
+      // config/settings.json is gitignored and only in copy_files → absent with --no-copy.
+      const r = repo.runCLI("create test/no-copy --no-copy --no-docker --no-start")
+      expect(r.exitCode).toBe(0)
+      expect(repo.worktreeFileExists("test/no-copy", "config/settings.json")).toBe(false)
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("--no-link does not create a symlinked link_files entry", () => {
+    const repo = createTestRepo("link-files", "no-link")
+    try {
+      // shared-data is gitignored and only in link_files → absent with --no-link.
+      const r = repo.runCLI("create test/no-link --no-link --no-docker --no-start")
+      expect(r.exitCode).toBe(0)
+      expect(repo.worktreeFileExists("test/no-link", "shared-data")).toBe(false)
+    } finally {
+      repo.cleanup()
+    }
+  })
+})
