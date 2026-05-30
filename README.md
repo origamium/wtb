@@ -409,7 +409,7 @@ env:
 
 | Value type | Behavior on existing key | Behavior when key is absent |
 |------------|--------------------------|-----------------------------|
-| **number** | Scans other worktrees + this file for the same key's port, then picks the first free port starting at `original + 1`. The number literal itself is used as a type marker — any positive integer works. | Key is appended with the number literal as its value, annotated `# Added by wtb`. |
+| **number** | Scans other worktrees + this file for the same key's port, then picks the first free port starting at `original + 1`. The number literal itself is used as a type marker — any positive integer works. | **Nothing is added** — wtb prints a warning. A port adjustment needs an existing value to bump, so writing the marker integer (e.g. `PORT=1`) would be meaningless. Define the key in the file, or use a string value to add a literal. |
 | **string** | Value is replaced verbatim. | Key is appended with the string value. |
 | **null**   | Key is removed from the output. | No-op. |
 

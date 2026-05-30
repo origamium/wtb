@@ -307,13 +307,24 @@ export function copyAndAdjustEnvFile(
   // 新しい環境変数を追加（既存にない場合のみ）
   const existingKeys = new Set(parsed.entries.map((e) => e.key))
   for (const [key, value] of Object.entries(adjustments)) {
-    if (!existingKeys.has(key) && value !== null && typeof value !== "function") {
-      const strValue = typeof value === "number" ? value.toString() : (value as string)
-      const newEntry: EnvEntry = { key, value: strValue, comment: "Added by wtb" }
-      parsed.entries.push(newEntry)
-      parsed.lines.push({ type: "entry", key, value: strValue, comment: "Added by wtb" })
-      adjustedCount++
+    if (existingKeys.has(key) || value === null || typeof value === "function") continue
+
+    if (typeof value === "number") {
+      // 数値調整は「既存のポート値を空きポートにずらす」もの。対象キーがこのファイルに
+      // 無い場合、ずらす元のポートが無く、型マーカーの数値（例: 1）をそのまま書くのは
+      // 無意味で誤解を招く（PORT=1 のように見える）。追記せず警告だけ出す。
+      console.warn(
+        `⚠️  env.adjust: "${key}" is a port adjustment but isn't present in this env file — nothing added (a port adjustment needs an existing value to bump). Define ${key} in the file, or use a string value to add a literal.`
+      )
+      continue
     }
+
+    // string: リテラルとして新キーを追記する（意図的に値を足せる）。
+    const strValue = value as string
+    const newEntry: EnvEntry = { key, value: strValue, comment: "Added by wtb" }
+    parsed.entries.push(newEntry)
+    parsed.lines.push({ type: "entry", key, value: strValue, comment: "Added by wtb" })
+    adjustedCount++
   }
 
   writeEnvFile(targetPath, parsed, options)

@@ -6,7 +6,7 @@ import { existsSync } from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 import fs from "fs-extra"
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   backupEnvFile,
   copyAndAdjustEnvFile,
@@ -273,6 +273,36 @@ describe("copyAndAdjustEnvFile", () => {
     expect(count).toBe(1)
     const result = fs.readFileSync(targetPath, "utf-8")
     expect(result).toContain("NEW_VAR=new_value")
+  })
+
+  it("warns and adds nothing when a numeric (port) adjust key is absent", () => {
+    const sourcePath = path.join(tmpDir, ".env")
+    const targetPath = path.join(tmpDir, ".env.out")
+    fs.writeFileSync(sourcePath, "EXISTING=value\n")
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+    // PORT is a port-type (numeric) adjustment but isn't in the file → wtb must
+    // NOT append the meaningless marker literal (`PORT=1`); it warns and skips.
+    const count = copyAndAdjustEnvFile(sourcePath, targetPath, { PORT: 1 })
+
+    const result = fs.readFileSync(targetPath, "utf-8")
+    expect(result).not.toContain("PORT=1")
+    expect(result).not.toContain("PORT=")
+    expect(count).toBe(0)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("PORT"))
+    warn.mockRestore()
+  })
+
+  it("still appends an absent STRING adjust key as a literal", () => {
+    const sourcePath = path.join(tmpDir, ".env")
+    const targetPath = path.join(tmpDir, ".env.out")
+    fs.writeFileSync(sourcePath, "EXISTING=value\n")
+
+    const count = copyAndAdjustEnvFile(sourcePath, targetPath, { API_BASE: "http://x" })
+
+    const result = fs.readFileSync(targetPath, "utf-8")
+    expect(result).toContain("API_BASE=http://x")
+    expect(count).toBe(1)
   })
 
   it("should apply function adjustments", () => {
