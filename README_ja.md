@@ -176,6 +176,7 @@ wtb create bugfix/urgent-fix
 | `--force-volume-copy` | 稼働中コンテナや既存 target volume があってもクローンを試行（dev のみ・データ破損リスクあり） |
 | `--no-stop` | クローン前にソース Compose スタックを自動 stop せず、稼働中 volume を skip する（旧挙動） |
 | `--seed` | クローンの代わりに seed する: volume クローンフェーズをスキップし、新 worktree 内で `volumes.seed_command` を実行する。ソース volume に一切触れないためソーススタックは止めない。`volumes.seed_command` の設定が必須で、`--force-volume-copy` とは排他。詳細は [Volume の自動クローン](#volume-の自動クローン) |
+| `--strict` | volume クローンまたは seed コマンドが 1 つでも失敗したら非ゼロ (`1`) で終了する(既定は exit `0` — worktree は作成済み)。データ分離の不完全さを検知したい CI / コーディングエージェント向け。詳細は [Volume の自動クローン](#volume-の自動クローン) |
 | `--dry-run` | 実際の変更を行わず、実行内容をプレビュー |
 
 **使用例:**
@@ -240,6 +241,7 @@ wtb remove feature/abandoned -f --no-end
 |-----------|------|
 | `--force-volume-copy` | source 稼働中・target に既存データがあってもクローン(上書きは atomic) |
 | `--no-stop` | source Compose スタックを自動 stop せず、稼働中 volume を skip |
+| `--strict` | volume が 1 つでもクローン失敗したら非ゼロ (`1`) で終了(既定は exit `0`)。データ分離の不完全さを検知したい CI / コーディングエージェント向け |
 | `--dry-run` | クローン対象をプレビューし、変更しない |
 
 ```bash
@@ -248,7 +250,7 @@ wtb reclone feature/auth          # 特定の worktree
 wtb reclone feature/auth --force-volume-copy   # 古い target データを上書き
 ```
 
-`create` と同じ `N cloned, N skipped, N failed` サマリを出力します。failure があっても exit `0` で、`⚠️  … data is NOT fully isolated` を明示します(解消して再実行)。main リポジトリ worktree は対象にできません(source と target が同一 project になるため)。`docker_compose_file` 未設定なら no-op(メッセージのみ)。再クローンではなく再 seed したい場合は worktree 内で `volumes.seed_command` を実行してください。
+`create` と同じ `N cloned, N skipped, N failed` サマリを出力します。既定では failure があっても exit `0` で、`⚠️  … data is NOT fully isolated` を明示します(解消して再実行。`--strict` を渡すと exit `1`)。main リポジトリ worktree は対象にできません(source と target が同一 project になるため)。`docker_compose_file` 未設定なら no-op(メッセージのみ)。再クローンではなく再 seed したい場合は worktree 内で `volumes.seed_command` を実行してください。
 
 ### `wtb prune`
 
@@ -546,7 +548,7 @@ volumes:
 
 その実行回だけスキップしたいときは `wtb create <branch> --no-volume-copy`、ソーススタックを止めずに稼働中 volume を skip したいときは `--no-stop`、稼働中ソースを止めずに強制ライブコピーしたい (dev のみ・データ破損リスクあり) ときは `--force-volume-copy`。
 
-volume ごとのサマリは `N cloned, N skipped, N failed` の形式で出力されます。いずれかの volume のクローンが **failed** になった場合、worktree 自体は作成されますが、最後のバナーが `🎉 Worktree created successfully!` から `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated` に変わり、不完全な状態が明示されます(なお終了コードは `0` のまま — worktree は存在するため)。*skip* は意図的(external/除外 volume、source 不在、`--no-stop` 下での稼働中、target に既存データ)、*failure* はコピー自体がエラーになったことを意味します。
+volume ごとのサマリは `N cloned, N skipped, N failed` の形式で出力されます。いずれかの volume のクローンが **failed** になった場合、worktree 自体は作成されますが、最後のバナーが `🎉 Worktree created successfully!` から `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated` に変わり、不完全な状態が明示されます。既定では終了コードは `0` のまま(worktree は存在するため)ですが、**`--strict`** を渡すとクローン(または `--seed`)失敗時に exit `1` になり、CI やコーディングエージェントがデータ分離の不完全さを検知できます。*skip* は意図的(external/除外 volume、source 不在、`--no-stop` 下での稼働中、target に既存データ)、*failure* はコピー自体がエラーになったことを意味します。
 
 `wtb remove <branch>` はデフォルトでは clone した volume を削除しません(`docker compose down` のデフォルト挙動と整合)。`wtb remove <branch> --remove-volumes` で `docker compose down -v` 相当に切り替わり volume も削除されます。これは自動 teardown 経由で動くため、teardown が省略される場合(`--no-docker` 時、または `end_command` 設定時)は no-op になり警告が出ます(その場合は `end_command` 側で volume を削除してください)。こうして残った volume は時間とともに孤児として溜まるので、[`wtb prune`](#wtb-prune) でまとめて掃除できます(wtb が作る volume には `wtb.managed=true` ラベルが付きます)。
 
@@ -570,7 +572,7 @@ wtb create feature/clean-db --seed
 
 - `--seed` は `volumes.seed_command` の設定が必須です。未設定なら worktree を作る前に exit `4` で失敗します。
 - `--seed` と `--force-volume-copy` は排他です(片方は seed、もう片方は clone)。両方渡すと exit `1` で失敗します。
-- seed コマンドが失敗した場合、worktree 自体は作成されますがバナーが `⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready` に変わります(終了コードは `0` のまま — 失敗クローンと同じ契約)。修正後に worktree 内で seed を再実行してください。
+- seed コマンドが失敗した場合、worktree 自体は作成されますがバナーが `⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready` に変わります(終了コードは `0` のまま — 失敗クローンと同じ契約。`--strict` を渡すと exit `1` になる)。修正後に worktree 内で seed を再実行してください。
 
 ## アーキテクチャ
 
@@ -595,7 +597,7 @@ src/
 
 主要な設計判断:
 
-- **git/docker は全て `execFileSync` 経由。** 引数は配列で渡され、文字列に展開されないため、ブランチ名やパスが含むメタ文字でシェル注入されない。例外はユーザ提供の `start_command` / `end_command` のみで、これは意図的に `/bin/sh` 経由で実行する。
+- **git/docker にシェル注入の余地なし。** ユーザ入力由来の値(ブランチ名・パス)は `execFileSync` に配列で渡し、文字列に展開しないため、メタ文字でシェル注入されない。一部の固定的な `docker compose` 呼び出しは `execSync` を使うが、渡すのはハードコードされた定数のみ(ユーザ入力は含まない)。意図的にシェルを使うのはユーザ提供の `start_command` / `end_command` だけで、これは `/bin/sh` 経由で実行する。
 - **`??` でデフォルトマージ。** 未定義フィールドはデフォルトに、明示的な空配列・空文字列は保存される。
 - **順序保存 `.env` パーサ。** コメント、空行、行末コメントもラウンドトリップで保たれる。
 - **`ls` は pure renderer。** `renderDefault`/`renderLong`/`renderPaths`/`renderJson` は単独でユニットテスト可能、コマンドモジュールはそれらを繋ぐだけ。

@@ -12,7 +12,7 @@ import { Command } from "commander"
 import { EXIT_CODES } from "../../constants/index.js"
 import { loadConfig } from "../../core/config/loader.js"
 import { getGitRootOrThrow } from "../../core/git/repository.js"
-import { getWorktreePath, listWorktrees } from "../../core/git/worktree.js"
+import { getWorktreePath, isSamePath, listWorktrees } from "../../core/git/worktree.js"
 import { CLIError } from "../../utils/error.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
 import { previewVolumeCopy, setupVolumeCopy } from "./create.js"
@@ -20,6 +20,7 @@ import { previewVolumeCopy, setupVolumeCopy } from "./create.js"
 interface RecloneOptions {
   forceVolumeCopy?: boolean
   stop?: boolean
+  strict?: boolean
   dryRun?: boolean
 }
 
@@ -42,6 +43,10 @@ export function recloneCommand(): Command {
     .option(
       "--no-stop",
       "Don't auto-stop the source Compose stack before cloning live volumes (skip in-use volumes instead)"
+    )
+    .option(
+      "--strict",
+      "Exit non-zero (1) if any volume fails to clone (default: exit 0). Use in CI / coding-agent pipelines that must detect incomplete data isolation."
     )
     .option("--dry-run", "Show what would be cloned without making changes")
     .action(withErrorHandling(executeRecloneCommand))
@@ -90,7 +95,8 @@ async function executeRecloneCommand(
 
   // main repo を対象にすると source project == target project になり、volume を
   // 自分自身にクローンする無意味/危険な操作になるため拒否する。
-  if (path.resolve(worktreePath) === path.resolve(gitRoot)) {
+  // symlink 経由でガードを回避されないよう canonical path で比較する。
+  if (isSamePath(worktreePath, gitRoot)) {
     throw new CLIError(
       "Refusing to reclone into the main repository worktree (source and target would be the same project). Run reclone for a non-main worktree.",
       EXIT_CODES.GENERAL_ERROR
@@ -121,10 +127,14 @@ async function executeRecloneCommand(
 
   console.log("")
   if (result.failed > 0) {
-    // create と同じ contract: コマンドは exit 0 だが、データ未達成を明示する。
+    // 既定では create と同じ contract: コマンドは exit 0 だが、データ未達成を明示する。
     console.log(
       `⚠️  Reclone finished, but ${result.failed} volume(s) FAILED — this worktree's data is NOT fully isolated. See the errors above; resolve them and re-run \`wtb reclone\`.`
     )
+    // --strict のときだけ非ゼロ終了して CI/エージェントに失敗を伝える。
+    if (options.strict === true) {
+      process.exit(EXIT_CODES.GENERAL_ERROR)
+    }
   } else {
     console.log(
       `✅ Reclone complete — ${result.copied} cloned, ${result.skipped} skipped, 0 failed.`

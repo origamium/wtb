@@ -45,6 +45,9 @@ describe("reclone command", () => {
       volumes: { exclude: [] },
     })
     vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({ copied: 1, skipped: 0, failed: 0 })
+    // 既定では「別パス」(main repo ではない) として扱う。main repo ガードのテストだけ true に上書きする。
+    // clearAllMocks は実装(mockReturnValue)をリセットしないため、ここで明示的に既定値を設定する。
+    vi.mocked(worktreeModule.isSamePath).mockReturnValue(false)
   })
 
   afterEach(() => {
@@ -89,6 +92,9 @@ describe("reclone command", () => {
 
   it("refuses to target the main repository worktree", async () => {
     vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project") // == gitRoot
+    // canonical 比較ヘルパは worktree.js モックで auto-mock されるため、ここでは
+    // 同一パス判定 (true) を返させてガードを発火させる。
+    vi.mocked(worktreeModule.isSamePath).mockReturnValue(true)
     const exit = vi.spyOn(process, "exit").mockImplementation(() => {
       throw new Error("exit")
     })
@@ -123,5 +129,45 @@ describe("reclone command", () => {
     await command.parseAsync(["feature/x"], { from: "user" })
 
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("data is NOT fully isolated"))
+  })
+
+  it("exits 0 by default even when a volume fails (worktree still exists)", async () => {
+    vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
+    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({ copied: 0, skipped: 0, failed: 1 })
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit")
+    })
+
+    // 既定では失敗しても process.exit を呼ばない（= 例外を投げない）。
+    await command.parseAsync(["feature/x"], { from: "user" })
+    expect(exit).not.toHaveBeenCalled()
+    exit.mockRestore()
+  })
+
+  it("exits non-zero with --strict when a volume fails", async () => {
+    vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
+    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({ copied: 0, skipped: 0, failed: 2 })
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit")
+    })
+
+    await expect(command.parseAsync(["feature/x", "--strict"], { from: "user" })).rejects.toThrow(
+      "exit"
+    )
+    expect(exit).toHaveBeenCalledWith(EXIT_CODES.GENERAL_ERROR)
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("data is NOT fully isolated"))
+    exit.mockRestore()
+  })
+
+  it("exits 0 with --strict when all volumes succeed", async () => {
+    vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
+    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({ copied: 2, skipped: 0, failed: 0 })
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit")
+    })
+
+    await command.parseAsync(["feature/x", "--strict"], { from: "user" })
+    expect(exit).not.toHaveBeenCalled()
+    exit.mockRestore()
   })
 })

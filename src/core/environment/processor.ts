@@ -52,17 +52,16 @@ interface ParsedEnvFile {
  * originalPort + 1 から順に空きを探す
  */
 function findNextFreePort(originalPort: number, usedPorts: Set<number>): number {
-  let candidate = originalPort + 1
-  let attempts = 0
-  while (attempts < PORT_RANGE.SEARCH_LIMIT) {
+  // README どおり常に originalPort + 1 から上方向に探索する。
+  // 旧実装は 100 個までしか走査せず、その後は使用中かもしれない originalPort + 1 を
+  // 無検証で返していた。レンジ上限まで走査してから初めてフォールバックする。
+  for (let candidate = originalPort + 1; candidate <= PORT_RANGE.MAX; candidate++) {
     if (!usedPorts.has(candidate)) {
       return candidate
     }
-    candidate++
-    attempts++
   }
   console.warn(
-    `⚠️  Could not find available port after ${PORT_RANGE.SEARCH_LIMIT} attempts, using ${originalPort + 1}`
+    `⚠️  Could not find a free port above ${originalPort} within range; using ${originalPort + 1}`
   )
   return originalPort + 1
 }
@@ -95,10 +94,47 @@ export function parseEnvFile(filePath: string, options?: FileOperationOptions): 
 }
 
 /**
+ * `KEY=` の右辺を value とインラインコメントに分解する。
+ *
+ * - 値が引用符で囲まれている場合、閉じ引用符までを value とし、`#` を値の一部として
+ *   扱う（旧実装は引用符より前に最初の `#` をコメント扱いしていたため、
+ *   `KEY="http://x#frag"` のような値を破壊していた）。閉じ引用符の後ろに `#` があれば
+ *   それをコメントとする。
+ * - 引用符で囲まれていない場合は、最初の `#` 以降をインラインコメントとして扱う。
+ */
+function parseEnvValue(rawValue: string): { value: string; comment?: string } {
+  const raw = rawValue.trim()
+  const quote = raw[0]
+  if (quote === '"' || quote === "'") {
+    const closeIdx = raw.indexOf(quote, 1)
+    if (closeIdx !== -1) {
+      const value = raw.slice(1, closeIdx)
+      const rest = raw.slice(closeIdx + 1)
+      const hashIdx = rest.indexOf("#")
+      const comment = hashIdx !== -1 ? rest.slice(hashIdx + 1).trim() || undefined : undefined
+      return { value, comment }
+    }
+    // 閉じ引用符が無い不正な値はそのまま value として保持（コメント解析しない）。
+    return { value: rawValue }
+  }
+
+  const hashIdx = rawValue.indexOf("#")
+  if (hashIdx !== -1) {
+    const comment = rawValue.slice(hashIdx + 1).trim() || undefined
+    return { value: rawValue.slice(0, hashIdx).trim(), comment }
+  }
+  return { value: rawValue }
+}
+
+/**
  * 環境変数ファイルの内容を解析（行順序を保持）
  */
 export function parseEnvContent(content: string): ParsedEnvFile {
-  const lines = content.split("\n")
+  // CRLF / LF どちらの改行でも処理できるよう正規化して分割する。
+  // `split("\n")` だけだと CRLF ファイルでは各行に末尾 `\r` が残り、
+  // `KEY=VALUE` 正規表現が `$` でマッチせず全エントリが解析対象から漏れてしまう
+  // （= ポート調整が無言で no-op になる）。
+  const lines = content.split(/\r?\n/)
   const parsedLines: EnvLine[] = []
   const entries: EnvEntry[] = []
 
@@ -115,29 +151,7 @@ export function parseEnvContent(content: string): ParsedEnvFile {
     const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
     if (match) {
       const [, key, rawValue] = match
-
-      let value = rawValue
-      // 値の前後の引用符を除去
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1)
-      }
-
-      // インラインコメントをチェック
-      let comment: string | undefined
-      const commentMatch = rawValue.match(/^[^#]*#\s*(.+)$/)
-      if (commentMatch) {
-        comment = commentMatch[1].trim()
-        value = rawValue.replace(/#.*$/, "").trim()
-        if (
-          (value.startsWith('"') && value.endsWith('"')) ||
-          (value.startsWith("'") && value.endsWith("'"))
-        ) {
-          value = value.slice(1, -1)
-        }
-      }
+      const { value, comment } = parseEnvValue(rawValue)
 
       const entry: EnvEntry = { key, value, comment }
       parsedLines.push({ type: "entry", key, value, comment })

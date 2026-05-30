@@ -191,25 +191,21 @@ export function adjustPortsInCompose(config: ComposeConfig, usedPorts: number[])
  * ```
  */
 export function findAvailablePort(basePort: number, usedPorts: number[]): number {
-  let candidatePort = basePort
-  let attempts = 0
-  const maxAttempts = PORT_RANGE.SEARCH_LIMIT
-
-  while (attempts < maxAttempts) {
-    if (
-      !usedPorts.includes(candidatePort) &&
-      candidatePort >= PORT_RANGE.MIN &&
-      candidatePort <= PORT_RANGE.MAX
-    ) {
-      return candidatePort
-    }
-    candidatePort++
-    attempts++
+  const used = new Set(usedPorts)
+  // 元のポートを優先しつつ、レンジ上限まで探索する（旧実装は基準から 100 個しか
+  // 走査せず、すべて埋まっていると「使用中の basePort」をそのまま返していた）。
+  const start = Math.max(basePort, PORT_RANGE.MIN)
+  for (let p = start; p <= PORT_RANGE.MAX; p++) {
+    if (!used.has(p)) return p
+  }
+  // 上方向で見つからなければ MIN 〜 start の範囲も走査する。
+  for (let p = PORT_RANGE.MIN; p < start; p++) {
+    if (!used.has(p)) return p
   }
 
-  // 上限に達した場合は警告を出して元のポートを返す
+  // レンジ全体が埋まっている場合のみ警告して basePort を返す（事実上到達しない）。
   console.warn(
-    `⚠️  Could not find available port after ${maxAttempts} attempts, using original port ${basePort}`
+    `⚠️  No free port available in range ${PORT_RANGE.MIN}-${PORT_RANGE.MAX}; keeping original port ${basePort}`
   )
   return basePort
 }

@@ -10,7 +10,12 @@ import { Command } from "commander"
 import { EXIT_CODES } from "../../constants/index.js"
 import { loadConfig } from "../../core/config/loader.js"
 import { getGitRootOrThrow } from "../../core/git/repository.js"
-import { getWorktreePath, listWorktrees, removeWorktree } from "../../core/git/worktree.js"
+import {
+  getWorktreePath,
+  isSamePath,
+  listWorktrees,
+  removeWorktree,
+} from "../../core/git/worktree.js"
 import { CLIError, getErrorMessage } from "../../utils/error.js"
 import { executeLifecycleCommand } from "../../utils/exec.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
@@ -58,8 +63,10 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
     throw new CLIError(`No worktree found for branch '${branch}'`, EXIT_CODES.GENERAL_ERROR)
   }
 
-  // メインリポジトリの削除を防止
-  if (worktreePath === gitRoot) {
+  // メインリポジトリの削除を防止。
+  // git が片方を symlink 解決済み・片方を未解決で返すケースに備え、canonical path で比較する
+  // （文字列等価だと symlink 経由でガードを回避でき、main repo を誤削除する恐れがある）。
+  if (isSamePath(worktreePath, gitRoot)) {
     throw new CLIError("Cannot remove the main repository worktree", EXIT_CODES.GENERAL_ERROR)
   }
 

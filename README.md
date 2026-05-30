@@ -165,6 +165,7 @@ Creates a new worktree for `<branch>`, branching from `base_branch` unless the b
 | `--force-volume-copy` | Clone volumes even when the source container is running or the target volume already has data |
 | `--no-stop` | Don't auto-stop the source Compose stack before cloning; skip in-use volumes instead (the old behavior) |
 | `--seed` | Seed the data instead of cloning: skip the volume-clone phase and run `volumes.seed_command` in the new worktree. Never touches the source volume, so the source stack is left running. Requires `volumes.seed_command` in the config; mutually exclusive with `--force-volume-copy`. See [Volume cloning](#volume-cloning) |
+| `--strict` | Exit non-zero (`1`) if any volume clone or the seed command fails (default: exit `0` — the worktree still exists). For CI / coding-agent pipelines that must detect incomplete data isolation. See [Volume cloning](#volume-cloning) |
 | `--dry-run` | Print the plan, make no changes |
 
 Examples:
@@ -205,6 +206,7 @@ Re-runs **only the volume-clone phase** for an existing worktree — useful when
 |--------|-------------|
 | `--force-volume-copy` | Clone even when the source container is running or the target already has data (overwrite is atomic) |
 | `--no-stop` | Don't auto-stop the source Compose stack; skip in-use volumes instead |
+| `--strict` | Exit non-zero (`1`) if any volume fails to clone (default: exit `0`). For CI / coding-agent pipelines that must detect incomplete data isolation |
 | `--dry-run` | Print which volumes would be cloned; make no changes |
 
 ```bash
@@ -416,7 +418,7 @@ Port collision sources considered:
 1. Other worktrees' `.env` files (only for keys listed as numbers in `env.adjust`).
 2. Other numeric entries in the current adjustment pass (so a single file doesn't collide with itself).
 
-Key naming: only POSIX-compliant names are valid (`^[A-Za-z_][A-Za-z0-9_]*$`). Invalid names are reported with a suggested sanitized form.
+Key naming: only POSIX-compliant names (`^[A-Za-z_][A-Za-z0-9_]*$`) are recognized as adjustable variables. Lines whose key doesn't match are passed through untouched (they're treated as ordinary file content, not as keys to adjust).
 
 ## Docker Compose integration
 
@@ -465,7 +467,7 @@ volumes:
 
 Disable the whole phase per-invocation with `wtb create <branch> --no-volume-copy`. Keep the source stack running and skip in-use volumes with `--no-stop`. Force-clone running source volumes live (data-loss risk, dev only) with `--force-volume-copy`.
 
-The per-volume summary reports `N cloned, N skipped, N failed`. If any volume **fails** to clone, the worktree is still created but the final banner changes from `🎉 Worktree created successfully!` to `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`, so the incomplete state is obvious (note: the command still exits `0` — the worktree exists). A *skip* is intentional (external/excluded volume, missing source, in-use under `--no-stop`, or a target that already has data); a *failure* means the copy itself errored.
+The per-volume summary reports `N cloned, N skipped, N failed`. If any volume **fails** to clone, the worktree is still created but the final banner changes from `🎉 Worktree created successfully!` to `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`, so the incomplete state is obvious. By default the command still exits `0` (the worktree exists) — pass **`--strict`** to make a clone (or `--seed`) failure exit `1` instead, so CI and coding-agent pipelines can detect incomplete data isolation. A *skip* is intentional (external/excluded volume, missing source, in-use under `--no-stop`, or a target that already has data); a *failure* means the copy itself errored.
 
 `wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`). Because that runs through the automatic teardown, `--remove-volumes` is a no-op (with a warning) when teardown is skipped — under `--no-docker`, or when `end_command` is set (then your `end_command` owns volume removal). Volumes left behind this way accumulate as orphans over time — sweep them with [`wtb prune`](#wtb-prune) (every wtb-created volume carries the `wtb.managed=true` label).
 
@@ -489,7 +491,7 @@ Notes:
 
 - `--seed` requires `volumes.seed_command` to be set; otherwise `create` fails with exit `4` before creating the worktree.
 - `--seed` and `--force-volume-copy` are mutually exclusive (one seeds, the other clones) — passing both fails with exit `1`.
-- If the seed command fails, the worktree is still created but the banner becomes `⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready` (exit stays `0`, same contract as a failed clone). Re-run the seed inside the worktree after fixing it.
+- If the seed command fails, the worktree is still created but the banner becomes `⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready` (exit stays `0`, same contract as a failed clone; pass `--strict` to exit `1` instead). Re-run the seed inside the worktree after fixing it.
 
 ## Lifecycle scripts
 
@@ -520,7 +522,7 @@ For full module-by-module API surface and design rationale, see [ARCHITECTURE.md
 
 Key design choices:
 
-- **`execFileSync` everywhere for git/docker.** Arguments are passed as arrays, never interpolated into strings — no shell injection surface on branch names or paths. The one exception is user-supplied lifecycle scripts, which intentionally run via `/bin/sh`.
+- **No shell-injection surface for git/docker.** Anything derived from user input (branch names, paths) is passed to `execFileSync` as array arguments, never interpolated into a shell string. A few fixed `docker compose` invocations use `execSync` with hardcoded constants only (no user input). The one place a shell is used intentionally is user-supplied lifecycle scripts, which run via `/bin/sh`.
 - **Defaults-merge with `??`.** Missing fields fall back to defaults, but empty arrays/strings you explicitly set are preserved.
 - **Order-preserving `.env` parsing.** Comments, blank lines, and inline `# comments` survive the copy + adjust round-trip.
 - **Pure renderers for `ls`.** `renderDefault`/`renderLong`/`renderPaths`/`renderJson` are unit-tested in isolation; the command module just wires them up.
