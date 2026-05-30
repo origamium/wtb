@@ -565,6 +565,14 @@ npm run check                  # biome check --write (lint + format)
 
 E2E tests (`e2e/`) create temporary git repos and exercise the compiled CLI end-to-end. See `sample/` for a runnable playground — a tiny Next.js + Postgres stack with a real `wtb.yaml`, `.env`, and `docker-compose.yml`.
 
+For a broader spread of configs — full-stack Compose, minimal Compose, seed/exclude/external volumes, a no-Docker Node project, and a bare-minimum setup — see [`examples/`](examples/). Each is a self-contained project, and `examples/try.sh <example> [branch] [--real]` drives the real CLI against any of them in a throwaway git repo (dry-run by default):
+
+```bash
+examples/try.sh                                   # list the examples
+examples/try.sh minimal                           # preview the plan
+examples/try.sh compose-minimal feature/db --real # real run (clones the DB volume)
+```
+
 ## Design notes
 
 - **Symlinks beat copies for large trees.** `node_modules`, `.cache`, `.next/cache` should almost always go in `link_files`. One source of truth, zero disk duplication, instant worktree creation. The tradeoff: native modules rebuilt for a different platform in one worktree affect all of them — use `copy_files` for those.

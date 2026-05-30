@@ -1,0 +1,29 @@
+# node-no-docker — everything wtb does EXCEPT Docker.
+#
+# A plain Node service: no docker_compose_file, so the Docker phases are skipped
+# entirely. Still exercises copy_files, link_files (node_modules), env.adjust
+# port remapping, and a start_command.
+
+base_branch: main
+# docker_compose_file omitted → Docker skipped entirely.
+
+copy_files:
+  - .env
+  - .env.local # raw-copied secrets (not in env.file, so not adjusted)
+
+link_files:
+  - node_modules
+
+start_command: npm run setup
+
+env:
+  # Only .env is parsed + adjusted. Keep the adjust keys in the one file that
+  # owns them — listing a second file here that lacks these keys would make wtb
+  # append marker lines (e.g. `PORT=1 # Added by wtb`) to it.
+  file:
+    - ./.env
+  adjust:
+    PORT: 1 # 4000 → next free port
+    WS_PORT: 1 # 4001 → next free port
+    LOG_LEVEL: debug # string → literal replacement
+    DEPRECATED_FLAG: null # null → remove the variable entirely

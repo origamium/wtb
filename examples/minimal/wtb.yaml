@@ -1,0 +1,16 @@
+# minimal — the smallest useful wtb config.
+#
+# No Docker, no symlinks, no lifecycle scripts. Just: copy .env into each new
+# worktree and bump one port so two worktrees don't collide. This is the
+# "I only need isolated checkouts with their own port" baseline.
+
+base_branch: main
+
+copy_files:
+  - .env
+
+env:
+  file:
+    - ./.env
+  adjust:
+    PORT: 1 # 8080 → next free port

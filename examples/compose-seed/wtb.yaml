@@ -1,0 +1,30 @@
+# compose-seed — exercises the three "don't just clone everything" paths:
+#
+#   1. volumes.exclude     → a regenerable cache volume is never cloned
+#   2. external: true      → a shared volume is skipped (shared by design)
+#   3. volumes.seed_command → `wtb create --seed` builds a fresh DB instead of
+#                             cloning main's data (never touches the source stack)
+
+base_branch: main
+docker_compose_file: ./docker-compose.yml
+
+copy_files:
+  - .env
+
+env:
+  file:
+    - ./.env
+  adjust:
+    DB_PORT: 1
+
+volumes:
+  # cache_data is cheap to rebuild — don't waste time/disk cloning it.
+  exclude:
+    - cache_data
+  # Used by `wtb create --seed`: seed a fresh DB in the new worktree instead of
+  # cloning main's. Runs in the worktree via /bin/sh; never reads a live source
+  # volume, so the source stack is left running.
+  seed_command: docker compose up -d db && ./scripts/seed.sh
+
+# Note: shared_assets is declared `external: true` in docker-compose.yml, so wtb
+# skips it automatically (no config needed) — it's shared across worktrees.
