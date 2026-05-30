@@ -516,7 +516,7 @@ env:
 設定読み込み時に wtb は以下を検証します:
 
 - **エラー** (exit code `4` で失敗): 型違反、`base_branch` 欠落/不正、`copy_files`/`link_files` が配列でない、`env.adjust` の値型違反 など。
-- **警告** (stderr に出力、処理は続行): `docker_compose_file` / `env.file` で参照したパスがディスク上に存在しない場合。
+- **警告** (stderr に出力、処理は続行): `docker_compose_file` / `env.file` で参照したパスがディスク上に存在しない場合。`env.adjust` のキーが POSIX env var 名として不正な場合(どの `.env` 行ともマッチしない — wtb が修正案を提示する)。
 
 ## Volume の自動クローン
 
