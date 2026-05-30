@@ -86,6 +86,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unit/e2e CI suites.
 
 ### Fixed
+- **`wtb ls -l` columns stay aligned with CJK relative dates.** The AGE column width
+  was measured with `.length` (code units) while padding used display width, so a
+  wide relative date (e.g. `3日前` — 3 code units, 5 columns) desynced the AGE column
+  and everything after it in CJK locales. AGE now uses display width like the other
+  columns.
+- **`wtb ls` now marks the current worktree from a subdirectory.** The `→` marker
+  used an exact cwd↔worktree-path match, so running `wtb ls` from anywhere below a
+  worktree root showed no marker. cwd is now resolved to its containing worktree
+  (longest-prefix match), matching the documented "the worktree that contains your
+  current working directory".
+- **Compose host-port remapping keeps a free original port even outside 3000-9999.**
+  `findAvailablePort` relocated a *free* host port that was below 3000 (e.g. `80`) or
+  above 9999 (e.g. `15432`) into the search range; it now keeps any free valid port
+  and only bumps occupied ones (biased into 3000-9999 to avoid privileged ports).
+- **`env.adjust` keys are validated.** A key that isn't a valid POSIX env var name
+  (and so could never match a `.env` entry) now produces a config warning with a
+  suggested sanitized name, instead of being silently ineffective.
 - **`remove --remove-volumes` silently ignored.** `--remove-volumes` only acts via
   the automatic `docker compose down -v`, which is skipped under `--no-docker` or
   when `end_command` is set — so the flag did nothing, with no feedback. wtb now

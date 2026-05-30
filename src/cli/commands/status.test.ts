@@ -3,8 +3,8 @@
  * 新しいディレクトリ構造に対応したテストファイル
  */
 
+import { existsSync } from "node:fs"
 import type { Command } from "commander"
-import { existsSync } from "fs-extra"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { EXIT_CODES } from "../../constants/index.js"
 import * as loaderModule from "../../core/config/loader.js"
@@ -21,7 +21,10 @@ vi.mock("../../core/git/repository.js")
 vi.mock("../../core/git/worktree.js")
 vi.mock("../../core/docker/client.js")
 vi.mock("../../core/docker/compose.js")
-vi.mock("fs-extra", () => ({
+// status.ts reads existsSync from node:fs — mock THAT (partially, keeping every
+// other node:fs function real) so env-file detection is actually controllable here.
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
   existsSync: vi.fn(),
 }))
 
@@ -372,5 +375,161 @@ describe("Status Command (Refactored)", () => {
       const payload = parseStdout()
       expect(payload.worktrees).toEqual([])
     })
+  })
+})
+
+describe("Status Command — human output structure (ordered, end to end render)", () => {
+  let consoleSpy: ReturnType<typeof vi.spyOn>
+  let command: Command
+
+  // Full assembled human output, in order (console.log() with no args → blank line).
+  const output = () => consoleSpy.mock.calls.map((c) => (c[0] ?? "") as string).join("\n")
+  const assertOrder = (out: string, lines: string[]) => {
+    let cursor = -1
+    for (const line of lines) {
+      const idx = out.indexOf(line, cursor + 1)
+      expect(idx, `expected "${line}" to appear after the previous line`).toBeGreaterThan(cursor)
+      cursor = idx
+    }
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {})
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    command = statusCommand()
+    vi.mocked(repositoryModule.getGitRoot).mockReturnValue("/project")
+    vi.mocked(repositoryModule.getGitRootOrThrow).mockReturnValue("/project")
+    vi.mocked(repositoryModule.getCurrentBranch).mockReturnValue("main")
+    vi.mocked(loaderModule.loadConfig).mockReturnValue({
+      base_branch: "main",
+      docker_compose_file: "./docker-compose.yml",
+      copy_files: [],
+      link_files: [],
+      env: { file: [], adjust: {} },
+    })
+    vi.mocked(dockerClientModule.getRunningContainers).mockReturnValue([])
+    vi.mocked(dockerClientModule.getDockerVolumes).mockReturnValue([])
+    vi.mocked(dockerClientModule.getWtbManagedVolumeNames).mockReturnValue([])
+    vi.mocked(dockerClientModule.getDockerInfo).mockReturnValue({
+      dockerVersion: "Docker version 26.0.0",
+      composeVersion: "v2.27.0",
+      isAvailable: true,
+    })
+    vi.mocked(existsSync).mockReturnValue(false)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it("renders the documented worktree → docker structure in the right order", async () => {
+    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+      { path: "/project", branch: "main", head: "abc" },
+    ])
+    vi.mocked(dockerComposeModule.findComposeFile).mockReturnValue("/project/docker-compose.yml")
+    vi.mocked(dockerComposeModule.readComposeFile).mockReturnValue({
+      services: { web: { image: "nginx" }, db: { image: "postgres" } },
+    })
+    // only .env exists in the worktree → the Environment line lists exactly it
+    vi.mocked(existsSync).mockImplementation((p) => String(p).endsWith("/.env"))
+    vi.mocked(dockerClientModule.getRunningContainers).mockReturnValue([
+      {
+        id: "c1",
+        name: "project_web_1",
+        image: "nginx:alpine",
+        status: "Up 3 minutes",
+        ports: ["0.0.0.0:3001->80/tcp"],
+        volumes: [],
+        networks: [],
+      },
+    ])
+    vi.mocked(dockerClientModule.isWtbContainer).mockReturnValue(true)
+    vi.mocked(dockerClientModule.getDockerVolumes).mockReturnValue([
+      { name: "project_pg_data", driver: "local", mountpoint: "/v/project_pg_data" },
+    ])
+    vi.mocked(dockerClientModule.getWtbManagedVolumeNames).mockReturnValue(["project_pg_data"])
+
+    await command.parseAsync([], { from: "user" })
+    const out = output()
+
+    assertOrder(out, [
+      "📁 Git Worktrees Status",
+      "→ main (main)",
+      "   📂 /project",
+      "   🐳 Docker: docker-compose.yml",
+      "   📦 Services: 2",
+      "   🔧 Environment: .env",
+      "🐳 Docker Environment Status",
+      "📦 Running Containers: 1",
+      "🌿 project_web_1", // wtb container marker
+      "   🏷️  Image: nginx:alpine",
+      "   🔗 Status: Up 3 minutes",
+      "   🔌 Ports: 0.0.0.0:3001->80/tcp",
+      "🗂️  Total Volumes: 1",
+      "🌿 wtb Volumes: 1",
+      "   📁 project_pg_data",
+      "      Driver: local",
+      "🔧 Docker Information",
+      "   Docker version 26.0.0",
+      "   Docker Compose: v2.27.0",
+    ])
+  })
+
+  it("marks only the current worktree with → and only the main worktree with (main)", async () => {
+    vi.mocked(repositoryModule.getCurrentBranch).mockReturnValue("feature")
+    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+      { path: "/project", branch: "main", head: "abc" }, // main, not current
+      { path: "/project-feature", branch: "feature", head: "def" }, // current, not main
+    ])
+    vi.mocked(dockerComposeModule.findComposeFile).mockReturnValue(null)
+
+    await command.parseAsync(["--all"], { from: "user" })
+    const out = output()
+
+    expect(out).toContain("→ feature") // current gets the arrow
+    expect(out).not.toContain("→ main") // main is not current → no arrow
+    expect(out).toMatch(/ {2}main \(main\)/) // main gets the (main) tag, space marker
+    expect(out).not.toContain("feature (main)") // feature is not main → no tag
+  })
+
+  it("--docker-only suppresses the worktree section (human mode)", async () => {
+    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+      { path: "/project", branch: "main", head: "abc" },
+    ])
+
+    await command.parseAsync(["--docker-only"], { from: "user" })
+    const out = output()
+
+    expect(out).not.toContain("📁 Git Worktrees Status")
+    expect(out).not.toContain("→ main")
+    expect(out).toContain("🐳 Docker Environment Status")
+  })
+
+  it('shows "No compose file" when a worktree has no compose file', async () => {
+    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+      { path: "/project", branch: "main", head: "abc" },
+    ])
+    vi.mocked(dockerComposeModule.findComposeFile).mockReturnValue(null)
+
+    await command.parseAsync([], { from: "user" })
+
+    expect(output()).toContain("   🐳 Docker: No compose file")
+  })
+
+  it("lists every detected env file on the Environment line, in order", async () => {
+    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+      { path: "/project", branch: "main", head: "abc" },
+    ])
+    vi.mocked(dockerComposeModule.findComposeFile).mockReturnValue(null)
+    // .env and .env.local present; .env.development / .env.production absent
+    vi.mocked(existsSync).mockImplementation((p) => {
+      const s = String(p)
+      return s.endsWith("/.env") || s.endsWith("/.env.local")
+    })
+
+    await command.parseAsync([], { from: "user" })
+
+    expect(output()).toContain("   🔧 Environment: .env, .env.local")
   })
 })

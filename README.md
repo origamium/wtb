@@ -366,7 +366,7 @@ If nothing is found, wtb still runs with defaults (prints a warning to stderr). 
 On load, wtb validates the config:
 
 - **Errors** (fail with exit code `4`): wrong types, missing/invalid `base_branch`, non-array `copy_files`/`link_files`, invalid `env.adjust` value type.
-- **Warnings** (stderr, keep running): referenced `docker_compose_file` / `env.file` not found on disk.
+- **Warnings** (stderr, keep running): referenced `docker_compose_file` / `env.file` not found on disk; an `env.adjust` key that isn't a valid POSIX env var name (it would never match a `.env` entry — wtb suggests a sanitized form).
 
 ### Annotated example
 

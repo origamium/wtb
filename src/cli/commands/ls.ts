@@ -3,7 +3,6 @@
  * Gitのworktree一覧をls風に表示する
  */
 
-import * as path from "node:path"
 import { Command } from "commander"
 import { enrichWorktree } from "../../core/git/commit-info.js"
 import { getGitRootOrThrow } from "../../core/git/repository.js"
@@ -15,6 +14,7 @@ import {
   renderJson,
   renderLong,
   renderPaths,
+  resolveCurrentWorktreePath,
 } from "../utils/worktree-render.js"
 
 /**
@@ -37,7 +37,9 @@ export function lsCommand(): Command {
 async function executeLsCommand(options: LsCommandOptions): Promise<void> {
   const gitRoot = getGitRootOrThrow()
   const worktrees = listWorktrees()
-  const currentPath = path.resolve(process.cwd())
+  // cwd をそれを含む worktree のルートに解決する（サブディレクトリから実行しても
+  // `→` マーカーが正しく出るように。README: "the worktree that contains your cwd"）。
+  const currentPath = resolveCurrentWorktreePath(worktrees, process.cwd())
 
   if (options.paths) {
     process.stdout.write(renderPaths(worktrees))

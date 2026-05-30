@@ -4,7 +4,48 @@
 
 import { describe, expect, it } from "vitest"
 import type { EnrichedWorktreeInfo, WorktreeInfo } from "../../types/index.js"
-import { renderDefault, renderJson, renderLong, renderPaths } from "./worktree-render.js"
+import {
+  renderDefault,
+  renderJson,
+  renderLong,
+  renderPaths,
+  resolveCurrentWorktreePath,
+  visualWidth,
+} from "./worktree-render.js"
+
+describe("resolveCurrentWorktreePath", () => {
+  const wts: WorktreeInfo[] = [
+    { path: "/repo", branch: "main", head: "a" },
+    { path: "/repo-feature", branch: "feature", head: "b" },
+  ]
+
+  it("returns the worktree root when cwd is exactly the root", () => {
+    expect(resolveCurrentWorktreePath(wts, "/repo")).toBe("/repo")
+    expect(resolveCurrentWorktreePath(wts, "/repo-feature")).toBe("/repo-feature")
+  })
+
+  it("resolves a SUBDIRECTORY of a worktree to that worktree root (the documented bug)", () => {
+    expect(resolveCurrentWorktreePath(wts, "/repo-feature/src/components")).toBe("/repo-feature")
+    expect(resolveCurrentWorktreePath(wts, "/repo/deep/nested/dir")).toBe("/repo")
+  })
+
+  it("does not let a path-prefix sibling match (/repo vs /repo-feature)", () => {
+    // "/repo-feature/x" must resolve to /repo-feature, NOT /repo (prefix-but-not-subpath).
+    expect(resolveCurrentWorktreePath(wts, "/repo-feature/x")).toBe("/repo-feature")
+  })
+
+  it("picks the most specific (longest) match for nested worktrees", () => {
+    const nested: WorktreeInfo[] = [
+      { path: "/repo", branch: "main", head: "a" },
+      { path: "/repo/sub", branch: "sub", head: "b" },
+    ]
+    expect(resolveCurrentWorktreePath(nested, "/repo/sub/x")).toBe("/repo/sub")
+  })
+
+  it("returns the resolved cwd when no worktree contains it (no marker)", () => {
+    expect(resolveCurrentWorktreePath(wts, "/elsewhere/x")).toBe("/elsewhere/x")
+  })
+})
 
 const FIXTURE: WorktreeInfo[] = [
   { path: "/repo", branch: "main", head: "abc1234" },
@@ -160,5 +201,44 @@ describe("renderJson", () => {
 
   it("produces valid JSON for empty array", () => {
     expect(JSON.parse(renderJson([], "/", "/"))).toEqual([])
+  })
+})
+
+describe("renderLong column alignment with wide (CJK) ageRelative", () => {
+  // Regression: ageWidth was computed with .length while padRight uses visualWidth,
+  // so CJK relative dates (e.g. "3日前" = 3 code units but 5 display columns)
+  // desynced the AGE column and everything after it.
+  const enriched = (
+    path: string,
+    branch: string,
+    ageRelative: string
+  ): EnrichedWorktreeInfo => ({
+    path,
+    branch,
+    head: "h",
+    shortHash: "abcdef0",
+    subject: "subject",
+    ageRelative,
+    ageTimestamp: "2026-04-19T00:00:00Z",
+    dirty: false,
+  })
+
+  it("keeps the PATH column at one visual offset across mixed-width ages", () => {
+    // All-CJK so the widest-by-display entry ("3日前", width 5) has a SMALLER .length
+    // (3) than its width — the exact shape that broke the old .length-based ageWidth.
+    const rows: EnrichedWorktreeInfo[] = [
+      enriched("/repoA", "main", "3日前"), // visualWidth 5, length 3
+      enriched("/repoB", "dev", "今"), // visualWidth 2, length 1
+    ]
+    const out = renderLong(rows, "/none", "/repoA")
+    const lines = out.split("\n").filter(Boolean)
+
+    // The header's PATH column must start at the same VISUAL column as every row's path.
+    const header = lines[0]
+    const headerPathOffset = visualWidth(header.slice(0, header.indexOf("PATH")))
+    for (const line of lines.slice(1)) {
+      const pathOffset = visualWidth(line.slice(0, line.indexOf("/repo")))
+      expect(pathOffset).toBe(headerPathOffset)
+    }
   })
 })

@@ -165,6 +165,19 @@ export function validateConfig(config: WtbConfig, configFile: string): void {
       })
     } else if (config.env.adjust) {
       Object.entries(config.env.adjust).forEach(([key, value]) => {
+        // キー名が POSIX env var 名でないと、どの .env 行ともマッチせず黙って効かない。
+        // 早期に警告し、修正案も併記する（致命的ではないので warning）。
+        if (!validateEnvVarName(key)) {
+          const suggestion = suggestEnvVarName(key)
+          errors.push({
+            message:
+              suggestion && suggestion !== key
+                ? `env.adjust key "${key}" is not a valid env var name and will never match a .env entry — did you mean "${suggestion}"?`
+                : `env.adjust key "${key}" is not a valid env var name and will never match a .env entry`,
+            field: `env.adjust.${key}`,
+            severity: "warning",
+          })
+        }
         if (value !== null && typeof value !== "string" && typeof value !== "number") {
           errors.push({
             message: `env.adjust.${key} must be null, string, or number`,
@@ -255,24 +268,4 @@ export function suggestEnvVarName(name: string): string {
   }
 
   return result
-}
-
-/**
- * 設定オブジェクト内の環境変数名をすべて検証し、問題があれば修正案を提示
- */
-export function validateConfigEnvVars(config: WtbConfig): Record<string, string> {
-  const suggestions: Record<string, string> = {}
-
-  if (config.env?.adjust) {
-    Object.keys(config.env.adjust).forEach((key) => {
-      if (!validateEnvVarName(key)) {
-        const suggestion = suggestEnvVarName(key)
-        if (suggestion !== key) {
-          suggestions[key] = suggestion
-        }
-      }
-    })
-  }
-
-  return suggestions
 }

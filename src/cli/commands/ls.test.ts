@@ -121,6 +121,42 @@ describe("ls command", () => {
     expect(parsed[0]).toMatchObject({ shortHash: "aaa", subject: "hello", dirty: true })
   })
 
+  it("marks the worktree containing cwd with → even from a subdirectory", async () => {
+    // Regression: ls used exact cwd↔worktree-path match, so the marker vanished when
+    // run from a subdir. It must resolve cwd to its containing worktree.
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue("/repo-feature/src/app")
+    await command.parseAsync([], { from: "user" })
+    const output = writeSpy.mock.calls.map((c) => c[0]).join("")
+    expect(output).toMatch(/→\s+feature/)
+    expect(output).not.toMatch(/→\s+main/)
+    cwdSpy.mockRestore()
+  })
+
+  it("--json marks current via cwd and emits the documented base fields", async () => {
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue("/repo/deep/dir")
+    await command.parseAsync(["--json"], { from: "user" })
+    const parsed = JSON.parse(writeSpy.mock.calls.map((c) => c[0]).join(""))
+    const main = parsed.find((w: { branch: string }) => w.branch === "main")
+    const feature = parsed.find((w: { branch: string }) => w.branch === "feature")
+    expect(main).toMatchObject({ path: "/repo", branch: "main", isMain: true, isCurrent: true })
+    expect(feature).toMatchObject({ isMain: false, isCurrent: false })
+    // README: JSON always carries these fields
+    for (const key of [
+      "path",
+      "branch",
+      "head",
+      "isMain",
+      "isCurrent",
+      "locked",
+      "prunable",
+      "bare",
+      "detached",
+    ]) {
+      expect(main).toHaveProperty(key)
+    }
+    cwdSpy.mockRestore()
+  })
+
   it("one failing enrichment does not abort others", async () => {
     vi.mocked(commitInfoModule.enrichWorktree)
       .mockImplementationOnce(async (wt) => ({

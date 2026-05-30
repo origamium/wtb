@@ -87,6 +87,36 @@ describe("Config Validator (Refactored)", () => {
       stderrSpy.mockRestore()
     })
 
+    it("warns (not throws) and suggests a fix for a non-POSIX env.adjust key", () => {
+      const cfg: WtbConfig = {
+        base_branch: "main",
+        docker_compose_file: "",
+        copy_files: [],
+        link_files: [],
+        env: { file: [], adjust: { "app-port": 1 } },
+      }
+      const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+      expect(() => validateConfig(cfg, configFile)).not.toThrow()
+      const out = stderrSpy.mock.calls.map((c) => String(c[0])).join("")
+      expect(out).toContain('env.adjust key "app-port"')
+      expect(out).toContain("APP_PORT") // suggested sanitized form
+      stderrSpy.mockRestore()
+    })
+
+    it("does not warn for a valid POSIX env.adjust key", () => {
+      const cfg: WtbConfig = {
+        base_branch: "main",
+        docker_compose_file: "",
+        copy_files: [],
+        link_files: [],
+        env: { file: [], adjust: { APP_PORT: 1 } },
+      }
+      const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+      validateConfig(cfg, configFile)
+      expect(stderrSpy).not.toHaveBeenCalled()
+      stderrSpy.mockRestore()
+    })
+
     it("should warn (not throw) when docker_compose_file does not exist", () => {
       vi.mocked(existsSync).mockImplementation((path) => {
         return !path.toString().includes("docker-compose.yaml")

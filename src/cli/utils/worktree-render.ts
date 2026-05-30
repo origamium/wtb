@@ -55,6 +55,28 @@ function isCurrentWorktree(wt: WorktreeInfo, currentPath: string): boolean {
   return path.resolve(wt.path) === path.resolve(currentPath)
 }
 
+/**
+ * cwd を「それを含む worktree のルート」に解決する。
+ *
+ * README どおり `→` マーカーは *cwd を含む* worktree を指す必要がある。素朴に
+ * `process.cwd()` を渡すと renderer 側の厳密一致では worktree のサブディレクトリから
+ * 実行したときにどの worktree にもマッチせず、マーカーが出ない。ここで「cwd が等しい、
+ * または cwd が `<wt>/...` の配下にある」worktree のうち最も深いものを選び、その
+ * ルートパスを返す（ネストした worktree でも最長一致＝最も具体的なものが当たる）。
+ * どれにも含まれなければ cwd をそのまま返す（= どの worktree も current にならない）。
+ */
+export function resolveCurrentWorktreePath(worktrees: WorktreeInfo[], cwd: string): string {
+  const resolvedCwd = path.resolve(cwd)
+  let best: string | null = null
+  for (const wt of worktrees) {
+    const wtPath = path.resolve(wt.path)
+    if (resolvedCwd === wtPath || resolvedCwd.startsWith(`${wtPath}${path.sep}`)) {
+      if (best === null || wtPath.length > best.length) best = wtPath
+    }
+  }
+  return best ?? resolvedCwd
+}
+
 function isMainWorktree(wt: WorktreeInfo, gitRoot: string): boolean {
   return path.resolve(wt.path) === path.resolve(gitRoot)
 }
@@ -113,7 +135,10 @@ export function renderLong(
 
   const branchWidth = Math.max(...rows.map((r) => visualWidth(r.branch)), "BRANCH".length)
   const hashWidth = Math.max(...rows.map((r) => r.shortHash.length), "COMMIT".length)
-  const ageWidth = Math.max(...rows.map((r) => r.ageRelative.length), "AGE".length)
+  // 表示幅 (visualWidth) で計算する。padRight も visualWidth で詰めるため、ここで
+  // .length を使うと CJK 相対日付（例: "3日前" は .length 3 だが 5 カラム幅）で
+  // AGE 列以降がずれる。branch/path 列と同じく visualWidth に統一する。
+  const ageWidth = Math.max(...rows.map((r) => visualWidth(r.ageRelative)), "AGE".length)
   const pathWidth = Math.max(...rows.map((r) => visualWidth(r.path)), "PATH".length)
 
   const columns = process.stdout.columns || 120
