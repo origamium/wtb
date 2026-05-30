@@ -22,6 +22,7 @@ Git worktree をベースにした CLI ツールで、ブランチごとに独�
   - [`create`](#wtb-create-branch)
   - [`remove`](#wtb-remove-branch)
   - [`reclone`](#wtb-reclone-branch)
+  - [`prune`](#wtb-prune)
   - [`ls` / `list`](#wtb-ls-alias-list)
   - [`ports`](#wtb-ports)
   - [`status`](#wtb-status)
@@ -248,6 +249,23 @@ wtb reclone feature/auth --force-volume-copy   # 古い target データを上�
 ```
 
 `create` と同じ `N cloned, N skipped, N failed` サマリを出力します。failure があっても exit `0` で、`⚠️  … data is NOT fully isolated` を明示します(解消して再実行)。main リポジトリ worktree は対象にできません(source と target が同一 project になるため)。`docker_compose_file` 未設定なら no-op(メッセージのみ)。再クローンではなく再 seed したい場合は worktree 内で `volumes.seed_command` を実行してください。
+
+### `wtb prune`
+
+**孤児になった wtb 管理 Docker volume** — もう存在しない worktree 用に wtb がクローンした volume(`wtb remove` はデフォルトで volume を残すため)— と、中断された `--force-volume-copy` 上書きの**残骸 temp volume** を削除します。create/remove を繰り返すと溜まるので、その掃除用です。`wtb.managed=true` ラベル付き volume のみが対象で、このリポジトリの**どの worktree にも属さない** volume だけを削除します。
+
+| オプション | 説明 |
+|-----------|------|
+| `-y, --yes` | 実際に削除する。**指定しなければ dry-run**(候補の表示のみ) |
+| `--json` | 機械可読出力(`{ dryRun, candidates, removed }`) |
+
+```bash
+wtb prune            # 削除対象をプレビュー(安全・何も消さない)
+wtb prune --yes      # 孤児 + 残骸 temp volume を削除
+wtb prune --json     # スクリプト/agent 向けの機械可読プレビュー
+```
+
+安全策: **デフォルトは dry-run**(削除は `--yes` 必須)、コンテナ使用中の volume はスキップ、worktree の volume は Compose プロジェクト名の前方一致(`<project>_…`)で厳密判定するため稼働中 worktree のデータは消しません。live 判定は `git worktree list`(このリポジトリ)に基づきます。
 
 ### `wtb ls` (alias: `list`)
 
@@ -530,7 +548,7 @@ volumes:
 
 volume ごとのサマリは `N cloned, N skipped, N failed` の形式で出力されます。いずれかの volume のクローンが **failed** になった場合、worktree 自体は作成されますが、最後のバナーが `🎉 Worktree created successfully!` から `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated` に変わり、不完全な状態が明示されます(なお終了コードは `0` のまま — worktree は存在するため)。*skip* は意図的(external/除外 volume、source 不在、`--no-stop` 下での稼働中、target に既存データ)、*failure* はコピー自体がエラーになったことを意味します。
 
-`wtb remove <branch>` はデフォルトでは clone した volume を削除しません(`docker compose down` のデフォルト挙動と整合)。`wtb remove <branch> --remove-volumes` で `docker compose down -v` 相当に切り替わり volume も削除されます。これは自動 teardown 経由で動くため、teardown が省略される場合(`--no-docker` 時、または `end_command` 設定時)は no-op になり警告が出ます(その場合は `end_command` 側で volume を削除してください)。
+`wtb remove <branch>` はデフォルトでは clone した volume を削除しません(`docker compose down` のデフォルト挙動と整合)。`wtb remove <branch> --remove-volumes` で `docker compose down -v` 相当に切り替わり volume も削除されます。これは自動 teardown 経由で動くため、teardown が省略される場合(`--no-docker` 時、または `end_command` 設定時)は no-op になり警告が出ます(その場合は `end_command` 側で volume を削除してください)。こうして残った volume は時間とともに孤児として溜まるので、[`wtb prune`](#wtb-prune) でまとめて掃除できます(wtb が作る volume には `wtb.managed=true` ラベルが付きます)。
 
 ### クローンの代わりに seed する(`--seed`)
 
@@ -559,7 +577,7 @@ wtb create feature/clean-db --seed
 ```
 src/
 ├── cli/
-│   ├── commands/      create, remove, reclone, ls, ports, status, init-claude
+│   ├── commands/      create, remove, reclone, prune, ls, ports, status, init-claude
 │   ├── utils/         worktree/ports レンダラ、共通エラーラッパー、Claude Skill インストーラ
 │   └── index.ts       commander の組み立て + グローバルエラーハンドラ
 ├── core/

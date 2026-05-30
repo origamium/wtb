@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`wtb prune`** — clean up orphaned wtb-managed Docker volumes (volumes cloned for
+  worktrees that no longer exist, since `wtb remove` leaves volumes by default) plus
+  leftover `*__wtbtmp_*` temp volumes from interrupted `--force-volume-copy` overwrites.
+  **Dry-run by default** (lists candidates); `--yes` actually removes; `--json` for
+  scripts/agents. Only `wtb.managed=true`-labelled volumes that belong to no existing
+  worktree are touched; in-use volumes are skipped; live worktrees are matched by exact
+  Compose project prefix so their data is never removed. This also sweeps the previously
+  accepted SIGKILL temp-volume leak.
 - **wtb-created volumes are now labelled `wtb.managed=true`.** Every volume wtb
   creates (cloned targets, atomic-overwrite temps) carries the label, so it is
   self-identifying regardless of project/path naming. `wtb status` now detects
@@ -66,10 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name aligns with Docker's own `down -v` project resolution — no silent
   orphans), the safety guards (`--no-stop` skips an in-use source volume without
   corruption or stopping the source; a populated target is skipped without
-  `--force`, preserving its data), and the escape hatch (`--force-volume-copy`
-  live-clones a running source without stopping it). 10 checks — the full
-  volume-clone decision matrix. Skips cleanly when Docker is absent, so it stays
-  out of the mocked unit/e2e CI suites.
+  `--force`, preserving its data), the escape hatch (`--force-volume-copy`
+  live-clones a running source without stopping it), and `prune` orphan detection
+  (an orphaned volume is detected while a live worktree's volume is spared). 11
+  checks. Skips cleanly when Docker is absent, so it stays out of the mocked
+  unit/e2e CI suites.
 
 ### Fixed
 - **`remove --remove-volumes` silently ignored.** `--remove-volumes` only acts via

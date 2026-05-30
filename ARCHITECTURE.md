@@ -18,6 +18,7 @@ src/
 │   │   ├── create.ts                # wtb create — worktree 構築パイプライン（clone/--seed）
 │   │   ├── remove.ts                # wtb remove — Docker teardown / end_command / worktree 削除
 │   │   ├── reclone.ts               # wtb reclone — 既存 worktree の volume クローンのみ再実行
+│   │   ├── prune.ts                 # wtb prune — 孤児/残骸 wtb-managed volume の掃除
 │   │   ├── ls.ts                    # wtb ls   — worktree 一覧（-l で並列 enrichment）
 │   │   ├── ports.ts                 # wtb ports — 調整後ポート/エンドポイント表示
 │   │   ├── status.ts                # wtb status — worktree + Docker 状態（--json で機械可読）
@@ -272,6 +273,17 @@ volume clone が 1 件でも失敗、または `--seed` の seed が失敗した
 - 対象 worktree は引数 branch（無ければ cwd を含む worktree）。main worktree は source==target になるため拒否。`docker_compose_file` 未設定なら no-op。
 - `--force-volume-copy` / `--no-stop` / `--dry-run` 対応。failed>0 でも exit 0 + 「NOT fully isolated」バナー（create と同契約）。
 
+### `wtb prune [-y] [--json]`
+
+- 掃除対象 = `getWtbManagedVolumeNames()` (label=wtb.managed=true) のうち、(a) `*__wtbtmp_*`
+  を含む残骸 temp volume、または (b) 現在の全 worktree の Compose プロジェクト名
+  (`resolveComposeProjectName(worktree-compose, worktree-path)`) のどれにも `<project>_`
+  で前方一致しない孤児。`_` 区切りで前方一致判定するため `worktree-a` と `worktree-ab`
+  を取り違えない。
+- **デフォルトは dry-run** (一覧のみ)。`--yes` で実削除。コンテナ使用中
+  (`getContainersUsingVolume`) の volume はスキップ。削除後 `volumeExists` で検証。
+- `--json` は `{ dryRun, candidates[{name,reason,inUse}], removed[] }`。
+
 ### `wtb ls`
 
 - `listWorktrees()` 取得後、`--long` 時のみ `Promise.all(worktrees.map(enrichWorktree))` で並列に commit info を取得。
@@ -373,7 +385,7 @@ tarball に含まれるのは **`dist/`, `templates/`, `README.md`, `LICENSE`** 
 
 - **ポート探索の上限**: `PORT_RANGE.SEARCH_LIMIT = 100`。ベースポートから 100 連続で空きが見つからない場合は警告と共に元ポートを返す（衝突する可能性あり）。100 ブランチ以上の同時稼働は想定外。
 - **コンテナ名/ネットワーク名のプレフィックスは触らない**: `adjustPortsInCompose` は `ports` のみ書き換える。各 worktree は別 Compose project として動くので、サービスに **固定 `container_name:` を設定しない**こと（グローバル名なので worktree 間で衝突する）。未指定なら Compose が `<project>-<service>-N` と自動命名し並行起動できる（`sample/docker-compose.yml` 参照）。`external: true` でない named volume は worktree ごとにクローンされ project スコープで分離される。
-- **volume の atomic 上書きには最小の commit 窓がある**: Docker に volume rename が無いため、`--force-volume-copy` の上書きは「検証済み temp volume → target を clear+ローカル cp」で置換する。source 読み取り失敗で target が空になることはないが、commit 中（ローカル cp）に失敗すると target が中途半端になる。その場合 temp volume を残し復旧コマンドを表示する。SIGKILL 等での temp volume 残留は許容（ディスクコストより安全性を優先）。
+- **volume の atomic 上書きには最小の commit 窓がある**: Docker に volume rename が無いため、`--force-volume-copy` の上書きは「検証済み temp volume → target を clear+ローカル cp」で置換する。source 読み取り失敗で target が空になることはないが、commit 中（ローカル cp）に失敗すると target が中途半端になる。その場合 temp volume を残し復旧コマンドを表示する。SIGKILL 等で残った temp volume (`*__wtbtmp_*`) は `wtb prune` で掃除できる。
 - **Windows 未対応**: `execFileSync` でのパス解釈と `/bin/sh` 依存により、現状は macOS / Linux 前提。
 - **`end_command` セット時の Docker teardown**: ユーザ側で `docker compose down` を呼ぶ責務がある。設定し忘れるとコンテナが残る。
 - **後方互換なし**: v1.0.1 の `wtb` は旧 `wturbo` 名の設定ファイル（`wturbo.yaml`）や env プレフィックス（`WTURBO_*`）を読まない。移行が必要。

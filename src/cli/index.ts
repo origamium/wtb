@@ -13,6 +13,7 @@ import { createCommand } from "./commands/create.js"
 import { initClaudeCommand } from "./commands/init-claude.js"
 import { lsCommand } from "./commands/ls.js"
 import { portsCommand } from "./commands/ports.js"
+import { pruneCommand } from "./commands/prune.js"
 import { recloneCommand } from "./commands/reclone.js"
 import { removeCommand } from "./commands/remove.js"
 import { statusCommand } from "./commands/status.js"
@@ -32,6 +33,7 @@ function createMainProgram(): Command {
   program.addCommand(createCommand())
   program.addCommand(removeCommand())
   program.addCommand(recloneCommand())
+  program.addCommand(pruneCommand())
   program.addCommand(initClaudeCommand())
 
   return program

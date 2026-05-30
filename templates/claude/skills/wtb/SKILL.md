@@ -43,8 +43,9 @@ Also activate when `wtb.yaml`, `.wtb.yaml`, `.wtb.yml`, or `.wtb/config.yaml` ex
 | "Make a worktree" | `wtb create <branch>` | Always preview with `--dry-run` first if config is unfamiliar |
 | "Remove a worktree" | `wtb remove <branch>` | **Destructive** — confirm with the user first |
 | "Its DB/volumes are empty or the clone failed" | `wtb reclone [branch]` | Re-runs just the volume-clone phase; recovers data without recreating the worktree |
+| "Clean up leftover/orphaned volumes" | `wtb prune` (preview) → `wtb prune --yes` | Removes wtb-managed volumes from deleted worktrees + leftover temp volumes |
 
-Read-only commands (`ls`, `ports`, `status`) are safe to run autonomously. Mutating commands (`create`, `remove`, `reclone`) require explicit user intent.
+Read-only commands (`ls`, `ports`, `status`, and `wtb prune` without `--yes`) are safe to run autonomously. Mutating commands (`create`, `remove`, `reclone`, `prune --yes`) require explicit user intent.
 
 ## Discovering the current worktree's endpoints
 
@@ -176,6 +177,19 @@ Flags:
 - `--remove-volumes` — also delete the worktree's Docker volumes (`docker compose down -v`). **Destructive for cloned data — confirm with the user.** Note: it only works via the automatic teardown, so it has **no effect** (and wtb prints a `⚠️  --remove-volumes had no effect` warning) when teardown is skipped — i.e. with `--no-docker`, or when `end_command` is set (your `end_command` must run `docker compose down -v` itself). Watch for that warning if you intended to drop the data.
 
 Ordering is: Docker teardown → `end_command` → `git worktree remove`. Setting `end_command` in `wtb.yaml` suppresses the automatic Docker teardown (the user owns shutdown). The default leaves volumes intact (consistent with `docker compose down`); use `--remove-volumes` only if the user explicitly wants the data gone.
+
+## Cleaning up orphaned volumes (`wtb prune`)
+
+Because `wtb remove` leaves volumes by default, wtb-cloned volumes from deleted worktrees accumulate over time. `wtb prune` removes them (plus leftover `*__wtbtmp_*` temp volumes from interrupted overwrites). It only touches `wtb.managed=true`-labelled volumes that belong to **no existing worktree** of this repo.
+
+```bash
+wtb prune            # safe preview (dry run) — lists candidates, deletes nothing
+wtb prune --json     # machine-readable preview { dryRun, candidates[], removed[] }
+wtb prune --yes      # actually remove — DESTRUCTIVE; confirm with the user first
+```
+
+- **Dry run by default** — `wtb prune` and `wtb prune --json` are safe to run autonomously to *show* what would be cleaned up. Only `--yes` deletes, and removing volumes is **data loss** — confirm with the user.
+- Volumes currently in use by a container are skipped. A live worktree's volume is matched by exact Compose project prefix, so it is never removed.
 
 ## Inspecting state
 

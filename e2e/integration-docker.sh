@@ -35,11 +35,12 @@ SEED_VOL="worktree-feat-seed_data"
 
 cleanup() {
   ( cd "$PROJ" 2>/dev/null && docker compose down >/dev/null 2>&1 ) || true
-  for b in feat-stop feat-x feat-seed feat-safe feat-pop feat-force; do
+  for b in feat-stop feat-x feat-seed feat-safe feat-pop feat-force feat-orphan; do
     git -C "$PROJ" worktree remove --force "$BASE/worktree-$b" 2>/dev/null || true
   done
   for v in "$SRC_VOL" "$X_VOL" "$SEED_VOL" worktree-feat-stop_data \
-           worktree-feat-safe_data worktree-feat-pop_data worktree-feat-force_data; do
+           worktree-feat-safe_data worktree-feat-pop_data worktree-feat-force_data \
+           worktree-feat-orphan_data; do
     docker volume rm -f "$v" >/dev/null 2>&1 || true
   done
   rm -rf "$BASE"
@@ -170,5 +171,23 @@ node -e '
 [ "$(docker volume ls -q | grep -cx "$X_VOL")" = "0" ] \
   && pass "remove --remove-volumes deletes the cloned volume (no silent orphan)" \
   || fail "remove --remove-volumes left '$X_VOL' behind"
+
+# 6) prune DETECTS an orphaned volume (worktree removed without --remove-volumes) and
+#    NOT a live worktree's volume. We assert detection via --json dry-run only (never
+#    --yes here: prune acts on global volumes; deletion is covered by unit tests).
+#    feat/seed's worktree is still live → worktree-feat-seed_data must be kept.
+( cd "$PROJ" && node "$CLI" create feat/orphan --no-stop >/dev/null 2>&1 )
+git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-orphan" >/dev/null 2>&1  # no --remove-volumes → orphan
+( cd "$PROJ" && node "$CLI" prune --json 2>/dev/null ) > "$BASE/prune.json"
+node -e '
+  const j = require(process.argv[1]);
+  const names = j.candidates.map(c => c.name);
+  if (j.dryRun !== true) { console.error("expected dryRun"); process.exit(1); }
+  if (!names.includes("worktree-feat-orphan_data")) { console.error("orphan not detected"); process.exit(1); }
+  if (names.includes("worktree-feat-seed_data")) { console.error("live seed volume wrongly flagged"); process.exit(1); }
+' "$BASE/prune.json" \
+  && pass "prune detects an orphaned volume and spares the live worktree's volume" \
+  || fail "prune detection incorrect"
+docker volume rm -f worktree-feat-orphan_data >/dev/null 2>&1 || true
 
 echo "🎉 All real-Docker integration checks passed."

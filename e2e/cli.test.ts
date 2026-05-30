@@ -867,6 +867,42 @@ describe("Reclone Command", () => {
 })
 
 // =============================================================================
+// PRUNE COMMAND
+// =============================================================================
+// NOTE: `wtb prune` queries GLOBAL Docker volumes, so we deliberately never run
+// `--yes` here (it could delete real volumes on a dev machine). The full
+// create→orphan→prune correctness is covered by e2e/integration-docker.sh in an
+// isolated temp project. Here we only exercise the safe, side-effect-free paths.
+describe("Prune Command", () => {
+  let testRepo: TestRepo
+
+  beforeEach(() => {
+    testRepo = createTestRepo("basic", "prune")
+  })
+
+  afterEach(() => {
+    testRepo.cleanup()
+  })
+
+  it("is listed in top-level help", () => {
+    const result = testRepo.runCLI("--help")
+    expect(result.combined).toContain("prune")
+  })
+
+  it("--json emits a valid dry-run summary (no deletion)", () => {
+    const result = testRepo.runCLI("prune --json")
+
+    expect(result.exitCode).toBe(0)
+    const payload = JSON.parse(result.stdout)
+    // shape only — values depend on the host's global wtb volumes; never assert deletion
+    expect(payload.dryRun).toBe(true)
+    expect(Array.isArray(payload.candidates)).toBe(true)
+    expect(Array.isArray(payload.removed)).toBe(true)
+    expect(payload.removed).toEqual([]) // dry-run never removes
+  })
+})
+
+// =============================================================================
 // FULL WORKFLOW TESTS
 // =============================================================================
 

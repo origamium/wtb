@@ -22,6 +22,7 @@ A CLI tool built on Git worktrees that gives every branch its own isolated worki
   - [`create`](#wtb-create-branch)
   - [`remove`](#wtb-remove-branch)
   - [`reclone`](#wtb-reclone-branch)
+  - [`prune`](#wtb-prune)
   - [`ls` / `list`](#wtb-ls-alias-list)
   - [`ports`](#wtb-ports)
   - [`status`](#wtb-status)
@@ -213,6 +214,23 @@ wtb reclone feature/auth --force-volume-copy   # overwrite stale target data
 ```
 
 Prints the same `N cloned, N skipped, N failed` summary as `create`; a failure exits `0` with the loud `⚠️  … data is NOT fully isolated` line (resolve and re-run). Refuses to target the main repository worktree (source and target would be the same project). If `docker_compose_file` isn't configured, it's a no-op with a message. To re-*seed* instead of re-clone, run your `volumes.seed_command` inside the worktree.
+
+### `wtb prune`
+
+Removes **wtb-managed Docker volumes that are orphaned** — i.e., volumes wtb cloned for worktrees that no longer exist (because `wtb remove` leaves volumes by default) — plus **leftover temp volumes** from interrupted `--force-volume-copy` overwrites. Over many create/remove cycles these accumulate; `prune` is the cleanup. Only volumes labelled `wtb.managed=true` are ever touched, and a volume is removed only if it belongs to **no existing worktree** of this repo.
+
+| Option | Description |
+|--------|-------------|
+| `-y, --yes` | Actually remove the volumes. **Without this, `prune` is a dry run** (lists candidates only) |
+| `--json` | Machine-readable output (`{ dryRun, candidates, removed }`) |
+
+```bash
+wtb prune            # preview what would be removed (safe; deletes nothing)
+wtb prune --yes      # remove the orphaned + leftover temp volumes
+wtb prune --json     # machine-readable preview for scripts/agents
+```
+
+Safety: it's **dry-run by default** (deletion needs `--yes`); a volume currently in use by a container is skipped; and a worktree's volume is matched by its exact Compose project prefix (`<project>_…`), so it never removes a live worktree's data. Determines "live" worktrees from `git worktree list` for this repo.
 
 ### `wtb ls` (alias: `list`)
 
@@ -449,7 +467,7 @@ Disable the whole phase per-invocation with `wtb create <branch> --no-volume-cop
 
 The per-volume summary reports `N cloned, N skipped, N failed`. If any volume **fails** to clone, the worktree is still created but the final banner changes from `🎉 Worktree created successfully!` to `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`, so the incomplete state is obvious (note: the command still exits `0` — the worktree exists). A *skip* is intentional (external/excluded volume, missing source, in-use under `--no-stop`, or a target that already has data); a *failure* means the copy itself errored.
 
-`wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`). Because that runs through the automatic teardown, `--remove-volumes` is a no-op (with a warning) when teardown is skipped — under `--no-docker`, or when `end_command` is set (then your `end_command` owns volume removal).
+`wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`). Because that runs through the automatic teardown, `--remove-volumes` is a no-op (with a warning) when teardown is skipped — under `--no-docker`, or when `end_command` is set (then your `end_command` owns volume removal). Volumes left behind this way accumulate as orphans over time — sweep them with [`wtb prune`](#wtb-prune) (every wtb-created volume carries the `wtb.managed=true` label).
 
 ### Seed instead of clone (`--seed`)
 
@@ -484,7 +502,7 @@ Script failures are **non-fatal** — wtb prints a warning and the worktree is l
 ```
 src/
 ├── cli/
-│   ├── commands/      create, remove, reclone, ls, ports, status, init-claude
+│   ├── commands/      create, remove, reclone, prune, ls, ports, status, init-claude
 │   ├── utils/         worktree/ports renderers, command error wrapper, claude skill installer
 │   └── index.ts       commander wiring + global error handlers
 ├── core/
