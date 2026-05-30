@@ -640,6 +640,14 @@ npm run check                  # biome check --write (lint + format)
 
 E2E テスト(`e2e/`)は一時 git リポジトリを作ってビルド済み CLI を実行します。`sample/` には Next.js + Postgres ベースの動作するプレイグラウンドがあり、実際の `wtb.yaml` / `.env` / `docker-compose.yml` が同梱されています。
 
+より幅広い構成 — フルスタック Compose・最小 Compose・seed/exclude/external volume・Docker なしの Node プロジェクト・最小構成 — は [`examples/`](examples/) を参照してください。各ディレクトリが自己完結したプロジェクトで、`examples/try.sh <example> [branch] [--real]` が使い捨ての git リポジトリ上で実際の CLI を実行します(既定は dry-run):
+
+```bash
+examples/try.sh                                   # 一覧を表示
+examples/try.sh minimal                           # 実行計画をプレビュー
+examples/try.sh compose-minimal feature/db --real # 実行(DB volume をクローン)
+```
+
 ## 設計メモ
 
 - **大きなツリーは copy より symlink。** `node_modules`、`.cache`、`.next/cache` は基本的に `link_files` 行き。1 つのソース、ディスク重複ゼロ、即座の worktree 作成。トレードオフ: ある worktree でネイティブモジュールを別プラットフォーム向けに再ビルドすると他にも波及する — そういうものは `copy_files` で。

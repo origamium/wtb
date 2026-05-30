@@ -1,0 +1,37 @@
+# compose-fullstack — exercises every wtb phase.
+#
+# 4-service Docker Compose stack (web + api + postgres + redis), two named
+# volumes that get cloned per worktree, node_modules symlinked instead of copied,
+# and four ports auto-remapped so several worktrees run in parallel.
+
+base_branch: main
+docker_compose_file: ./docker-compose.yml
+
+# Copied into every new worktree even though they're gitignored.
+copy_files:
+  - .env
+  - .env.local
+
+# Symlinked back to the source repo (one source of truth, no duplication).
+link_files:
+  - node_modules
+
+# Runs in the new worktree after creation. Path-or-shell: a relative script path
+# is resolved against the worktree root; otherwise it's passed to /bin/sh.
+start_command: ./start-dev.sh
+end_command: ./stop-dev.sh
+
+env:
+  file:
+    - ./.env
+    - ./.env.local
+  adjust:
+    APP_PORT: 1 # web (nginx)  3000 → next free
+    API_PORT: 1 # api (node)   3100 → next free
+    DB_PORT: 1 # postgres      5432 → next free
+    REDIS_PORT: 1 # redis      6379 → next free
+
+# By default wtb clones every named non-external volume (pg_data, redis_data) into
+# the new worktree's project, so a branch starts with main's DB + cache contents.
+volumes:
+  exclude: [] # e.g. [redis_data] to skip cloning the regenerable cache

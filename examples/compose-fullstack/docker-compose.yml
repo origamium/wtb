@@ -1,0 +1,71 @@
+# No `container_name:` anywhere — a fixed name is GLOBAL and would collide across
+# worktrees. Letting Compose auto-name (<project>-<service>-N) keeps each worktree
+# isolated so several can `docker compose up` in parallel.
+#
+# Uses only prebuilt images (no build context) so the stack comes up fast and
+# `docker compose config` validates without a Docker build.
+
+services:
+  web:
+    image: nginx:alpine
+    ports:
+      - "${APP_PORT:-3000}:80"
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+    depends_on:
+      - api
+    networks: [appnet]
+
+  api:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "node server.js"
+    environment:
+      PORT: 3100
+      DATABASE_URL: postgres://${DB_USER:-app}:${DB_PASSWORD:-secret}@postgres:5432/${DB_NAME:-app_db}
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "${API_PORT:-3100}:3100"
+    volumes:
+      - ./api:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks: [appnet]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:-app}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+      POSTGRES_DB: ${DB_NAME:-app_db}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-app}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [appnet]
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save 60 1
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks: [appnet]
+
+volumes:
+  pg_data:
+  redis_data:
+
+networks:
+  appnet:
+    driver: bridge

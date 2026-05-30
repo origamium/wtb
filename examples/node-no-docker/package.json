@@ -1,0 +1,9 @@
+{
+  "name": "node-no-docker-example",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "setup": "echo '▶ (start_command) worktree ready — would npm install / migrate here'",
+    "dev": "node server.js"
+  }
+}

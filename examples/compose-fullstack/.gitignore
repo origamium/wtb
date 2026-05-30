@@ -1,0 +1,6 @@
+# Copied by wtb, not committed
+.env
+.env.local
+
+# Symlinked by wtb
+node_modules/

@@ -1,0 +1,18 @@
+# compose-minimal — the simplest real Docker case: one service, one volume.
+#
+# Just a Postgres database. Demonstrates stop-then-copy + volume cloning on the
+# smallest possible stack, with a single port remapped.
+
+base_branch: main
+docker_compose_file: ./docker-compose.yml
+
+copy_files:
+  - .env
+
+env:
+  file:
+    - ./.env
+  adjust:
+    DB_PORT: 1 # 5432 → next free port
+
+# db_data is cloned into each new worktree by default (no config needed).
