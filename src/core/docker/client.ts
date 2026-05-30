@@ -25,9 +25,26 @@ function execDockerCommand(command: string, options?: ExecOptions): string {
     }
     return execSync(command, execOptions).trim()
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    throw new Error(`Docker command failed: ${command}\n${message}`)
+    // execSync の error.message は "Command failed: <command>" を含むため、それを
+    // そのまま前置するとコマンドが二重表示になる。実際の docker のエラー出力は
+    // error.stderr にあるので、それを優先して原因が分かるメッセージにする。
+    const e = error as { stderr?: Buffer | string; message?: string }
+    const stderr = e.stderr ? e.stderr.toString().trim() : ""
+    const detail = stderr || (error instanceof Error ? error.message : String(error))
+    throw new Error(`Docker command failed: ${command}\n${detail}`)
   }
+}
+
+/**
+ * Docker のコンテナ ID / 名前として妥当な形式か検証する。
+ * docker の命名規則は `[a-zA-Z0-9][a-zA-Z0-9_.-]*`、ID は 16 進数。シェルメタ文字は
+ * 入り得ないが、`{containerId}` を文字列置換してシェル経由(execSync)に渡している以上、
+ * 防御的に検証してインジェクション経路を断つ。
+ */
+const CONTAINER_REF_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/
+
+function isValidContainerRef(ref: string): boolean {
+  return typeof ref === "string" && ref.length > 0 && CONTAINER_REF_PATTERN.test(ref)
 }
 
 /**
@@ -115,6 +132,10 @@ function parseContainerList(output: string): ContainerInfo[] {
  * ```
  */
 export function getContainerVolumes(containerId: string, options?: ExecOptions): string[] {
+  if (!isValidContainerRef(containerId)) {
+    console.warn(`Refusing to inspect container with invalid id/name: ${containerId}`)
+    return []
+  }
   try {
     const command = DOCKER_COMMANDS.CONTAINER_VOLUMES.replace("{containerId}", containerId)
     const output = execDockerCommand(command, options)
@@ -147,6 +168,10 @@ export function getContainerVolumes(containerId: string, options?: ExecOptions):
  * ```
  */
 export function getContainerNetworks(containerId: string, options?: ExecOptions): string[] {
+  if (!isValidContainerRef(containerId)) {
+    console.warn(`Refusing to inspect container with invalid id/name: ${containerId}`)
+    return []
+  }
   try {
     const command = DOCKER_COMMANDS.CONTAINER_NETWORKS.replace("{containerId}", containerId)
     const output = execDockerCommand(command, options)

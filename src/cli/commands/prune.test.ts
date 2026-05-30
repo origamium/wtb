@@ -10,7 +10,6 @@
 import type { Command } from "commander"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import * as clientModule from "../../core/docker/client.js"
-import * as composeModule from "../../core/docker/compose.js"
 import * as volumeModule from "../../core/docker/volume.js"
 import * as loaderModule from "../../core/config/loader.js"
 import * as repositoryModule from "../../core/git/repository.js"

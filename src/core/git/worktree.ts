@@ -3,10 +3,30 @@
  * Git worktreeの作成、削除、一覧表示等の操作を担当
  */
 
+import { realpathSync } from "node:fs"
 import * as path from "node:path"
 import type { WorktreeInfo } from "../../types/index.js"
 import { execGitSafe } from "../../utils/exec.js"
 import { getGitRoot, isGitRepository } from "./repository.js"
+
+/**
+ * 2 つのパスが同じ場所を指すかを canonical 比較で判定する。
+ *
+ * git は `rev-parse --show-toplevel` と `worktree list` で、片方を symlink 解決済み、
+ * 片方を未解決の形で返すことがある。素朴な文字列等価ではガード(例: main repo の
+ * 削除防止)を symlink 経由で回避できてしまうため、realpath で正規化して比較する。
+ * realpath が失敗(存在しない等)した場合は path.resolve にフォールバックする。
+ */
+export function isSamePath(a: string, b: string): boolean {
+  const canonical = (p: string): string => {
+    try {
+      return realpathSync(p)
+    } catch {
+      return path.resolve(p)
+    }
+  }
+  return canonical(a) === canonical(b)
+}
 
 /**
  * Git worktreeの一覧を取得

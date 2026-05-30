@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`wtb create --strict` / `wtb reclone --strict`** — opt-in non-zero exit when a
+  volume clone (or the `--seed` command) fails. Default stays exit `0` (the worktree
+  exists), preserving the documented contract; `--strict` makes the failure exit `1`
+  so CI and coding-agent pipelines can detect incomplete data isolation (the warning
+  banner is unchanged, only the exit code).
 - **`wtb prune`** — clean up orphaned wtb-managed Docker volumes (volumes cloned for
   worktrees that no longer exist, since `wtb remove` leaves volumes by default) plus
   leftover `*__wtbtmp_*` temp volumes from interrupted `--force-volume-copy` overwrites.
@@ -103,6 +108,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of an opaque "exit code N".
 - The rsync→`cp` fallback now starts from a clean target, discarding any partial
   tree a failed rsync left behind.
+- **`.env` CRLF files no longer silently drop every entry.** `parseEnvContent` now
+  splits on `\r?\n`, so Windows-authored `.env` files are parsed (previously the
+  trailing `\r` defeated the `KEY=VALUE` match and `env.adjust` port remapping became
+  a silent no-op).
+- **`.env` values containing `#` inside quotes are preserved.** A quoted value like
+  `DB_URL="postgres://…?x=1#frag"` is no longer truncated at the first `#`; an inline
+  comment after the closing quote is still honored.
+- **Main-repository delete/reclone guard hardened against symlinks.** `wtb remove` and
+  `wtb reclone` compare the target against the git root via canonical (realpath) paths,
+  so a symlinked checkout can't slip past the guard and remove/clobber the main repo.
+- **Port search no longer returns an in-use port on exhaustion.** The Compose and
+  `.env` port finders now scan the full `3000-9999` range instead of giving up after
+  100 attempts and returning a possibly-occupied port.
+- **Docker container inspection is injection-hardened.** Container ids/names are
+  validated against the Docker naming pattern before being interpolated into an
+  `inspect` command, and the real Docker stderr is now surfaced in the thrown error
+  message instead of a duplicated, detail-free string.
 
 ## [1.0.1] – 2026-05-03
 

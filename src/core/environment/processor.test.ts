@@ -96,6 +96,42 @@ describe("parseEnvContent", () => {
     expect(parsed.entries).toHaveLength(3)
     expect(parsed.lines.filter((l) => l.type === "entry")).toHaveLength(3)
   })
+
+  it("should parse CRLF (Windows) files without dropping entries", () => {
+    // 回帰防止: split("\n") のままだと各行末に \r が残り KEY=VALUE 正規表現に
+    // マッチせず、全エントリが解析対象から漏れていた。
+    const content = "APP_PORT=3000\r\nDB_PORT=5432\r\n"
+    const parsed = parseEnvContent(content)
+
+    expect(parsed.entries).toHaveLength(2)
+    expect(parsed.entries[0]).toMatchObject({ key: "APP_PORT", value: "3000" })
+    expect(parsed.entries[1]).toMatchObject({ key: "DB_PORT", value: "5432" })
+    // 値に \r が混入していないこと。
+    expect(parsed.entries[0].value).toBe("3000")
+  })
+
+  it("should keep '#' that is inside a quoted value (not treat it as a comment)", () => {
+    // 回帰防止: 旧実装は引用符の前で最初の # をコメント扱いし、URL の fragment 等を破壊した。
+    const content = 'DB_URL="postgres://u:p@host/db?x=1#frag"'
+    const parsed = parseEnvContent(content)
+
+    expect(parsed.entries[0]).toMatchObject({
+      key: "DB_URL",
+      value: "postgres://u:p@host/db?x=1#frag",
+    })
+    expect(parsed.entries[0].comment).toBeUndefined()
+  })
+
+  it("should still parse a comment that follows a quoted value", () => {
+    const content = 'KEY="a # b" # real comment'
+    const parsed = parseEnvContent(content)
+
+    expect(parsed.entries[0]).toMatchObject({
+      key: "KEY",
+      value: "a # b",
+      comment: "real comment",
+    })
+  })
 })
 
 // =============================================================================

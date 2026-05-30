@@ -47,6 +47,7 @@ interface CreateOptions {
   forceVolumeCopy?: boolean
   stop?: boolean
   seed?: boolean
+  strict?: boolean
   dryRun?: boolean
 }
 
@@ -90,6 +91,10 @@ export function createCommand(): Command {
     .option(
       "--seed",
       "Seed the data instead of cloning volumes: skip the volume-clone phase and run `volumes.seed_command` in the new worktree (never touches the source volume, so the source stack is left running)"
+    )
+    .option(
+      "--strict",
+      "Exit non-zero (1) if any volume clone or the seed command fails (default: exit 0 — the worktree still exists). Use in CI / coding-agent pipelines that must detect incomplete data isolation."
     )
     .option("--dry-run", "Show what would be done without making changes")
     .action(withErrorHandling(executeCreateCommand))
@@ -333,6 +338,13 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
         '💡 Tip: Run "wtb init-claude" to let Claude Code auto-detect this worktree\'s ports.'
       )
     }
+  }
+
+  // --strict: worktree は作成済みでも、データ分離が未達成 (volume クローン失敗 / seed 失敗)
+  // なら非ゼロ終了する。既定 (exit 0) は「worktree は存在する」契約を維持しつつ、CI や
+  // コーディングエージェントが失敗を確実に検知できるオプトインの経路を提供する。
+  if (!dryRun && options.strict === true && (volumeFailures > 0 || seedFailed)) {
+    process.exit(EXIT_CODES.GENERAL_ERROR)
   }
 }
 

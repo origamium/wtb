@@ -3,8 +3,41 @@
  * git worktree list --porcelain 出力のパース動作を検証
  */
 
+import * as fs from "node:fs"
+import * as os from "node:os"
+import * as path from "node:path"
 import { describe, expect, it } from "vitest"
-import { parseWorktreeList } from "./worktree.js"
+import { isSamePath, parseWorktreeList } from "./worktree.js"
+
+describe("isSamePath", () => {
+  it("treats identical paths as the same", () => {
+    expect(isSamePath("/project", "/project")).toBe(true)
+  })
+
+  it("normalizes non-canonical but equivalent paths (realpath fallback)", () => {
+    // 存在しないパスは realpath が失敗し path.resolve にフォールバックする。
+    expect(isSamePath("/project/", "/project")).toBe(true)
+    expect(isSamePath("/a/b/../b", "/a/b")).toBe(true)
+  })
+
+  it("distinguishes genuinely different paths", () => {
+    expect(isSamePath("/project", "/project-feature")).toBe(false)
+  })
+
+  it("resolves symlinks so a link and its target compare equal", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wtb-samepath-"))
+    try {
+      const real = path.join(dir, "real")
+      const link = path.join(dir, "link")
+      fs.mkdirSync(real)
+      fs.symlinkSync(real, link)
+      // 文字列としては異なるが、同じ実体を指すので true。
+      expect(isSamePath(link, real)).toBe(true)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
 
 describe("parseWorktreeList", () => {
   it("returns empty array for empty input", () => {
