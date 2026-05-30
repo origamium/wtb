@@ -130,6 +130,24 @@ describe("prune command", () => {
     expect(j.removed).toEqual([])
   })
 
+  it("refuses to prune (and deletes nothing) if worktree enumeration returns empty", async () => {
+    // a git error → listWorktrees() returns [] → without the guard EVERY managed
+    // volume would be treated as orphaned. The guard must abort with exit 1.
+    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([])
+    vi.mocked(clientModule.getWtbManagedVolumeNames).mockReturnValue([
+      "worktree-keep_data",
+      "worktree-gone_data",
+    ])
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit")
+    })
+
+    await expect(command.parseAsync(["--yes"], { from: "user" })).rejects.toThrow("exit")
+    expect(exit).toHaveBeenCalledWith(1)
+    expect(volumeModule.removeVolume).not.toHaveBeenCalled()
+    exit.mockRestore()
+  })
+
   it("--json --yes reports removed volumes", async () => {
     vi.mocked(clientModule.getWtbManagedVolumeNames).mockReturnValue(["worktree-gone_data"])
     await command.parseAsync(["--json", "--yes"], { from: "user" })

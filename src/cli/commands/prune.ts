@@ -23,6 +23,9 @@ import {
 import { getContainersUsingVolume, removeVolume, volumeExists } from "../../core/docker/volume.js"
 import { getGitRootOrThrow } from "../../core/git/repository.js"
 import { listWorktrees } from "../../core/git/worktree.js"
+import type { WorktreeInfo } from "../../types/index.js"
+import { CLIError } from "../../utils/error.js"
+import { EXIT_CODES } from "../../constants/index.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
 
 interface PruneOptions {
@@ -57,9 +60,9 @@ export function pruneCommand(): Command {
  * cloned volume は `<project>_<key>` 命名なので、この集合に prefix 一致しない
  * ラベル付き volume は孤児とみなせる。
  */
-function liveProjectNames(gitRoot: string): Set<string> {
+function liveProjectNames(worktrees: WorktreeInfo[]): Set<string> {
   const projects = new Set<string>()
-  for (const wt of listWorktrees()) {
+  for (const wt of worktrees) {
     const composePath = findComposeFile(wt.path)
     let composeConfig = {}
     if (composePath) {
@@ -114,7 +117,21 @@ async function executePruneCommand(options: PruneOptions): Promise<void> {
   }
 
   const managed = getWtbManagedVolumeNames()
-  const live = liveProjectNames(gitRoot)
+
+  // SAFETY: a labelled volume is judged "orphan" when it matches no live worktree's
+  // project prefix. If worktree enumeration fails (returns []), EVERY volume would
+  // look orphaned and `--yes` would delete them all. We're inside a git repo
+  // (getGitRootOrThrow passed), so there must be at least the main worktree — an
+  // empty list means a git error. Refuse to prune rather than risk mass deletion.
+  const worktrees = listWorktrees()
+  if (worktrees.length === 0) {
+    throw new CLIError(
+      "Could not enumerate git worktrees — refusing to prune (every volume would look orphaned). Check `git worktree list`.",
+      EXIT_CODES.GENERAL_ERROR
+    )
+  }
+
+  const live = liveProjectNames(worktrees)
   const candidates = classifyCandidates(managed, live)
 
   // 使用中の volume は削除できない/危険なのでマークしてスキップ
@@ -125,9 +142,12 @@ async function executePruneCommand(options: PruneOptions): Promise<void> {
   const skipped = candidates.filter((c) => c.inUseBy.length > 0)
 
   if (options.json) {
-    const removed = options.yes
-      ? removable.filter((c) => safeRemove(c.name))
-      : []
+    const removed: PruneCandidate[] = []
+    if (options.yes) {
+      for (const c of removable) {
+        if (safeRemove(c.name)) removed.push(c)
+      }
+    }
     process.stdout.write(
       `${JSON.stringify(
         {
