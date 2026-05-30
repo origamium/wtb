@@ -10,10 +10,43 @@ const CURRENT_MARKER = "→ "
 const NO_MARKER = "  "
 
 /**
- * 右詰めでパディング（ASCII前提、マルチバイト対応は spreadで近似）
+ * 文字列の「表示幅」（端末カラム数）を返す。East Asian Wide/Fullwidth の文字
+ * (CJK 漢字・かな・ハングル・全角記号など) は 2 カラム、それ以外は 1 として数える。
+ * ASCII 文字列では `.length` と一致するため、既存の整列挙動は変わらない。
+ */
+export function visualWidth(value: string): number {
+  let width = 0
+  for (const ch of value) {
+    const cp = ch.codePointAt(0) ?? 0
+    width += isWideCodePoint(cp) ? 2 : 1
+  }
+  return width
+}
+
+/** East Asian Wide / Fullwidth に該当する code point か（実用上十分な範囲集合） */
+function isWideCodePoint(cp: number): boolean {
+  return (
+    (cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
+    (cp >= 0x2e80 && cp <= 0x303e) || // CJK Radicals … CJK Symbols
+    (cp >= 0x3041 && cp <= 0x33ff) || // Hiragana, Katakana, CJK punctuation, etc.
+    (cp >= 0x3400 && cp <= 0x4dbf) || // CJK Ext A
+    (cp >= 0x4e00 && cp <= 0x9fff) || // CJK Unified Ideographs
+    (cp >= 0xa000 && cp <= 0xa4cf) || // Yi
+    (cp >= 0xac00 && cp <= 0xd7a3) || // Hangul Syllables
+    (cp >= 0xf900 && cp <= 0xfaff) || // CJK Compatibility Ideographs
+    (cp >= 0xfe30 && cp <= 0xfe4f) || // CJK Compatibility Forms
+    (cp >= 0xff00 && cp <= 0xff60) || // Fullwidth Forms
+    (cp >= 0xffe0 && cp <= 0xffe6) || // Fullwidth signs
+    (cp >= 0x1f300 && cp <= 0x1faff) || // emoji / symbols (typically wide)
+    (cp >= 0x20000 && cp <= 0x3fffd) // CJK Ext B+ (astral)
+  )
+}
+
+/**
+ * 右詰めでパディング。表示幅 (visualWidth) で計算するので CJK/全角混じりでも整列する。
  */
 function padRight(value: string, width: number): string {
-  const visual = [...value].length
+  const visual = visualWidth(value)
   if (visual >= width) return value
   return value + " ".repeat(width - visual)
 }
@@ -54,8 +87,8 @@ export function renderDefault(
 ): string {
   if (rows.length === 0) return "No worktrees found\n"
 
-  const branchWidth = Math.max(...rows.map((r) => r.branch.length), "BRANCH".length)
-  const pathWidth = Math.max(...rows.map((r) => r.path.length), "PATH".length)
+  const branchWidth = Math.max(...rows.map((r) => visualWidth(r.branch)), "BRANCH".length)
+  const pathWidth = Math.max(...rows.map((r) => visualWidth(r.path)), "PATH".length)
 
   const lines: string[] = []
   for (const wt of rows) {
@@ -78,10 +111,10 @@ export function renderLong(
 ): string {
   if (rows.length === 0) return "No worktrees found\n"
 
-  const branchWidth = Math.max(...rows.map((r) => r.branch.length), "BRANCH".length)
+  const branchWidth = Math.max(...rows.map((r) => visualWidth(r.branch)), "BRANCH".length)
   const hashWidth = Math.max(...rows.map((r) => r.shortHash.length), "COMMIT".length)
   const ageWidth = Math.max(...rows.map((r) => r.ageRelative.length), "AGE".length)
-  const pathWidth = Math.max(...rows.map((r) => r.path.length), "PATH".length)
+  const pathWidth = Math.max(...rows.map((r) => visualWidth(r.path)), "PATH".length)
 
   const columns = process.stdout.columns || 120
   const fixedWidth =
