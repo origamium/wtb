@@ -4,7 +4,47 @@
 
 import { describe, expect, it } from "vitest"
 import type { EnrichedWorktreeInfo, WorktreeInfo } from "../../types/index.js"
-import { renderDefault, renderJson, renderLong, renderPaths } from "./worktree-render.js"
+import {
+  renderDefault,
+  renderJson,
+  renderLong,
+  renderPaths,
+  resolveCurrentWorktreePath,
+} from "./worktree-render.js"
+
+describe("resolveCurrentWorktreePath", () => {
+  const wts: WorktreeInfo[] = [
+    { path: "/repo", branch: "main", head: "a" },
+    { path: "/repo-feature", branch: "feature", head: "b" },
+  ]
+
+  it("returns the worktree root when cwd is exactly the root", () => {
+    expect(resolveCurrentWorktreePath(wts, "/repo")).toBe("/repo")
+    expect(resolveCurrentWorktreePath(wts, "/repo-feature")).toBe("/repo-feature")
+  })
+
+  it("resolves a SUBDIRECTORY of a worktree to that worktree root (the documented bug)", () => {
+    expect(resolveCurrentWorktreePath(wts, "/repo-feature/src/components")).toBe("/repo-feature")
+    expect(resolveCurrentWorktreePath(wts, "/repo/deep/nested/dir")).toBe("/repo")
+  })
+
+  it("does not let a path-prefix sibling match (/repo vs /repo-feature)", () => {
+    // "/repo-feature/x" must resolve to /repo-feature, NOT /repo (prefix-but-not-subpath).
+    expect(resolveCurrentWorktreePath(wts, "/repo-feature/x")).toBe("/repo-feature")
+  })
+
+  it("picks the most specific (longest) match for nested worktrees", () => {
+    const nested: WorktreeInfo[] = [
+      { path: "/repo", branch: "main", head: "a" },
+      { path: "/repo/sub", branch: "sub", head: "b" },
+    ]
+    expect(resolveCurrentWorktreePath(nested, "/repo/sub/x")).toBe("/repo/sub")
+  })
+
+  it("returns the resolved cwd when no worktree contains it (no marker)", () => {
+    expect(resolveCurrentWorktreePath(wts, "/elsewhere/x")).toBe("/elsewhere/x")
+  })
+})
 
 const FIXTURE: WorktreeInfo[] = [
   { path: "/repo", branch: "main", head: "abc1234" },

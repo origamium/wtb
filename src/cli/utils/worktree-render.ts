@@ -55,6 +55,28 @@ function isCurrentWorktree(wt: WorktreeInfo, currentPath: string): boolean {
   return path.resolve(wt.path) === path.resolve(currentPath)
 }
 
+/**
+ * cwd を「それを含む worktree のルート」に解決する。
+ *
+ * README どおり `→` マーカーは *cwd を含む* worktree を指す必要がある。素朴に
+ * `process.cwd()` を渡すと renderer 側の厳密一致では worktree のサブディレクトリから
+ * 実行したときにどの worktree にもマッチせず、マーカーが出ない。ここで「cwd が等しい、
+ * または cwd が `<wt>/...` の配下にある」worktree のうち最も深いものを選び、その
+ * ルートパスを返す（ネストした worktree でも最長一致＝最も具体的なものが当たる）。
+ * どれにも含まれなければ cwd をそのまま返す（= どの worktree も current にならない）。
+ */
+export function resolveCurrentWorktreePath(worktrees: WorktreeInfo[], cwd: string): string {
+  const resolvedCwd = path.resolve(cwd)
+  let best: string | null = null
+  for (const wt of worktrees) {
+    const wtPath = path.resolve(wt.path)
+    if (resolvedCwd === wtPath || resolvedCwd.startsWith(`${wtPath}${path.sep}`)) {
+      if (best === null || wtPath.length > best.length) best = wtPath
+    }
+  }
+  return best ?? resolvedCwd
+}
+
 function isMainWorktree(wt: WorktreeInfo, gitRoot: string): boolean {
   return path.resolve(wt.path) === path.resolve(gitRoot)
 }
