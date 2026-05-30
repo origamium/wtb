@@ -204,6 +204,105 @@ describe("Create Command - Basic Project", () => {
 })
 
 // =============================================================================
+// CREATE COMMAND - SEED INSTEAD OF CLONE (--seed)
+// =============================================================================
+
+describe("Create Command - Seed instead of clone (--seed)", () => {
+  let testRepo: TestRepo
+
+  beforeEach(() => {
+    // no-docker project: no docker_compose_file, so the data phase is purely seed.
+    testRepo = createTestRepo("no-docker", "seed")
+  })
+
+  afterEach(() => {
+    testRepo.cleanup()
+  })
+
+  it("runs volumes.seed_command instead of cloning when --seed is passed", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      [
+        'base_branch: "main"',
+        "copy_files: []",
+        "env:",
+        "  file: []",
+        "  adjust: {}",
+        "volumes:",
+        '  seed_command: "echo seeded > seeded.marker"',
+        "",
+      ].join("\n")
+    )
+
+    const result = testRepo.runCLI("create feature/seeded --seed")
+
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("Seeding data instead of cloning volumes")
+    expect(result.combined).toContain("Seed command completed successfully")
+    expect(result.combined).toContain("Worktree created successfully")
+    // The seed command wrote its marker into the new worktree (cwd = worktree root).
+    expect(testRepo.worktreeFileExists("feature/seeded", "seeded.marker")).toBe(true)
+  })
+
+  it("dry-run previews the seed command without running it", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      ['base_branch: "main"', "volumes:", '  seed_command: "echo seeded > seeded.marker"', ""].join(
+        "\n"
+      )
+    )
+
+    const result = testRepo.runCLI("create feature/seed-dry --seed --dry-run")
+
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("Would seed data instead of cloning volumes")
+    expect(testRepo.worktreeFileExists("feature/seed-dry", "seeded.marker")).toBe(false)
+  })
+
+  it("fails with exit 4 when --seed is used without volumes.seed_command", () => {
+    // no-docker project's default wtb.yaml has no volumes.seed_command
+    const result = testRepo.runCLI("create feature/no-seed --seed")
+
+    expect(result.exitCode).toBe(4)
+    expect(result.combined).toContain("--seed requires `volumes.seed_command`")
+    // worktree must NOT have been created (validation runs before worktree add)
+    expect(testRepo.worktreeFileExists("feature/no-seed", "")).toBe(false)
+  })
+
+  it("fails with exit 1 when --seed is combined with --force-volume-copy", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      ['base_branch: "main"', "volumes:", '  seed_command: "true"', ""].join("\n")
+    )
+
+    const result = testRepo.runCLI("create feature/seed-conflict --seed --force-volume-copy")
+
+    expect(result.exitCode).toBe(1)
+    expect(result.combined).toContain("mutually exclusive")
+  })
+
+  it("surfaces a NOT-ready banner (exit 0) when the seed command fails", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      ['base_branch: "main"', "volumes:", '  seed_command: "exit 7"', ""].join("\n")
+    )
+
+    const result = testRepo.runCLI("create feature/seed-fail --seed")
+
+    // worktree is still created (consistent with start_command / volume-clone contract)
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("Seed command failed")
+    expect(result.combined).toContain("data is NOT ready")
+    expect(existsSync(testRepo.getWorktreePath("feature/seed-fail"))).toBe(true)
+  })
+
+  it("lists --seed in create --help", () => {
+    const result = testRepo.runCLI("create --help")
+    expect(result.combined).toContain("--seed")
+  })
+})
+
+// =============================================================================
 // CREATE COMMAND - FULL-FEATURED PROJECT
 // =============================================================================
 
@@ -591,6 +690,31 @@ describe("Status Command", () => {
     })
   })
 
+  describe("--json flag", () => {
+    it("emits valid JSON with worktrees + docker keys on stdout", () => {
+      const result = testRepo.runCLI("status --json")
+
+      expect(result.exitCode).toBe(0)
+      // stdout must be parseable JSON on its own (warnings go to stderr)
+      const payload = JSON.parse(result.stdout)
+      expect(payload).toHaveProperty("worktrees")
+      expect(payload).toHaveProperty("docker")
+      expect(Array.isArray(payload.worktrees)).toBe(true)
+      // full-featured project configures docker_compose_file
+      expect(payload.docker.configured).toBe(true)
+      // human-readable banners must be absent in JSON mode
+      expect(result.combined).not.toContain("📁 Git Worktrees Status")
+    })
+
+    it("--docker-only --json yields an empty worktrees array", () => {
+      const result = testRepo.runCLI("status --docker-only --json")
+
+      expect(result.exitCode).toBe(0)
+      const payload = JSON.parse(result.stdout)
+      expect(payload.worktrees).toEqual([])
+    })
+  })
+
   describe("Environment file detection", () => {
     it("should detect and show environment files", () => {
       const result = testRepo.runCLI("status")
@@ -639,6 +763,142 @@ describe("Status Command - No Docker Project", () => {
     expect(result.combined).toContain("Docker Environment Status")
     expect(result.combined).toContain("Docker checks skipped (not configured)")
     expect(result.combined).not.toContain("Git Worktrees Status")
+  })
+})
+
+// =============================================================================
+// REMOVE COMMAND - --remove-volumes guardrails
+// =============================================================================
+
+describe("Remove Command - --remove-volumes guardrails", () => {
+  let testRepo: TestRepo
+
+  beforeEach(() => {
+    testRepo = createTestRepo("basic", "rmvol-guard")
+  })
+
+  afterEach(() => {
+    testRepo.cleanup()
+  })
+
+  it("warns that --remove-volumes had no effect when end_command owns teardown", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      [
+        'base_branch: "main"',
+        "docker_compose_file: ./docker-compose.yml",
+        'end_command: "echo end-ran"',
+        "",
+      ].join("\n")
+    )
+    testRepo.runCLI("create test/x --no-docker --no-start")
+
+    const result = testRepo.runCLI("remove test/x --remove-volumes --force")
+
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("--remove-volumes had no effect")
+    expect(result.combined).toContain("end_command")
+    // end_command still runs
+    expect(result.combined).toContain("end-ran")
+  })
+
+  it("warns that --remove-volumes had no effect with --no-docker", () => {
+    testRepo.writeFile(
+      "wtb.yaml",
+      ['base_branch: "main"', "docker_compose_file: ./docker-compose.yml", ""].join("\n")
+    )
+    testRepo.runCLI("create test/y --no-docker --no-start")
+
+    const result = testRepo.runCLI("remove test/y --remove-volumes --no-docker --force")
+
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("--remove-volumes had no effect")
+  })
+})
+
+// =============================================================================
+// RECLONE COMMAND
+// =============================================================================
+
+describe("Reclone Command", () => {
+  it("is listed in top-level help", () => {
+    const testRepo = createTestRepo("basic", "reclone-help")
+    try {
+      const result = testRepo.runCLI("--help")
+      expect(result.combined).toContain("reclone")
+    } finally {
+      testRepo.cleanup()
+    }
+  })
+
+  describe("No Docker project", () => {
+    let testRepo: TestRepo
+    beforeEach(() => {
+      testRepo = createTestRepo("no-docker", "reclone-no-docker")
+    })
+    afterEach(() => {
+      testRepo.cleanup()
+    })
+
+    it("reports nothing to clone when docker_compose_file is unset (exit 0)", () => {
+      testRepo.runCLI("create feature/x")
+      // run reclone targeting the created worktree by branch
+      const result = testRepo.runCLI("reclone feature/x")
+
+      expect(result.exitCode).toBe(0)
+      expect(result.combined).toContain("No docker_compose_file configured")
+    })
+
+    it("fails with exit 1 for an unknown branch", () => {
+      const result = testRepo.runCLI("reclone does/not/exist")
+
+      expect(result.exitCode).toBe(1)
+      expect(result.combined).toContain("No worktree found for branch")
+    })
+
+    it("refuses to reclone the main repository worktree", () => {
+      // run with no branch arg from the main repo root → resolves to main worktree
+      const result = testRepo.runCLI("reclone")
+
+      expect(result.exitCode).toBe(1)
+      expect(result.combined).toContain("main repository worktree")
+    })
+  })
+})
+
+// =============================================================================
+// PRUNE COMMAND
+// =============================================================================
+// NOTE: `wtb prune` queries GLOBAL Docker volumes, so we deliberately never run
+// `--yes` here (it could delete real volumes on a dev machine). The full
+// create→orphan→prune correctness is covered by e2e/integration-docker.sh in an
+// isolated temp project. Here we only exercise the safe, side-effect-free paths.
+describe("Prune Command", () => {
+  let testRepo: TestRepo
+
+  beforeEach(() => {
+    testRepo = createTestRepo("basic", "prune")
+  })
+
+  afterEach(() => {
+    testRepo.cleanup()
+  })
+
+  it("is listed in top-level help", () => {
+    const result = testRepo.runCLI("--help")
+    expect(result.combined).toContain("prune")
+  })
+
+  it("--json emits a valid dry-run summary (no deletion)", () => {
+    const result = testRepo.runCLI("prune --json")
+
+    expect(result.exitCode).toBe(0)
+    const payload = JSON.parse(result.stdout)
+    // shape only — values depend on the host's global wtb volumes; never assert deletion
+    expect(payload.dryRun).toBe(true)
+    expect(Array.isArray(payload.candidates)).toBe(true)
+    expect(Array.isArray(payload.removed)).toBe(true)
+    expect(payload.removed).toEqual([]) // dry-run never removes
   })
 })
 
@@ -989,6 +1249,43 @@ describe("Create Command - env.adjust", () => {
     expect(envContent).toContain("DB_PORT=5433")
     // REDIS_PORT=6379 → finds next free port from 6380
     expect(envContent).toContain("REDIS_PORT=6380")
+  })
+
+  it("avoids colliding with the main worktree's other ports (adjacent-port config)", () => {
+    // Regression: when main uses adjacent ports (APP=3000, DB=3001), a new
+    // worktree's APP must NOT bump to 3001 and collide with main's running DB.
+    // The main/source worktree's ports must be in the collision-avoidance set.
+    testRepo.writeFile(
+      ".env",
+      ["APP_PORT=3000", "DB_PORT=3001", ""].join("\n")
+    )
+    testRepo.writeFile(
+      "wtb.yaml",
+      [
+        'base_branch: "main"',
+        "env:",
+        "  file: [./.env]",
+        "  adjust:",
+        "    APP_PORT: 1",
+        "    DB_PORT: 1",
+        "",
+      ].join("\n")
+    )
+
+    const result = testRepo.runCLI("create test/adjacent --no-docker --no-start")
+    expect(result.exitCode).toBe(0)
+
+    const envContent = fs.readFileSync(
+      path.join(testRepo.getWorktreePath("test/adjacent"), ".env"),
+      "utf-8"
+    )
+    const get = (k: string) => envContent.match(new RegExp(`^${k}=(\\d+)`, "m"))?.[1]
+    const app = Number(get("APP_PORT"))
+    const db = Number(get("DB_PORT"))
+    // new worktree's ports must avoid BOTH of main's ports (3000, 3001) and each other
+    expect([3000, 3001]).not.toContain(app)
+    expect([3000, 3001]).not.toContain(db)
+    expect(app).not.toBe(db)
   })
 
   it("should copy env file even when adjust is empty", () => {

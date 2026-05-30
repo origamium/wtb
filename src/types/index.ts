@@ -27,6 +27,13 @@ export interface EnvConfig {
 export interface VolumesConfig {
   /** クローンから除外する compose volume key 一覧 (例: ["cache_data"])。デフォルト: [] */
   exclude: string[]
+  /**
+   * `--seed` 指定時に volume クローンの代わりに worktree 内で実行する seed コマンド。
+   * source volume を一切触らないため、source スタックを停止する必要が無く、
+   * 「main のクローン」ではなく「新規 seed された DB」が欲しいケース向け。
+   * 未設定で `--seed` を渡すと CONFIG_ERROR で終了する。
+   */
+  seed_command?: string
 }
 
 /**
@@ -244,6 +251,8 @@ export interface CommandOptions {
   all?: boolean
   /** Docker情報のみ表示するフラグ */
   dockerOnly?: boolean
+  /** 機械可読な JSON で出力するフラグ */
+  json?: boolean
 }
 
 /**

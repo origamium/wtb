@@ -61,13 +61,16 @@ describe("Status Command (Refactored)", () => {
 
     it("should have correct options", () => {
       const options = command.options
-      expect(options).toHaveLength(2)
+      expect(options).toHaveLength(3)
 
       const allOption = options.find((opt) => opt.flags === "-a, --all")
       expect(allOption?.description).toBe("Show all worktrees, not just current")
 
       const dockerOnlyOption = options.find((opt) => opt.flags === "--docker-only")
       expect(dockerOnlyOption?.description).toBe("Show only Docker-related information")
+
+      const jsonOption = options.find((opt) => opt.flags === "--json")
+      expect(jsonOption).toBeDefined()
     })
 
     it("should exit with error when not in git repository", async () => {
@@ -249,6 +252,125 @@ describe("Status Command (Refactored)", () => {
       await command.parseAsync([], { from: "user" })
 
       expect(consoleSpy).toHaveBeenCalledWith("⚠️  Could not retrieve Docker version information")
+    })
+  })
+
+  describe("status --json", () => {
+    let stdoutSpy: ReturnType<typeof vi.spyOn>
+    const parseStdout = () => JSON.parse(stdoutSpy.mock.calls.map((c) => c[0]).join(""))
+
+    beforeEach(() => {
+      stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
+      vi.mocked(repositoryModule.getCurrentBranch).mockReturnValue("main")
+      vi.mocked(repositoryModule.getGitRoot).mockReturnValue("/project")
+      vi.mocked(worktreeModule.listWorktrees).mockReturnValue([])
+      vi.mocked(dockerClientModule.getRunningContainers).mockReturnValue([])
+      vi.mocked(dockerClientModule.getDockerVolumes).mockReturnValue([])
+      vi.mocked(existsSync).mockReturnValue(false)
+    })
+
+    afterEach(() => {
+      stdoutSpy.mockRestore()
+    })
+
+    it("emits a single valid JSON object on stdout (not console.log)", async () => {
+      vi.mocked(dockerClientModule.getDockerInfo).mockReturnValue({
+        dockerVersion: "Docker version 25.0",
+        composeVersion: "2.24.0",
+        isAvailable: true,
+      })
+
+      await command.parseAsync(["--json"], { from: "user" })
+
+      const payload = parseStdout()
+      expect(payload).toHaveProperty("worktrees")
+      expect(payload).toHaveProperty("docker")
+      expect(payload.docker.configured).toBe(true)
+      expect(payload.docker.available).toBe(true)
+      expect(payload.docker.version).toBe("Docker version 25.0")
+      // human-readable banners must NOT be printed in JSON mode
+      expect(consoleSpy).not.toHaveBeenCalledWith("📁 Git Worktrees Status\n")
+    })
+
+    it("includes per-worktree compose + env info filtered to current by default", async () => {
+      vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+        { path: "/project", branch: "main", head: "abc" },
+        { path: "/project-feature", branch: "feature", head: "def" },
+      ])
+      vi.mocked(dockerComposeModule.findComposeFile).mockReturnValue("/project/docker-compose.yml")
+      vi.mocked(dockerComposeModule.readComposeFile).mockReturnValue({
+        services: { web: { image: "nginx" }, db: { image: "postgres" } },
+      })
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(dockerClientModule.getDockerInfo).mockReturnValue({
+        dockerVersion: "x",
+        composeVersion: "y",
+        isAvailable: true,
+      })
+
+      await command.parseAsync(["--json"], { from: "user" })
+
+      const payload = parseStdout()
+      // default (no --all) → only the current branch
+      expect(payload.worktrees).toHaveLength(1)
+      expect(payload.worktrees[0]).toMatchObject({
+        branch: "main",
+        isMain: true,
+        isCurrent: true,
+        compose: { file: "docker-compose.yml", services: 2 },
+      })
+    })
+
+    it("reports docker.available=false (valid JSON) when Docker is unavailable", async () => {
+      vi.mocked(dockerClientModule.getDockerInfo).mockImplementation(() => {
+        throw new Error("daemon down")
+      })
+
+      await command.parseAsync(["--json"], { from: "user" })
+
+      const payload = parseStdout()
+      expect(payload.docker.configured).toBe(true)
+      expect(payload.docker.available).toBe(false)
+      expect(payload.docker.containers).toEqual([])
+    })
+
+    it("detects wtb volumes by label even when the name doesn't match the heuristic", async () => {
+      // A custom -p path yields a project/volume name without "wtb"/"worktree".
+      vi.mocked(dockerClientModule.getDockerInfo).mockReturnValue({
+        dockerVersion: "x",
+        composeVersion: "y",
+        isAvailable: true,
+      })
+      vi.mocked(dockerClientModule.getDockerVolumes).mockReturnValue([
+        { name: "customproj_data", driver: "local", mountpoint: "/v/customproj_data" },
+        { name: "unrelated_cache", driver: "local", mountpoint: "/v/unrelated_cache" },
+      ])
+      // only the wtb-created one carries the label
+      vi.mocked(dockerClientModule.getWtbManagedVolumeNames).mockReturnValue(["customproj_data"])
+
+      await command.parseAsync(["--json"], { from: "user" })
+
+      const payload = parseStdout()
+      const names = payload.docker.volumes.wtb.map((v: { name: string }) => v.name)
+      expect(names).toContain("customproj_data") // matched by label
+      expect(names).not.toContain("unrelated_cache") // neither label nor name heuristic
+      expect(payload.docker.volumes.total).toBe(2)
+    })
+
+    it("omits worktrees with --docker-only", async () => {
+      vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+        { path: "/project", branch: "main", head: "abc" },
+      ])
+      vi.mocked(dockerClientModule.getDockerInfo).mockReturnValue({
+        dockerVersion: "x",
+        composeVersion: "y",
+        isAvailable: true,
+      })
+
+      await command.parseAsync(["--json", "--docker-only"], { from: "user" })
+
+      const payload = parseStdout()
+      expect(payload.worktrees).toEqual([])
     })
   })
 })

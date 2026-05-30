@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+#
+# Real-Docker integration test for wtb's volume-clone / data-autonomy feature.
+#
+# The vitest suites (unit + e2e) deliberately avoid the Docker daemon for speed
+# and CI reliability — volume operations there are boundary-mocked. This script
+# is the counterpart: it exercises the *real* clone path end-to-end against a
+# live daemon, proving the feature's core promise — that a new worktree starts
+# with a full copy of the source volume's data.
+#
+# It is intentionally NOT part of `npm test`. Run it manually on a box with
+# Docker:  `npm run test:integration`  (or `bash e2e/integration-docker.sh`).
+#
+# Covers: clone carryover, --force-volume-copy atomic overwrite, --seed, and
+# `status --json` — all against real volumes, with full cleanup on exit.
+set -euo pipefail
+
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+  echo "⏭  Docker is not available — skipping integration test (this is fine in CI)."
+  exit 0
+fi
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CLI="$ROOT_DIR/dist/cli/index.js"
+if [ ! -f "$CLI" ]; then
+  echo "Building CLI first (dist not found)..."
+  ( cd "$ROOT_DIR" && npm run build >/dev/null )
+fi
+
+BASE="$(mktemp -d "${TMPDIR:-/tmp}/wtb-int.XXXXXX")"
+PROJ="$BASE/srcproj"           # fixed basename → predictable compose project name
+SRC_VOL="srcproj_data"
+X_VOL="worktree-feat-x_data"
+SEED_VOL="worktree-feat-seed_data"
+
+cleanup() {
+  ( cd "$PROJ" 2>/dev/null && docker compose down >/dev/null 2>&1 ) || true
+  for b in feat-stop feat-x feat-seed feat-safe feat-pop feat-force feat-orphan; do
+    git -C "$PROJ" worktree remove --force "$BASE/worktree-$b" 2>/dev/null || true
+  done
+  for v in "$SRC_VOL" "$X_VOL" "$SEED_VOL" worktree-feat-stop_data \
+           worktree-feat-safe_data worktree-feat-pop_data worktree-feat-force_data \
+           worktree-feat-orphan_data; do
+    docker volume rm -f "$v" >/dev/null 2>&1 || true
+  done
+  rm -rf "$BASE"
+}
+trap cleanup EXIT
+
+pass() { echo "  ✅ $1"; }
+fail() { echo "  ❌ $1"; exit 1; }
+
+mkdir -p "$PROJ"
+cat > "$PROJ/docker-compose.yml" <<'YAML'
+services:
+  db:
+    image: busybox
+    command: sleep 3600
+    volumes:
+      - data:/var/lib/data
+volumes:
+  data:
+YAML
+cat > "$PROJ/wtb.yaml" <<'YAML'
+base_branch: main
+docker_compose_file: ./docker-compose.yml
+volumes:
+  seed_command: docker run --rm -v worktree-feat-seed_data:/d busybox sh -c 'echo SEEDED-FRESH > /d/marker.txt'
+YAML
+git -C "$PROJ" init -q -b main
+git -C "$PROJ" config user.email integ@test.local
+git -C "$PROJ" config user.name  "wtb integration"
+git -C "$PROJ" add -A && git -C "$PROJ" commit -qm init
+
+vol_read() { docker run --rm -v "$1:/d" busybox cat /d/marker.txt 2>/dev/null || echo "<missing>"; }
+
+echo "🔬 wtb real-Docker integration test"
+
+# 0) stop-then-copy: a RUNNING source stack is auto-stopped, cloned, and restarted
+#    (the headline crash-safe data-autonomy path — no --no-stop)
+( cd "$PROJ" && docker compose up -d >/dev/null 2>&1 )
+docker run --rm -v "$SRC_VOL:/d" busybox sh -c 'echo LIVE-DATA > /d/marker.txt'
+stop_out="$( cd "$PROJ" && node "$CLI" create feat/stop 2>&1 )"
+running_after="$(docker compose -p srcproj ps --format '{{.State}}' 2>/dev/null | grep -c running || true)"
+if echo "$stop_out" | grep -q "stopping it to clone" \
+   && [ "$(vol_read worktree-feat-stop_data)" = "LIVE-DATA" ] \
+   && [ "$running_after" -ge 1 ]; then
+  pass "running source stack is auto stop→clone→restart (data cloned, stack back up)"
+else
+  fail "stop-then-copy failed (running_after=$running_after, data=$(vol_read worktree-feat-stop_data))"
+fi
+
+# 0b) SAFETY: --no-stop against a RUNNING source must SKIP the in-use volume (no live-copy
+#     corruption) and must NOT stop the source. (stack still up from check 0)
+safe_out="$( cd "$PROJ" && node "$CLI" create feat/safe --no-stop 2>&1 )"
+running_safe="$(docker compose -p srcproj ps --format '{{.State}}' 2>/dev/null | grep -c running || true)"
+if echo "$safe_out" | grep -q "is in use by" \
+   && [ "$(docker volume ls -q | grep -cx worktree-feat-safe_data || true)" = "0" ] \
+   && [ "$running_safe" -ge 1 ]; then
+  pass "--no-stop skips an in-use source volume (corruption-safe; source left running)"
+else
+  fail "--no-stop did not skip the in-use volume safely (running=$running_safe)"
+fi
+
+# 0b2) ESCAPE HATCH: --force-volume-copy live-clones a RUNNING source WITHOUT stopping it
+#      (confirms the opt-in unsafe path works and is distinct from stop-then-copy)
+docker run --rm -v "$SRC_VOL:/d" busybox sh -c 'echo SRC-LIVE > /d/marker.txt'
+force_out="$( cd "$PROJ" && node "$CLI" create feat/force --force-volume-copy 2>&1 )"
+running_force="$(docker compose -p srcproj ps --format '{{.State}}' 2>/dev/null | grep -c running || true)"
+if [ "$(vol_read worktree-feat-force_data)" = "SRC-LIVE" ] \
+   && [ "$running_force" -ge 1 ] \
+   && ! echo "$force_out" | grep -q "stopping it to clone"; then
+  pass "--force-volume-copy live-clones a running source without stopping it"
+else
+  fail "--force-volume-copy did not live-clone as expected (running=$running_force, data=$(vol_read worktree-feat-force_data))"
+fi
+git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-force" 2>/dev/null || true
+docker volume rm -f worktree-feat-force_data >/dev/null 2>&1 || true
+
+# tear the stack down so the remaining (--no-stop) checks run against a stopped source
+( cd "$PROJ" && docker compose down >/dev/null 2>&1 )
+git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-stop" 2>/dev/null || true
+git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-safe" 2>/dev/null || true
+docker volume rm -f worktree-feat-stop_data >/dev/null 2>&1 || true
+
+# 0c) SAFETY: a target volume that already has data is SKIPPED without --force (no data loss)
+docker volume create worktree-feat-pop_data >/dev/null
+docker run --rm -v worktree-feat-pop_data:/d busybox sh -c 'echo PREEXISTING > /d/marker.txt'
+pop_out="$( cd "$PROJ" && node "$CLI" create feat/pop --no-stop 2>&1 )"
+if echo "$pop_out" | grep -q "already has data" \
+   && [ "$(vol_read worktree-feat-pop_data)" = "PREEXISTING" ]; then
+  pass "populated target volume is skipped without --force (existing data preserved)"
+else
+  fail "populated target was not preserved (got '$(vol_read worktree-feat-pop_data)')"
+fi
+
+# 1) clone carries data over
+docker run --rm -v "$SRC_VOL:/d" busybox sh -c 'echo V1 > /d/marker.txt'
+( cd "$PROJ" && node "$CLI" create feat/x --no-stop >/dev/null 2>&1 )
+[ "$(vol_read "$X_VOL")" = "V1" ] && pass "create clones source data into the new worktree volume" \
+  || fail "clone did not carry data over (got '$(vol_read "$X_VOL")')"
+
+# 1b) the cloned (wtb-created) volume carries the wtb.managed=true label
+docker volume ls --filter label=wtb.managed=true --format '{{.Name}}' | grep -qx "$X_VOL" \
+  && pass "cloned volume is labelled wtb.managed=true (discoverable regardless of name)" \
+  || fail "cloned volume '$X_VOL' is missing the wtb.managed=true label"
+
+# 2) reclone --force-volume-copy atomically overwrites with updated source
+docker run --rm -v "$SRC_VOL:/d" busybox sh -c 'echo V2-UPDATED > /d/marker.txt'
+( cd "$PROJ" && node "$CLI" reclone feat/x --no-stop --force-volume-copy >/dev/null 2>&1 )
+[ "$(vol_read "$X_VOL")" = "V2-UPDATED" ] && pass "reclone --force-volume-copy atomically overwrites the target" \
+  || fail "atomic overwrite failed (got '$(vol_read "$X_VOL")')"
+
+# 3) --seed runs the seed command instead of cloning
+( cd "$PROJ" && node "$CLI" create feat/seed --seed --no-stop >/dev/null 2>&1 )
+[ "$(vol_read "$SEED_VOL")" = "SEEDED-FRESH" ] && pass "--seed runs seed_command and skips cloning" \
+  || fail "--seed did not seed (got '$(vol_read "$SEED_VOL")')"
+
+# 4) status --json is valid and reports live Docker state
+( cd "$PROJ" && node "$CLI" status -a --json 2>/dev/null ) > "$BASE/status.json"
+node -e '
+  const j = require(process.argv[1]);
+  if (!j.docker || j.docker.available !== true) { console.error("docker.available !== true"); process.exit(1); }
+  if (!Array.isArray(j.worktrees) || j.worktrees.length < 3) { console.error("expected >=3 worktrees"); process.exit(1); }
+' "$BASE/status.json" && pass "status --json emits valid JSON with live Docker state" \
+  || fail "status --json output invalid"
+
+# 5) remove --remove-volumes actually deletes the cloned volume (lifecycle cleanup;
+#    confirms wtb's clone-target name aligns with Docker's `down -v` project resolution)
+( cd "$PROJ" && node "$CLI" remove feat/x --remove-volumes --force >/dev/null 2>&1 )
+[ "$(docker volume ls -q | grep -cx "$X_VOL")" = "0" ] \
+  && pass "remove --remove-volumes deletes the cloned volume (no silent orphan)" \
+  || fail "remove --remove-volumes left '$X_VOL' behind"
+
+# 6) prune DETECTS an orphaned volume (worktree removed without --remove-volumes) and
+#    NOT a live worktree's volume. We assert detection via --json dry-run only (never
+#    --yes here: prune acts on global volumes; deletion is covered by unit tests).
+#    feat/seed's worktree is still live → worktree-feat-seed_data must be kept.
+( cd "$PROJ" && node "$CLI" create feat/orphan --no-stop >/dev/null 2>&1 )
+git -C "$PROJ" worktree remove --force "$BASE/worktree-feat-orphan" >/dev/null 2>&1  # no --remove-volumes → orphan
+( cd "$PROJ" && node "$CLI" prune --json 2>/dev/null ) > "$BASE/prune.json"
+node -e '
+  const j = require(process.argv[1]);
+  const names = j.candidates.map(c => c.name);
+  if (j.dryRun !== true) { console.error("expected dryRun"); process.exit(1); }
+  if (!names.includes("worktree-feat-orphan_data")) { console.error("orphan not detected"); process.exit(1); }
+  if (names.includes("worktree-feat-seed_data")) { console.error("live seed volume wrongly flagged"); process.exit(1); }
+' "$BASE/prune.json" \
+  && pass "prune detects an orphaned volume and spares the live worktree's volume" \
+  || fail "prune detection incorrect"
+docker volume rm -f worktree-feat-orphan_data >/dev/null 2>&1 || true
+
+echo "🎉 All real-Docker integration checks passed."

@@ -21,6 +21,8 @@ Git worktree をベースにした CLI ツールで、ブランチごとに独�
 - [コマンド](#コマンド)
   - [`create`](#wtb-create-branch)
   - [`remove`](#wtb-remove-branch)
+  - [`reclone`](#wtb-reclone-branch)
+  - [`prune`](#wtb-prune)
   - [`ls` / `list`](#wtb-ls-alias-list)
   - [`ports`](#wtb-ports)
   - [`status`](#wtb-status)
@@ -165,7 +167,7 @@ wtb create bugfix/urgent-fix
 |-----------|------|
 | `-p, --path <path>` | worktreeの作成場所を指定（デフォルト: 親ディレクトリに `worktree-<branch名>` で作成） |
 | `--no-create-branch` | 既存のブランチを使用（新規作成しない） |
-| `--no-docker` | Docker Composeのセットアップをスキップ |
+| `--no-docker` | Docker Compose のセットアップをスキップ — **volume クローンもスキップされる**(volume フェーズは Docker 前提)ため、worktree は空の volume で始まる |
 | `--no-env` | 環境変数ファイルの処理をスキップ（`.env`のコピー/調整） |
 | `--no-copy` | ファイルコピーをスキップ（`copy_files`） |
 | `--no-link` | symlink作成をスキップ（`link_files`） |
@@ -173,6 +175,7 @@ wtb create bugfix/urgent-fix
 | `--no-volume-copy` | Docker volume の自動クローンをスキップ |
 | `--force-volume-copy` | 稼働中コンテナや既存 target volume があってもクローンを試行（dev のみ・データ破損リスクあり） |
 | `--no-stop` | クローン前にソース Compose スタックを自動 stop せず、稼働中 volume を skip する（旧挙動） |
+| `--seed` | クローンの代わりに seed する: volume クローンフェーズをスキップし、新 worktree 内で `volumes.seed_command` を実行する。ソース volume に一切触れないためソーススタックは止めない。`volumes.seed_command` の設定が必須で、`--force-volume-copy` とは排他。詳細は [Volume の自動クローン](#volume-の自動クローン) |
 | `--dry-run` | 実際の変更を行わず、実行内容をプレビュー |
 
 **使用例:**
@@ -217,7 +220,7 @@ wtb remove feature/new-feature
 | `-f, --force` | 未コミットの変更があっても強制削除 |
 | `--no-docker` | Docker Composeの停止をスキップ（`docker compose down`） |
 | `--no-end` | `end_command` の実行をスキップ |
-| `--remove-volumes` | この worktree の Docker volume も削除 (`docker compose down -v`) |
+| `--remove-volumes` | この worktree の Docker volume も削除 (`docker compose down -v`)。teardown が省略されるケース（`--no-docker` 時、または `end_command` 設定時）では**効果なし**（wtb が警告を出す。`end_command` 側で volume を削除すること) |
 
 **使用例:**
 
@@ -228,6 +231,41 @@ wtb remove feature/old-branch --no-docker
 # 強制削除、クリーンアップもスキップ
 wtb remove feature/abandoned -f --no-end
 ```
+
+### `wtb reclone [branch]`
+
+既存 worktree の **volume クローンフェーズだけ**を再実行します。クローンが失敗/skip された(volume が空/古い)ときに、worktree を作り直さずに(=未コミットの作業を失わずに)データを復旧できます。デフォルトは現在の worktree、branch 指定で別の worktree を対象にできます。
+
+| オプション | 説明 |
+|-----------|------|
+| `--force-volume-copy` | source 稼働中・target に既存データがあってもクローン(上書きは atomic) |
+| `--no-stop` | source Compose スタックを自動 stop せず、稼働中 volume を skip |
+| `--dry-run` | クローン対象をプレビューし、変更しない |
+
+```bash
+wtb reclone                       # 現在の worktree
+wtb reclone feature/auth          # 特定の worktree
+wtb reclone feature/auth --force-volume-copy   # 古い target データを上書き
+```
+
+`create` と同じ `N cloned, N skipped, N failed` サマリを出力します。failure があっても exit `0` で、`⚠️  … data is NOT fully isolated` を明示します(解消して再実行)。main リポジトリ worktree は対象にできません(source と target が同一 project になるため)。`docker_compose_file` 未設定なら no-op(メッセージのみ)。再クローンではなく再 seed したい場合は worktree 内で `volumes.seed_command` を実行してください。
+
+### `wtb prune`
+
+**孤児になった wtb 管理 Docker volume** — もう存在しない worktree 用に wtb がクローンした volume(`wtb remove` はデフォルトで volume を残すため)— と、中断された `--force-volume-copy` 上書きの**残骸 temp volume** を削除します。create/remove を繰り返すと溜まるので、その掃除用です。`wtb.managed=true` ラベル付き volume のみが対象で、このリポジトリの**どの worktree にも属さない** volume だけを削除します。
+
+| オプション | 説明 |
+|-----------|------|
+| `-y, --yes` | 実際に削除する。**指定しなければ dry-run**(候補の表示のみ) |
+| `--json` | 機械可読出力(`{ dryRun, candidates, removed }`) |
+
+```bash
+wtb prune            # 削除対象をプレビュー(安全・何も消さない)
+wtb prune --yes      # 孤児 + 残骸 temp volume を削除
+wtb prune --json     # スクリプト/agent 向けの機械可読プレビュー
+```
+
+安全策: **デフォルトは dry-run**(削除は `--yes` 必須)、コンテナ使用中の volume はスキップ、worktree の volume は Compose プロジェクト名の前方一致(`<project>_…`)で厳密判定するため稼働中 worktree のデータは消しません。live 判定は `git worktree list`(このリポジトリ)に基づきます。
 
 ### `wtb ls` (alias: `list`)
 
@@ -301,6 +339,9 @@ wtb status
 |-----------|------|
 | `-a, --all` | 現在のブランチだけでなく、全てのworktreeを表示 |
 | `--docker-only` | Docker関連の情報のみ表示 |
+| `--json` | 機械可読な JSON(worktree + Docker 状態)を stdout に出力 — スクリプト / agent 向け |
+
+`--json` は 1 つの構造化オブジェクト(`{ worktrees: [...], docker: {...} }`)を返し、Docker が止まっていても valid JSON のまま(`docker.available: false`)です。`wtb ls --json` / `wtb ports` と合わせて機械可読の三点セットを構成します。
 
 出力例:
 ```
@@ -466,6 +507,7 @@ env:
 | `env.file` | string[] | `["./.env"]` | 処理する環境変数ファイルのリスト |
 | `env.adjust` | object | `{}` | 調整設定（数値: 空きポート検索, 文字列: 置換, null: 削除） |
 | `volumes.exclude` | string[] | `[]` | 自動クローンから**除外**する compose volume key 一覧。デフォルトでは Compose の named non-`external` volume をすべて自動クローンする |
+| `volumes.seed_command` | string | — | `wtb create --seed` 指定時に、volume データのクローンの**代わりに**新 worktree 内(`/bin/sh`)で実行するコマンド。main のクローンではなく新規 seed された DB から worktree を始められる。詳細は [Volume の自動クローン](#volume-の自動クローン) |
 
 ### バリデーション
 
@@ -490,6 +532,8 @@ Compose ファイルが remap された後、wtb は **Compose の `volumes:` �
    - **ターゲット volume が既に中身を持っていれば** skip (二度走らせて上書きしないため)。`--force-volume-copy` で上書きできます。この上書きは **atomic** です: 新しいデータを一時 volume にステージングし、検証してから target を置換するため、コピーが途中で失敗しても target が空になることはありません。
    - それ以外は `instrumentisto/rsync-ssh` の使い捨てサイドカーコンテナで再帰コピー (rsync が無ければ Alpine の `cp -a` にフォールバック)。
 
+wtb が作成する volume には必ず **`wtb.managed=true`** ラベルが付くため、project/パスの命名に依存せず自己識別できます。`wtb status` はこのラベルで wtb 管理 volume を正確に列挙し (カスタム `-p` パスでも)、`docker volume ls --filter label=wtb.managed=true` で自分でも一覧できます。
+
 特定の volume を除外したい (例: 再生成可能なキャッシュ):
 
 ```yaml
@@ -504,14 +548,36 @@ volumes:
 
 volume ごとのサマリは `N cloned, N skipped, N failed` の形式で出力されます。いずれかの volume のクローンが **failed** になった場合、worktree 自体は作成されますが、最後のバナーが `🎉 Worktree created successfully!` から `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated` に変わり、不完全な状態が明示されます(なお終了コードは `0` のまま — worktree は存在するため)。*skip* は意図的(external/除外 volume、source 不在、`--no-stop` 下での稼働中、target に既存データ)、*failure* はコピー自体がエラーになったことを意味します。
 
-`wtb remove <branch>` はデフォルトでは clone した volume を削除しません(`docker compose down` のデフォルト挙動と整合)。`wtb remove <branch> --remove-volumes` で `docker compose down -v` 相当に切り替わり volume も削除されます。
+`wtb remove <branch>` はデフォルトでは clone した volume を削除しません(`docker compose down` のデフォルト挙動と整合)。`wtb remove <branch> --remove-volumes` で `docker compose down -v` 相当に切り替わり volume も削除されます。これは自動 teardown 経由で動くため、teardown が省略される場合(`--no-docker` 時、または `end_command` 設定時)は no-op になり警告が出ます(その場合は `end_command` 側で volume を削除してください)。こうして残った volume は時間とともに孤児として溜まるので、[`wtb prune`](#wtb-prune) でまとめて掃除できます(wtb が作る volume には `wtb.managed=true` ラベルが付きます)。
+
+### クローンの代わりに seed する(`--seed`)
+
+main のデータのコピーではなく、新 worktree に**新規 seed された**データベースが欲しいことがあります(クリーンなマイグレーション先、決定的なテストフィクスチャなど)。seed コマンドを設定して `--seed` を渡します:
+
+```yaml
+# wtb.yaml
+volumes:
+  seed_command: docker compose up -d db && npm run db:migrate && npm run db:seed
+```
+
+```bash
+wtb create feature/clean-db --seed
+```
+
+`--seed` を付けると wtb は **volume クローンフェーズを完全にスキップ**し、新 worktree 内で `volumes.seed_command` を実行します(`/bin/sh`・`cwd` は worktree ルート・`start_command` と同じパス/シェル解決)。ライブのソース volume から一切読み取らないため、この経路は**ソーススタックを止めません** — メインのサービスは稼働したままです。データを「コピー」ではなく「新規構築」する、構造的にデータ自律な経路です。
+
+注意:
+
+- `--seed` は `volumes.seed_command` の設定が必須です。未設定なら worktree を作る前に exit `4` で失敗します。
+- `--seed` と `--force-volume-copy` は排他です(片方は seed、もう片方は clone)。両方渡すと exit `1` で失敗します。
+- seed コマンドが失敗した場合、worktree 自体は作成されますがバナーが `⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready` に変わります(終了コードは `0` のまま — 失敗クローンと同じ契約)。修正後に worktree 内で seed を再実行してください。
 
 ## アーキテクチャ
 
 ```
 src/
 ├── cli/
-│   ├── commands/      create, remove, ls, ports, status, init-claude
+│   ├── commands/      create, remove, reclone, prune, ls, ports, status, init-claude
 │   ├── utils/         worktree/ports レンダラ、共通エラーラッパー、Claude Skill インストーラ
 │   └── index.ts       commander の組み立て + グローバルエラーハンドラ
 ├── core/
@@ -543,8 +609,8 @@ src/
 | `1` | 一般エラー |
 | `2` | CLI 引数エラー |
 | `3` | git リポジトリ外 |
-| `4` | 設定エラー |
-| `5` | Docker エラー |
+| `4` | 設定エラー(設定ファイルのパース失敗・バリデーション失敗) |
+| `5` | Docker エラー — **予約**。Docker はオプションで graceful に degrade する(警告して継続)ため、現状このコードで終了することはない。Docker の問題は警告(コマンドは成功)になるか、`1` として表面化する。 |
 
 ## 開発
 
@@ -561,6 +627,7 @@ npm run test                   # vitest watch
 npm run test:run               # vitest 1 回
 npm run test:unit              # ユニットテスト(src/)
 npm run test:e2e               # E2E(test-repos/ 配下に実 git repo を作る)
+npm run test:integration       # 実 Docker での volume クローン検証(Docker 無しなら skip)
 npm run test:ui                # vitest UI
 
 npm run typecheck              # tsc --noEmit
@@ -609,7 +676,7 @@ wtb init-claude --user                   # ~/.claude/skills/wtb/SKILL.md
 
 ### データソース: `wtb ports`
 
-Skill は `wtb ports --json` を呼び出して結果を読み取ります。シェルから直接使うこともできます:
+Skill は `wtb ports` を呼び出して結果を読み取ります(JSON がデフォルト出力 — `--json` フラグは存在しません)。シェルから直接使うこともできます:
 
 ```bash
 wtb ports                                # 現 worktree を JSON オブジェクトで
@@ -648,10 +715,12 @@ Skill インストール後は、次のような依頼が自然に通ります:
 
 | 発言 | Claude の挙動 |
 |-----|---------------|
-| 「ここの API のポート教えて」 | `wtb ports --json` を実行 → 該当ポートを返答 |
+| 「ここの API のポート教えて」 | `wtb ports` を実行(JSON がデフォルト)→ 該当ポートを返答 |
 | 「worktree 一覧見せて」 | `wtb ls -l` |
 | 「feature/login の worktree 作って」 | `wtb create feature/login`(破壊的変更は事前確認) |
 | 「feature/old 片付けて」 | `wtb ls -l` で対象表示 → 確認 → `wtb remove feature/old` |
+| 「この worktree の DB が空/クローン失敗した」 | `wtb reclone` → volume クローンフェーズだけ再実行(worktree は作り直さない) |
+| 「この worktree で実際に何が動いてる?」 | `wtb status --json` → コンテナ/volume を構造化データで取得 |
 
 Skill の `description` は `wtb.yaml` を含むリポジトリで自動発火するので、手動で呼び出す必要はほぼありません。
 
@@ -698,10 +767,11 @@ wtb は内部で `git worktree add` を使い、その上に git 単体ではカ
 
 以下は **今後の予定であり、まだ実装されていません**。意図する方向性を記録するために記載しています。
 
-- **コピーの代わりに seed(オプション)。** オプションにより、`create` 時に volume データのクローンではなく seed を走らせられるようにします。main のクローンではなく、新規に seed した DB が欲しいときに便利です。稼働中 volume からのコピーが発生しないため、この経路では stop しません。
+- _現在リストにある項目はありません — 予定していた項目はすべて実装済みです(下記参照)。次に欲しい機能があれば issue を立ててください。_
 
 最近実装済み(このリストにあった項目):
 
+- **コピーの代わりに seed(オプション)。** ✅ `wtb create --seed` は volume データのクローンではなく、新 worktree 内で `volumes.seed_command` を実行します。main のクローンではなく新規に seed した DB が欲しいときに。稼働中 volume からのコピーが発生しないため、この経路では stop しません。詳細は [Volume の自動クローン → クローンの代わりに seed する](#クローンの代わりに-seed-する--seed)。
 - **DB の完全性のための stop-then-copy。** ✅ `create` は稼働中のソース Compose スタックを自動で stop してから volume をクローンし、その後 restart します(クラッシュセーフ)。稼働中のライブ DB も手動操作ゼロでクローンできます。`--no-stop` で従来挙動にできます。
 
 ## Changelog

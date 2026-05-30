@@ -21,6 +21,8 @@ A CLI tool built on Git worktrees that gives every branch its own isolated worki
 - [Commands](#commands)
   - [`create`](#wtb-create-branch)
   - [`remove`](#wtb-remove-branch)
+  - [`reclone`](#wtb-reclone-branch)
+  - [`prune`](#wtb-prune)
   - [`ls` / `list`](#wtb-ls-alias-list)
   - [`ports`](#wtb-ports)
   - [`status`](#wtb-status)
@@ -154,7 +156,7 @@ Creates a new worktree for `<branch>`, branching from `base_branch` unless the b
 |--------|-------------|
 | `-p, --path <path>` | Custom worktree location |
 | `--no-create-branch` | Use an existing branch (fails if it doesn't exist) |
-| `--no-docker` | Skip Docker Compose copy/port-remap |
+| `--no-docker` | Skip Docker Compose copy/port-remap — **also skips volume cloning** (the volume phase requires Docker), so the worktree starts with empty volumes |
 | `--no-env` | Skip `env.file` copy + `env.adjust` |
 | `--no-copy` | Skip `copy_files` |
 | `--no-link` | Skip `link_files` symlinks |
@@ -162,6 +164,7 @@ Creates a new worktree for `<branch>`, branching from `base_branch` unless the b
 | `--no-volume-copy` | Skip cloning Docker volumes from the source project |
 | `--force-volume-copy` | Clone volumes even when the source container is running or the target volume already has data |
 | `--no-stop` | Don't auto-stop the source Compose stack before cloning; skip in-use volumes instead (the old behavior) |
+| `--seed` | Seed the data instead of cloning: skip the volume-clone phase and run `volumes.seed_command` in the new worktree. Never touches the source volume, so the source stack is left running. Requires `volumes.seed_command` in the config; mutually exclusive with `--force-volume-copy`. See [Volume cloning](#volume-cloning) |
 | `--dry-run` | Print the plan, make no changes |
 
 Examples:
@@ -185,7 +188,7 @@ Removes the worktree that owns `<branch>`. Guards against removing the main repo
 | `-f, --force` | Pass `--force` to `git worktree remove` (uncommitted changes) |
 | `--no-docker` | Skip `docker compose down` in the worktree |
 | `--no-end` | Skip `end_command` |
-| `--remove-volumes` | Also delete this worktree's Docker volumes (`docker compose down -v`) |
+| `--remove-volumes` | Also delete this worktree's Docker volumes (`docker compose down -v`). Has **no effect** (wtb warns) when teardown is skipped — i.e. with `--no-docker` or when `end_command` is set (your `end_command` must drop the volumes itself) |
 
 Ordering: Docker teardown → `end_command` → `git worktree remove`. If `end_command` is set, wtb assumes you own teardown and skips the automatic `docker compose down`.
 
@@ -193,6 +196,41 @@ Ordering: Docker teardown → `end_command` → `git worktree remove`. If `end_c
 wtb remove feature/old --no-docker          # Docker daemon already stopped
 wtb remove feature/abandoned -f --no-end    # force-remove, skip cleanup
 ```
+
+### `wtb reclone [branch]`
+
+Re-runs **only the volume-clone phase** for an existing worktree — useful when a clone previously failed or was skipped (empty/stale volumes) and you want to recover the data **without** removing and recreating the worktree (so uncommitted work is safe). Defaults to the current worktree; pass a branch to target another.
+
+| Option | Description |
+|--------|-------------|
+| `--force-volume-copy` | Clone even when the source container is running or the target already has data (overwrite is atomic) |
+| `--no-stop` | Don't auto-stop the source Compose stack; skip in-use volumes instead |
+| `--dry-run` | Print which volumes would be cloned; make no changes |
+
+```bash
+wtb reclone                       # current worktree
+wtb reclone feature/auth          # a specific worktree
+wtb reclone feature/auth --force-volume-copy   # overwrite stale target data
+```
+
+Prints the same `N cloned, N skipped, N failed` summary as `create`; a failure exits `0` with the loud `⚠️  … data is NOT fully isolated` line (resolve and re-run). Refuses to target the main repository worktree (source and target would be the same project). If `docker_compose_file` isn't configured, it's a no-op with a message. To re-*seed* instead of re-clone, run your `volumes.seed_command` inside the worktree.
+
+### `wtb prune`
+
+Removes **wtb-managed Docker volumes that are orphaned** — i.e., volumes wtb cloned for worktrees that no longer exist (because `wtb remove` leaves volumes by default) — plus **leftover temp volumes** from interrupted `--force-volume-copy` overwrites. Over many create/remove cycles these accumulate; `prune` is the cleanup. Only volumes labelled `wtb.managed=true` are ever touched, and a volume is removed only if it belongs to **no existing worktree** of this repo.
+
+| Option | Description |
+|--------|-------------|
+| `-y, --yes` | Actually remove the volumes. **Without this, `prune` is a dry run** (lists candidates only) |
+| `--json` | Machine-readable output (`{ dryRun, candidates, removed }`) |
+
+```bash
+wtb prune            # preview what would be removed (safe; deletes nothing)
+wtb prune --yes      # remove the orphaned + leftover temp volumes
+wtb prune --json     # machine-readable preview for scripts/agents
+```
+
+Safety: it's **dry-run by default** (deletion needs `--yes`); a volume currently in use by a container is skipped; and a worktree's volume is matched by its exact Compose project prefix (`<project>_…`), so it never removes a live worktree's data. Determines "live" worktrees from `git worktree list` for this repo.
 
 ### `wtb ls` (alias: `list`)
 
@@ -264,6 +302,7 @@ Richer inspection: worktrees + Docker Compose services + running containers + vo
 |--------|-------------|
 | `-a, --all` | Show all worktrees (default: current branch only) |
 | `--docker-only` | Suppress worktree section, show only Docker info |
+| `--json` | Machine-readable JSON (worktrees + Docker state) on stdout — for scripts/agents |
 
 ```
 📁 Git Worktrees Status
@@ -273,6 +312,13 @@ Richer inspection: worktrees + Docker Compose services + running containers + vo
    🐳 Docker: docker-compose.yml
    📦 Services: 3
    🔧 Environment: .env, .env.local
+```
+
+`--json` returns one structured object (`{ worktrees: [...], docker: {...} }`) and stays valid JSON even when Docker is down (`docker.available: false`). This completes the machine-readable trio with `wtb ls --json` and `wtb ports`.
+
+```bash
+wtb status --json | jq '.docker.containers[] | select(.isWtb) | .name'   # this project's containers
+wtb status -a --json | jq '.worktrees[] | {branch, services: .compose.services}'
 ```
 
 ### `wtb init-claude`
@@ -311,6 +357,7 @@ If nothing is found, wtb still runs with defaults (prints a warning to stderr). 
 | `env.file` | string[] | `["./.env"]` | Env files to copy into the worktree |
 | `env.adjust` | map | `{}` | Per-key adjustment (see [Environment variable adjustment](#environment-variable-adjustment)) |
 | `volumes.exclude` | string[] | `[]` | Compose volume keys to **exclude** from auto-cloning. Default: every named non-`external` volume in the Compose file is cloned. See [Volume cloning](#volume-cloning) |
+| `volumes.seed_command` | string | — | Command run in the new worktree (via `/bin/sh`) when `wtb create --seed` is used, **instead of** cloning volume data. Lets a worktree start from a freshly seeded DB rather than a copy of main's. See [Volume cloning](#volume-cloning) |
 
 ### Validation
 
@@ -404,6 +451,8 @@ How it works:
    - **If the target volume already has data**, wtb skips it (assumes you've already populated it). Pass `--force-volume-copy` to overwrite. The overwrite is **atomic**: wtb stages the new data into a temporary volume and verifies it before replacing the target, so a failed copy never leaves the target emptied.
    - Otherwise, wtb does a recursive copy via a transient `instrumentisto/rsync-ssh` sidecar container (with an Alpine `cp -a` fallback if rsync isn't available).
 
+Every volume wtb creates is labelled **`wtb.managed=true`**, so it is self-identifying regardless of how the project/path is named. `wtb status` uses this label to report wtb-managed volumes accurately (even for custom `-p` paths), and you can list them yourself with `docker volume ls --filter label=wtb.managed=true`.
+
 Selectively exclude volumes you don't want to clone (e.g. regenerable caches):
 
 ```yaml
@@ -418,7 +467,29 @@ Disable the whole phase per-invocation with `wtb create <branch> --no-volume-cop
 
 The per-volume summary reports `N cloned, N skipped, N failed`. If any volume **fails** to clone, the worktree is still created but the final banner changes from `🎉 Worktree created successfully!` to `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`, so the incomplete state is obvious (note: the command still exits `0` — the worktree exists). A *skip* is intentional (external/excluded volume, missing source, in-use under `--no-stop`, or a target that already has data); a *failure* means the copy itself errored.
 
-`wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`).
+`wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`). Because that runs through the automatic teardown, `--remove-volumes` is a no-op (with a warning) when teardown is skipped — under `--no-docker`, or when `end_command` is set (then your `end_command` owns volume removal). Volumes left behind this way accumulate as orphans over time — sweep them with [`wtb prune`](#wtb-prune) (every wtb-created volume carries the `wtb.managed=true` label).
+
+### Seed instead of clone (`--seed`)
+
+Sometimes you don't want a copy of main's data — you want a **freshly seeded** database in the new worktree (a clean migration target, a deterministic test fixture, etc.). Configure a seed command and pass `--seed`:
+
+```yaml
+# wtb.yaml
+volumes:
+  seed_command: docker compose up -d db && npm run db:migrate && npm run db:seed
+```
+
+```bash
+wtb create feature/clean-db --seed
+```
+
+With `--seed`, wtb **skips the volume-clone phase entirely** and runs `volumes.seed_command` in the new worktree (via `/bin/sh`, `cwd` = worktree root, same path-or-shell resolution as `start_command`). Because nothing is ever read off a live source volume, this path **never stops the source stack** — your main services keep running untouched. This is the "data-autonomous by construction" path: the worktree's data is built fresh, not copied.
+
+Notes:
+
+- `--seed` requires `volumes.seed_command` to be set; otherwise `create` fails with exit `4` before creating the worktree.
+- `--seed` and `--force-volume-copy` are mutually exclusive (one seeds, the other clones) — passing both fails with exit `1`.
+- If the seed command fails, the worktree is still created but the banner becomes `⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready` (exit stays `0`, same contract as a failed clone). Re-run the seed inside the worktree after fixing it.
 
 ## Lifecycle scripts
 
@@ -431,7 +502,7 @@ Script failures are **non-fatal** — wtb prints a warning and the worktree is l
 ```
 src/
 ├── cli/
-│   ├── commands/      create, remove, ls, ports, status, init-claude
+│   ├── commands/      create, remove, reclone, prune, ls, ports, status, init-claude
 │   ├── utils/         worktree/ports renderers, command error wrapper, claude skill installer
 │   └── index.ts       commander wiring + global error handlers
 ├── core/
@@ -463,8 +534,8 @@ Exit codes (`src/constants/index.ts`):
 | `1` | General error |
 | `2` | Invalid CLI usage |
 | `3` | Not in a git repository |
-| `4` | Configuration error |
-| `5` | Docker error |
+| `4` | Configuration error (config not found-but-invalid, parse failure, or validation failure) |
+| `5` | Docker error — **reserved.** Docker is optional and degrades gracefully (warn + continue), so wtb does not currently exit with this code; Docker problems either warn (and the command still succeeds) or surface as `1`. |
 
 ## Development
 
@@ -481,6 +552,7 @@ npm run test                   # vitest watch
 npm run test:run               # vitest once
 npm run test:unit              # unit tests (src/)
 npm run test:e2e               # e2e (creates real git repos under test-repos/)
+npm run test:integration       # real-Docker volume-clone checks (skips if Docker is absent)
 npm run test:ui                # vitest UI
 
 npm run typecheck              # tsc --noEmit
@@ -529,7 +601,7 @@ Flags: `-f, --force` (overwrite existing), `--user` (global), `--dry-run` (previ
 
 ### `wtb ports` — the data source
 
-The skill tells Claude to call `wtb ports --json`. The command is useful on its own too:
+The skill tells Claude to call `wtb ports` (JSON is the default output — there is no `--json` flag). The command is useful on its own too:
 
 ```bash
 wtb ports                                # current worktree as a JSON object
@@ -568,10 +640,12 @@ With the skill installed, typical prompts just work:
 
 | You say | Claude does |
 |---------|-------------|
-| "What port is the API on here?" | `wtb ports --json` → picks the right host port |
+| "What port is the API on here?" | `wtb ports` → picks the right host port (JSON by default) |
 | "List the worktrees." | `wtb ls -l` |
 | "Make a worktree for feature/login." | `wtb create feature/login` (prompts you first if destructive) |
 | "Clean up feature/old." | `wtb ls -l` to show the target → confirms → `wtb remove feature/old` |
+| "This worktree's DB is empty / the clone failed." | `wtb reclone` → re-runs just the volume-clone phase, no worktree recreation |
+| "What's actually running for this worktree?" | `wtb status --json` → live containers/volumes as structured data |
 
 The skill's `description` triggers automatically when `wtb.yaml` is in the repo, so you usually don't need to invoke it by hand.
 
@@ -624,10 +698,11 @@ Short for "worktree turbo" — git worktrees, but with the environment-wrangling
 
 Planned, **not yet implemented** — listed so the intended direction is on record.
 
-- **Seed instead of copy (opt-in).** A flag will let `create` run a seed step instead of cloning volume data — useful when you want a freshly seeded DB rather than a clone of main's. Because nothing is copied off a live volume, this path does *not* stop the stack.
+- _Nothing currently on the list — the previously-planned items have shipped (see below). Open an issue with what you'd like to see next._
 
 Recently shipped (was on this list):
 
+- **Seed instead of copy (opt-in).** ✅ `wtb create --seed` runs `volumes.seed_command` in the new worktree instead of cloning volume data — for a freshly seeded DB rather than a clone of main's. Because nothing is copied off a live volume, this path does *not* stop the source stack. See [Volume cloning → Seed instead of clone](#seed-instead-of-clone---seed).
 - **Stop-then-copy for DB integrity.** ✅ `create` now auto-stops the source Compose stack before cloning live volumes and restarts it afterward (crash-safe), so a running dev DB clones with no manual step. Opt out with `--no-stop`.
 
 ## Changelog

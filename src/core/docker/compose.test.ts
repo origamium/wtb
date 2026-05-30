@@ -69,9 +69,18 @@ describe("resolveComposeProjectName", () => {
       expect(resolveComposeProjectName(empty(), "/tmp/dir_name", env)).toBe("from_env")
     })
 
-    it("explicit `name:` field beats COMPOSE_PROJECT_NAME (Compose precedence)", () => {
+    it("COMPOSE_PROJECT_NAME beats explicit `name:` field (verified vs `docker compose config`)", () => {
+      // Docker Compose v2 precedence: -p > COMPOSE_PROJECT_NAME > name: > basename.
+      // Ground-truthed empirically: `COMPOSE_PROJECT_NAME=from_env docker compose
+      // config --format json | jq -r .name` returns "from_env" even with `name: from_yaml`.
       const config = empty({ name: "from_yaml" } as ComposeConfig)
       const env = { COMPOSE_PROJECT_NAME: "from_env" }
+      expect(resolveComposeProjectName(config, "/tmp/dir_name", env)).toBe("from_env")
+    })
+
+    it("falls back to `name:` when COMPOSE_PROJECT_NAME is empty", () => {
+      const config = empty({ name: "from_yaml" } as ComposeConfig)
+      const env = { COMPOSE_PROJECT_NAME: "" }
       expect(resolveComposeProjectName(config, "/tmp/dir_name", env)).toBe("from_yaml")
     })
 

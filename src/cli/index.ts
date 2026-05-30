@@ -13,6 +13,8 @@ import { createCommand } from "./commands/create.js"
 import { initClaudeCommand } from "./commands/init-claude.js"
 import { lsCommand } from "./commands/ls.js"
 import { portsCommand } from "./commands/ports.js"
+import { pruneCommand } from "./commands/prune.js"
+import { recloneCommand } from "./commands/reclone.js"
 import { removeCommand } from "./commands/remove.js"
 import { statusCommand } from "./commands/status.js"
 
@@ -30,6 +32,8 @@ function createMainProgram(): Command {
   program.addCommand(portsCommand())
   program.addCommand(createCommand())
   program.addCommand(removeCommand())
+  program.addCommand(recloneCommand())
+  program.addCommand(pruneCommand())
   program.addCommand(initClaudeCommand())
 
   return program
@@ -49,10 +53,16 @@ function setupErrorHandling(): void {
     process.exit(EXIT_CODES.GENERAL_ERROR)
   })
 
-  process.on("SIGINT", () => {
+  // SIGINT (Ctrl-C) と SIGTERM (kill) の両方で同じ後始末経路を通す。
+  // 長時間処理 (volume clone 中の stop-then-copy など) は、コマンド側が
+  // process.prependListener でこれらのシグナルに復旧フック (source スタック
+  // 再開) を差し込む。prepend なのでここの exit より先に必ず走る。
+  const gracefulExit = () => {
     console.log("\n👋 Goodbye!")
     process.exit(EXIT_CODES.SUCCESS)
-  })
+  }
+  process.on("SIGINT", gracefulExit)
+  process.on("SIGTERM", gracefulExit)
 }
 
 /**

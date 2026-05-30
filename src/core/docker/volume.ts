@@ -71,7 +71,14 @@ export function getVolumeSize(volumeName: string): number | null {
  * @param driver - ドライバー（デフォルト: local）
  */
 export function createVolume(volumeName: string, driver: string = "local"): void {
-  execDockerSafe(["volume", "create", "--driver", driver, volumeName], {})
+  // wtb が作成した volume には `wtb.managed=true` ラベルを付け、自己識別できるようにする。
+  // これで `wtb status` はディレクトリ名の命名規則に依存せず (カスタム -p パスでも)
+  // wtb 管理 volume を正確に列挙でき、ユーザ/agent も
+  // `docker volume ls --filter label=wtb.managed=true` で発見・整理できる。
+  execDockerSafe(
+    ["volume", "create", "--driver", driver, "--label", "wtb.managed=true", volumeName],
+    {}
+  )
 }
 
 /**
@@ -121,6 +128,46 @@ function makeTempVolumeName(targetVolume: string): string {
   return `${targetVolume}__wtbtmp_${suffix}`
 }
 
+/** rsync の速度単位 → bytes/sec 倍率。未知の単位は「不明」(0) として扱い、勝手に bytes と誤認しない。 */
+const RSYNC_SPEED_UNITS: Record<string, number> = {
+  "b/s": 1,
+  "kb/s": 1024,
+  "mb/s": 1024 * 1024,
+  "gb/s": 1024 * 1024 * 1024,
+  "tb/s": 1024 * 1024 * 1024 * 1024,
+}
+
+/**
+ * rsync `--info=progress2` の 1 行から進捗を抽出する純粋関数。
+ *
+ * 例: `  1,234,567  45%   12.34MB/s    0:00:12`
+ * - ETA (`H:M:S`) は rsync のビルド差で欠ける場合があるため任意とし、無ければ `eta=0`。
+ * - 速度単位が未知 (上記マップ外) のときは `speed=0` を返す。0 を「不明」として
+ *   扱い、未知単位を bytes と誤って巨大な速度に化けさせない。
+ *
+ * @returns 進捗。行が進捗フォーマットでなければ `null`。
+ */
+export function parseRsyncProgress(
+  line: string
+): { bytesTransferred: number; percentage: number; speed: number; eta: number } | null {
+  const m = line.match(/(\d[\d,]*)\s+(\d+)%\s+([\d.]+)([A-Za-z]+\/s)(?:\s+(\d+):(\d+):(\d+))?/)
+  if (!m) return null
+
+  const bytesTransferred = parseInt(m[1].replace(/,/g, ""), 10)
+  const percentage = parseInt(m[2], 10)
+  const value = parseFloat(m[3])
+  const unit = m[4].toLowerCase()
+  const multiplier = RSYNC_SPEED_UNITS[unit]
+  const speed = multiplier !== undefined ? value * multiplier : 0
+
+  let eta = 0
+  if (m[5] !== undefined) {
+    eta = Number(m[5]) * 3600 + Number(m[6]) * 60 + Number(m[7])
+  }
+
+  return { bytesTransferred, percentage, speed, eta }
+}
+
 /**
  * rsyncを使用した高速ボリュームコピー
  *
@@ -136,11 +183,10 @@ export async function copyVolumeWithRsync(
 ): Promise<void> {
   const { onProgress, incremental = true, compress = false } = options
 
-  try {
-    createVolume(targetVolume)
-  } catch {
-    // 既に存在する場合は無視
-  }
+  // `docker volume create` は idempotent (既存 volume なら何もせず成功) なので
+  // 失敗 = 本当のエラー (daemon down / 不正な名前 / driver エラー)。握り潰さず
+  // 伝播させ、呼び出し側で copy 失敗として明確に扱う。
+  createVolume(targetVolume)
 
   const totalBytes = getVolumeSize(sourceVolume) ?? 0
 
@@ -183,49 +229,30 @@ export async function copyVolumeWithRsync(
     dockerProcess.stdout.on("data", (data: Buffer) => {
       const output = data.toString()
 
-      const progressMatch = output.match(/(\d[\d,]*)\s+(\d+)%\s+([\d.]+\w+\/s)\s+(\d+:\d+:\d+)/)
+      const progress = parseRsyncProgress(output)
 
-      if (progressMatch && onProgress) {
-        const bytesTransferred = parseInt(progressMatch[1].replace(/,/g, ""), 10)
-        const percentage = parseInt(progressMatch[2], 10)
-        const speedStr = progressMatch[3]
-        const etaStr = progressMatch[4]
-
-        const speedMatch = speedStr.match(/([\d.]+)(\w+)/)
-        let speed = 0
-        if (speedMatch) {
-          const value = parseFloat(speedMatch[1])
-          const unit = speedMatch[2].toLowerCase()
-          const multipliers: Record<string, number> = {
-            "b/s": 1,
-            "kb/s": 1024,
-            "mb/s": 1024 * 1024,
-            "gb/s": 1024 * 1024 * 1024,
-          }
-          speed = value * (multipliers[unit] || 1)
-        }
-
-        const etaParts = etaStr.split(":").map(Number)
-        const eta = etaParts[0] * 3600 + etaParts[1] * 60 + etaParts[2]
-
+      if (progress && onProgress) {
         lastProgress = {
           sourceVolume,
           targetVolume,
-          percentage,
-          bytesTransferred,
+          percentage: progress.percentage,
+          bytesTransferred: progress.bytesTransferred,
           totalBytes,
-          speed,
-          eta,
+          speed: progress.speed,
+          eta: progress.eta,
         }
 
         onProgress(lastProgress)
       }
     })
 
+    // rsync の stderr は全量バッファする。失敗時に診断できるよう、
+    // close ハンドラで例外メッセージへ畳み込む (末尾を切り詰めて肥大化を防ぐ)。
+    let stderrBuffer = ""
     dockerProcess.stderr.on("data", (data: Buffer) => {
-      const error = data.toString()
-      if (error.includes("error") || error.includes("failed")) {
-        console.error("rsync error:", error)
+      stderrBuffer += data.toString()
+      if (stderrBuffer.length > 8192) {
+        stderrBuffer = stderrBuffer.slice(-8192)
       }
     })
 
@@ -240,7 +267,12 @@ export async function copyVolumeWithRsync(
         }
         resolve()
       } else {
-        reject(new Error(`Volume copy failed with exit code ${code}`))
+        const detail = stderrBuffer.trim()
+        reject(
+          new Error(
+            `Volume copy failed with exit code ${code}${detail ? `: ${detail}` : ""}`
+          )
+        )
       }
     })
 
@@ -271,11 +303,8 @@ export async function copyVolumeWithCp(
   } = {}
 ): Promise<void> {
   const { onProgress, clearTarget = false } = options
-  try {
-    createVolume(targetVolume)
-  } catch {
-    // 既に存在する場合は無視
-  }
+  // idempotent: 既存なら no-op で成功。失敗は本当のエラーなので伝播させる。
+  createVolume(targetVolume)
 
   const totalBytes = getVolumeSize(sourceVolume) ?? 0
 
@@ -357,8 +386,14 @@ export async function copyVolume(
     })
   } catch (error) {
     console.warn("rsync copy failed, falling back to cp:", error)
+    // rsync は途中まで書き込んでから失敗している可能性があり、target に中途半端な
+    // ツリーが残る。cp フォールバックはこの非 clearTarget 経路では常に fresh/空の
+    // target に対して呼ばれる (既存データの上書きは atomic 経路へ分岐済み) ので、
+    // rsync の部分出力を捨てて clean な状態からコピーし直す。これで rsync の
+    // --delete (incremental) 相当の置換セマンティクスをフォールバックでも保つ。
     await copyVolumeWithCp(sourceVolume, targetVolume, {
       onProgress: options.onProgress,
+      clearTarget: true,
     })
   }
 }

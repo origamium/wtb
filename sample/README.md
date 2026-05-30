@@ -77,6 +77,32 @@ worktree作成時と削除時にスクリプトを自動実行します：
 - `end_command: ./stop-dev.sh` - worktree削除前に実行
   - Docker Composeサービスの停止
 
+### 5. Docker volume の自動クローン（データ自律性）
+
+`docker-compose.yml` に定義された named volume（`postgres_data` / `shared_data`）は、
+worktree 作成時に **自動でクローン** されます。これにより新しいブランチが main と
+**同じ DB データ** から始まり、再 seed 不要で独立してマイグレーション・データ変更が
+できます。main の DB が起動中でも、wtb が自動で stop → クローン → restart します
+（クラッシュセーフ）。
+
+```bash
+cd ..
+cd sample
+../dist/cli/index.js create feature/with-data    # postgres_data がクローンされる
+# → worktree 側の DB に main と同じデータが入っている
+
+# データを上書きで取り直す / 復旧する（worktree を作り直さずに）:
+../dist/cli/index.js reclone feature/with-data --force-volume-copy
+
+# クローンではなく新規 seed から始めたい場合 (wtb.yaml の volumes.seed_command を使用):
+../dist/cli/index.js create feature/fresh-db --seed
+```
+
+> 注: このサンプルの compose には `container_name:` を**あえて設定していません**。
+> `container_name:` はグローバル名のため、複数 worktree で `docker compose up` すると
+> 衝突します。未指定なら Compose が project ごとに `<project>-<service>-N` と命名し、
+> 各 worktree が独立して並行起動できます。
+
 ## ポート設定
 
 | サービス | デフォルトポート | 環境変数 |

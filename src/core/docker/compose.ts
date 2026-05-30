@@ -269,9 +269,10 @@ export function generateProjectName(projectDir: string, branchName?: string): st
 /**
  * Docker Compose v2 が実際に算出するプロジェクト名を解決する
  *
- * 優先順位 (Compose v2 の実挙動に整合):
- * 1. `composeConfig.name` (compose.yml で `name:` が明示されていればそれを採用)
- * 2. `COMPOSE_PROJECT_NAME` 環境変数 (空でない場合)
+ * 優先順位 (Compose v2 の実挙動に整合 — `docker compose config --format json`
+ * で実機確認済み。`COMPOSE_PROJECT_NAME` は `name:` より**強い**):
+ * 1. `COMPOSE_PROJECT_NAME` 環境変数 (空でない場合) — `-p` フラグ相当の次に強い
+ * 2. `composeConfig.name` (compose.yml の `name:`)
  * 3. workdir の basename を Compose 仕様で正規化:
  *    - lowercase 化
  *    - `[a-z0-9_-]` 以外の文字を **削除** (置換ではなく除去)
@@ -291,13 +292,13 @@ export function resolveComposeProjectName(
   workdir: string,
   env: NodeJS.ProcessEnv = process.env
 ): string {
-  const explicit = (composeConfig as { name?: unknown }).name
-  if (typeof explicit === "string" && explicit.length > 0) {
-    return explicit
-  }
   const fromEnv = env.COMPOSE_PROJECT_NAME
   if (typeof fromEnv === "string" && fromEnv.length > 0) {
     return fromEnv
+  }
+  const explicit = (composeConfig as { name?: unknown }).name
+  if (typeof explicit === "string" && explicit.length > 0) {
+    return explicit
   }
   const baseName = workdir.split("/").pop() || ""
   const stripped = baseName.toLowerCase().replace(/[^a-z0-9_-]/g, "")

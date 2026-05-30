@@ -1,11 +1,21 @@
 ---
 name: wtb
-description: Use this skill when working in a repository that contains a wtb.yaml or .wtb.yaml config. wtb is a CLI that manages multiple git worktrees with per-worktree environment and port isolation. Activate this skill when the user asks about - this worktree's local ports, endpoints, or URLs; which worktrees exist or which is main/current; creating, removing, or listing worktrees for a branch; why a dev server or Docker Compose service is reachable on a non-default port; setting up a new feature branch environment. The skill explains how to invoke the wtb CLI via Bash and how to interpret its JSON output.
+description: Use this skill when working in a repository that contains a wtb.yaml or .wtb.yaml config. wtb is a CLI that manages multiple git worktrees with per-worktree environment, port isolation, and Docker volume/database cloning. Activate this skill when the user asks about - this worktree's local ports, endpoints, or URLs; which worktrees exist or which is main/current; creating, removing, or listing worktrees for a branch; why a dev server or Docker Compose service is reachable on a non-default port; setting up a new feature branch environment; this worktree's database/volume being empty or its data not carrying over from main; cloning, re-cloning, recovering, or seeding a worktree's Docker volumes (e.g. PostgreSQL data); a failed or skipped volume clone; or inspecting Docker/container state per worktree. The skill explains how to invoke the wtb CLI via Bash and how to interpret its JSON output.
 ---
 
 # wtb skill
 
 wtb gives every git branch its own isolated working directory with remapped ports and copied `.env` files. Each worktree's concrete port numbers are only discoverable at runtime — that is what this skill is for.
+
+## Operating model (how to think about worktrees)
+
+This is the mental model that makes autonomous work in a worktree safe — internalize it before acting:
+
+- **Each worktree is a fully self-contained mini-environment for one branch:** its own working dir (sharing the same `.git`), its own collision-free ports, its own copied `.env`, and its own **cloned copy of the DB/Docker-volume data** (or a freshly seeded DB with `--seed`). It is independent of every other worktree.
+- **You can build, run, migrate, and mutate data freely inside it** without affecting `main` or any sibling worktree — the data is a full copy (or fresh seed), not shared. This is the point: parallel, DB-touching changes run in true isolation.
+- **Conflicts between worktrees are expected and fine.** wtb deliberately does not resolve them; don't try to reconcile sibling worktrees.
+- **Scope:** wtb covers Docker Compose stacks only. No coding-agent orchestration is built in.
+- **When you (an agent) are working inside a worktree, treat the task as done once you've finished it** — the recommended pattern is to run all the way to opening a pull request. If more work is needed afterward, a human picks it up; don't spin up or manage other worktrees unless asked.
 
 ## When to use
 
@@ -17,6 +27,9 @@ Activate this skill when the user says or implies any of:
 - "Tear down / remove / clean up the worktree for feature/X."
 - "Why is the service on port 3002 not 3000?" — wtb auto-bumps ports to avoid collisions.
 - Any time the user wants to hit a local URL and you do not already know the port.
+- "This worktree's database / volume is empty" / "the data didn't carry over from main" / "the volume clone failed or was skipped." → re-clone the data (`wtb reclone`).
+- "Clone / copy / re-clone / recover the DB (PostgreSQL/MySQL/Redis) data into this worktree" or "seed a fresh DB for this worktree" (`wtb create --seed` / `volumes.seed_command`).
+- "What containers/volumes is this worktree running?" / inspecting per-worktree Docker state programmatically (`wtb status --json`).
 
 Also activate when `wtb.yaml`, `.wtb.yaml`, `.wtb.yml`, or `.wtb/config.yaml` exists at the repo root, even without an explicit trigger — that config is the sign wtb is in use.
 
@@ -29,8 +42,10 @@ Also activate when `wtb.yaml`, `.wtb.yaml`, `.wtb.yml`, or `.wtb/config.yaml` ex
 | "Show me everything (incl. Docker state)" | `wtb status -a` | Human-readable, includes containers/volumes |
 | "Make a worktree" | `wtb create <branch>` | Always preview with `--dry-run` first if config is unfamiliar |
 | "Remove a worktree" | `wtb remove <branch>` | **Destructive** — confirm with the user first |
+| "Its DB/volumes are empty or the clone failed" | `wtb reclone [branch]` | Re-runs just the volume-clone phase; recovers data without recreating the worktree |
+| "Clean up leftover/orphaned volumes" | `wtb prune` (preview) → `wtb prune --yes` | Removes wtb-managed volumes from deleted worktrees + leftover temp volumes |
 
-Read-only commands (`ls`, `ports`, `status`) are safe to run autonomously. Mutating commands (`create`, `remove`) require explicit user intent.
+Read-only commands (`ls`, `ports`, `status`, and `wtb prune` without `--yes`) are safe to run autonomously. Mutating commands (`create`, `remove`, `reclone`, `prune --yes`) require explicit user intent.
 
 ## Discovering the current worktree's endpoints
 
@@ -66,6 +81,7 @@ Reading the output:
 - `compose.services.<service>.host_ports[]` is the authoritative list of host-bound ports (already adjusted for the current worktree).
 - `endpoints` is a pre-rendered list of `http://localhost:<host_port>` entries. Use these first; reach for `env.*_PORT` only if no compose file is present.
 - If Docker is missing or the Compose file is absent, `compose.services` is `{}` — that is not an error. Use `env` values instead.
+- `compose.file` is resolved per worktree: wtb prefers **this worktree's own copy** of `docker_compose_file` (so the ports are the *adjusted* ones) and only falls back to the source repo's copy if the worktree has none. If you see the source's path in `compose.file`, the worktree copy was missing and the ports may be the *un-adjusted* originals — re-run `wtb create` (or copy the compose file in) to get isolated ports.
 - Warnings (e.g. `📋 Loading configuration from: wtb.yaml`) go to stderr; stdout stays valid JSON. Pipe to `jq` safely.
 
 When the user asks an open question like "check the health endpoint," pick the first `http://localhost:<port>` from `endpoints` (or reason from service names like `web` / `api` when multiple exist).
@@ -105,16 +121,28 @@ Useful flags:
 - `--dry-run` — preview without touching anything. **Suggest this to the user before the real run** if the config is unfamiliar or recently changed.
 - `-p <path>` — custom worktree location (default: `../worktree-<branch-with-slashes-as-dashes>`).
 - `--no-create-branch` — attach to an existing branch instead of creating a new one.
-- `--no-docker` / `--no-env` / `--no-copy` / `--no-link` / `--no-start` — skip individual phases.
+- `--no-docker` / `--no-env` / `--no-copy` / `--no-link` / `--no-start` — skip individual phases. Note: `--no-docker` skips **both** the Compose port-remap **and** the volume-clone phase (volume cloning is gated on Docker being active), so a worktree created with `--no-docker` starts with empty volumes even without `--no-volume-copy`.
 - `--no-volume-copy` — skip the volume-clone phase entirely (start with empty volumes).
 - `--no-stop` — don't auto-stop the source Compose stack; skip in-use volumes with a warning instead (the pre-stop-then-copy behavior). Use only when momentarily stopping the source services is unacceptable.
 - `--force-volume-copy` — clone even when source containers are running or the target already has data (clones *live* without stopping — data-corruption risk; dev only). Overwriting an existing target is atomic (staged via a temp volume, verified, then swapped), so a failed overwrite never empties the target.
+- `--seed` — **seed instead of clone.** Skips the volume-clone phase and runs `volumes.seed_command` in the new worktree instead, so the worktree starts from a *freshly seeded* DB rather than a copy of main's. Never reads the source volume, so the source stack is left running (no stop/restart). Requires `volumes.seed_command` in `wtb.yaml` (else exits `4` before creating the worktree); mutually exclusive with `--force-volume-copy` (passing both exits `1`). If the seed command fails the worktree is still created but the banner is `⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready` (exit `0`) — same not-ready contract as a failed clone.
 
 After creation, the new worktree path is printed at the end. `cd` there, then re-run `wtb ports` to see the *new* worktree's adjusted ports.
 
 ### Recovering a skipped/empty volume clone
 
-There is **no standalone re-clone subcommand** — volume cloning only happens during `create`. Two distinct signals matter, and `create` keeps the worktree either way:
+Use **`wtb reclone [branch]`** to re-run *only* the volume-clone phase on an existing worktree — no need to remove and recreate it (so uncommitted work is safe). Defaults to the current worktree; pass a branch to target another. Accepts the same `--force-volume-copy` / `--no-stop` / `--dry-run` flags as `create`, and prints the same `N cloned, N skipped, N failed` summary (a failure still exits `0` with the loud not-ready line). This is the preferred recovery primitive for agents.
+
+```bash
+wtb reclone                      # re-clone volumes for the current worktree
+wtb reclone feature/auth         # ...for a specific worktree
+wtb reclone feature/auth --force-volume-copy   # overwrite stale target data (atomic)
+wtb reclone --dry-run            # preview which volumes would be cloned
+```
+
+(`reclone` refuses to target the main repository worktree, since source and target would be the same project. To *re-seed* instead of re-clone, just run the configured `volumes.seed_command` inside the worktree.)
+
+Two distinct signals matter, and `create`/`reclone` keep the worktree either way:
 
 - **Failure** — if a clone errors, the per-volume line is `❌ Failed to clone …`, the summary shows `… N failed`, and the final banner is **`⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`** (instead of the `🎉` success banner). Treat this as data-not-ready: surface it, don't proceed as if clean.
 - **Skip** — an intentional skip (`source volume … does not exist`, `is in use by …`, or `target … already has data`) means the volume was deliberately not copied; the worktree's DB volume is empty or stale.
@@ -122,8 +150,8 @@ There is **no standalone re-clone subcommand** — volume cloning only happens d
 To recover from either:
 
 - **Default runs no longer skip just because the source is running** — wtb stops/restarts it automatically. On a default run a skip means one of: `--no-stop` was used; the source stack couldn't be stopped (e.g. Docker daemon error — look for "Could not stop source stack"); the volume is *still* in use after stopping (a shared, explicitly-`name:`d volume held by another Compose project); the target already had data; or the source volume didn't exist yet. The exact reason is printed on the skip line.
-- If skipped due to `--no-stop` + a running source: `docker compose stop` the source stack, then re-run the clone by removing and recreating the worktree (`wtb remove <branch>` → `wtb create <branch>`), or copy the volume manually with `docker run --rm -v <src>:/from -v <dst>:/to alpine cp -a /from/. /to/`.
-- If skipped because the target already had data: pass `--force-volume-copy` on a recreate to overwrite.
+- If skipped due to `--no-stop` + a running source: `docker compose stop` the source stack, then `wtb reclone <branch>` (no `--no-stop`) to auto stop-then-copy. (Or copy manually: `docker run --rm -v <src>:/from -v <dst>:/to alpine cp -a /from/. /to/`.)
+- If skipped because the target already had data: `wtb reclone <branch> --force-volume-copy` to overwrite (atomic).
 - If a `--force-volume-copy` overwrite **fails mid-commit** (rare: e.g. disk full while replacing the target), wtb keeps the verified copy in a temp volume (`<target>__wtbtmp_*`) and prints an exact `docker run … && docker volume rm …` recovery command — run it to finish restoring the target. Don't delete that temp volume until the target is restored.
 - Confirm the data landed with `wtb status` (shows volumes) or `docker compose ps` in the worktree.
 
@@ -143,12 +171,25 @@ wtb remove feature/old-branch
 
 Flags:
 
-- `-f, --force` — allow removal with uncommitted changes.
+- `-f, --force` — allow removal with uncommitted changes. (wtb does **not** run its own dirty-check; without `-f`, `git worktree remove` itself refuses a dirty worktree and the command fails. Run `wtb ls -l` first to see the `*` dirty flag before deciding.)
 - `--no-docker` — skip `docker compose down` (useful when the Docker daemon is already stopped).
 - `--no-end` — skip `end_command`.
-- `--remove-volumes` — also delete the worktree's Docker volumes (`docker compose down -v`). **Destructive for cloned data — confirm with the user.**
+- `--remove-volumes` — also delete the worktree's Docker volumes (`docker compose down -v`). **Destructive for cloned data — confirm with the user.** Note: it only works via the automatic teardown, so it has **no effect** (and wtb prints a `⚠️  --remove-volumes had no effect` warning) when teardown is skipped — i.e. with `--no-docker`, or when `end_command` is set (your `end_command` must run `docker compose down -v` itself). Watch for that warning if you intended to drop the data.
 
 Ordering is: Docker teardown → `end_command` → `git worktree remove`. Setting `end_command` in `wtb.yaml` suppresses the automatic Docker teardown (the user owns shutdown). The default leaves volumes intact (consistent with `docker compose down`); use `--remove-volumes` only if the user explicitly wants the data gone.
+
+## Cleaning up orphaned volumes (`wtb prune`)
+
+Because `wtb remove` leaves volumes by default, wtb-cloned volumes from deleted worktrees accumulate over time. `wtb prune` removes them (plus leftover `*__wtbtmp_*` temp volumes from interrupted overwrites). It only touches `wtb.managed=true`-labelled volumes that belong to **no existing worktree** of this repo.
+
+```bash
+wtb prune            # safe preview (dry run) — lists candidates, deletes nothing
+wtb prune --json     # machine-readable preview { dryRun, candidates[], removed[] }
+wtb prune --yes      # actually remove — DESTRUCTIVE; confirm with the user first
+```
+
+- **Dry run by default** — `wtb prune` and `wtb prune --json` are safe to run autonomously to *show* what would be cleaned up. Only `--yes` deletes, and removing volumes is **data loss** — confirm with the user.
+- Volumes currently in use by a container are skipped. A live worktree's volume is matched by exact Compose project prefix, so it is never removed.
 
 ## Inspecting state
 
@@ -156,9 +197,31 @@ Ordering is: Docker teardown → `end_command` → `git worktree remove`. Settin
 wtb status              # current branch + Docker state (human-readable)
 wtb status -a           # all worktrees
 wtb status --docker-only # skip the worktree section
+wtb status --json       # machine-readable JSON (worktrees + Docker state) — prefer this for agents
+wtb status -a --json    # all worktrees, JSON
 ```
 
-Use `wtb status` for diagnosis when ports look wrong or services are missing — it shells out to `docker ps` and `docker volume ls` to show what is actually running. There is no JSON mode; for scripting use `wtb ls --json` and `wtb ports --all`.
+Use `wtb status` for diagnosis when ports look wrong or services are missing — it shells out to `docker ps` and `docker volume ls` to show what is actually running. **For autonomous inspection, prefer `wtb status --json`** — it returns one structured object on stdout (valid JSON even when Docker is down):
+
+```json
+{
+  "worktrees": [
+    { "branch": "feature/auth", "path": "…", "isMain": false, "isCurrent": true,
+      "compose": { "file": "docker-compose.yml", "services": 3 },
+      "envFiles": [".env", ".env.local"] }
+  ],
+  "docker": {
+    "configured": true, "available": true,
+    "version": "Docker version 25.0", "composeVersion": "2.24.0",
+    "containers": [ { "name": "…", "image": "…", "status": "Up 3m", "ports": ["0.0.0.0:5433->5432/tcp"], "isWtb": true } ],
+    "volumes": { "total": 7, "wtb": [ { "name": "proj_pg", "driver": "local" } ] }
+  }
+}
+```
+
+- `docker.available` is `false` (not an error) when the daemon is down or Docker isn't installed; `docker.configured` reflects whether `docker_compose_file` is set. Check `available` before trusting `containers`/`volumes`.
+- This completes the machine-readable trio: `wtb ls --json` (worktrees), `wtb ports` (ports/endpoints, JSON by default), `wtb status --json` (live Docker state).
+- `docker.volumes.wtb` lists wtb-created volumes. wtb labels every volume it creates with `wtb.managed=true`, so detection is reliable even for custom `-p` paths. To find them directly: `docker volume ls --filter label=wtb.managed=true`.
 
 ## Config quick reference
 
@@ -174,6 +237,20 @@ Use `wtb status` for diagnosis when ports look wrong or services are missing —
 | `env.file` | Env files processed per worktree. |
 | `env.adjust` | Per-key transform: `number` = auto-bump to next free port, `string` = literal replace, `null` = remove. |
 | `volumes.exclude` | Compose volume keys to exclude from auto-cloning. Default `[]` (clone every named non-`external` volume). |
+| `volumes.seed_command` | Command run in the worktree when `create --seed` is used, *instead of* cloning volume data (fresh-seeded DB rather than a copy of main's). |
+
+## Installing / updating this skill (`wtb init-claude`)
+
+This skill file is installed by `wtb init-claude`. If the user asks to install, refresh, or update the wtb skill — or you notice it's stale versus the installed CLI — use it:
+
+```bash
+wtb init-claude              # write .claude/skills/wtb/SKILL.md in this repo
+wtb init-claude --force      # overwrite an existing SKILL.md (use when updating)
+wtb init-claude --user       # install globally at ~/.claude/skills/wtb/ instead
+wtb init-claude --dry-run     # print the target path only; write nothing
+```
+
+Because `.claude/skills/` is a regular tracked directory, every worktree created with `wtb create` inherits the skill automatically — there's nothing to sync per worktree. After installing, suggest the user `git add .claude/skills/wtb && git commit`. `init-claude` is safe to run autonomously *except* `--force`, which overwrites the existing file — confirm before using it.
 
 ## Troubleshooting hints
 
@@ -186,6 +263,6 @@ Use `wtb status` for diagnosis when ports look wrong or services are missing —
 ## Conventions
 
 - All read-only commands (`ls`, `ports`, `status`) are safe to run without confirmation. `create` and `remove` mutate state — confirm first.
-- `wtb ports` and `wtb ls --json` produce **valid JSON on stdout even when Docker is unavailable**. For these JSON read-commands, warnings/progress go to stderr, so `2>/dev/null` keeps pipes clean. (`create`/`remove` print human-readable output — including the volume-clone banner and `❌`/`⚠️` lines — to **stdout**; don't `2>/dev/null` those expecting to hide them.)
-- Exit codes: `0` success, `1` general error, `2` usage, `3` not-a-git-repo, `4` config error, `5` Docker error. **Caveat:** `wtb create` exits `0` even when a volume clone *failed* (the worktree is still created). Do **not** gate data-readiness on `$?` alone — detect the `⚠️  Worktree created, but N volume(s) FAILED to clone` banner on stdout (see [Recovering a skipped/empty volume clone](#recovering-a-skippedempty-volume-clone)).
+- `wtb ports`, `wtb ls --json`, and `wtb status --json` produce **valid JSON on stdout even when Docker is unavailable**. For these JSON read-commands, warnings/progress go to stderr, so `2>/dev/null` keeps pipes clean. (`create`/`remove` print human-readable output — including the volume-clone banner and `❌`/`⚠️` lines — to **stdout**; don't `2>/dev/null` those expecting to hide them.)
+- Exit codes: `0` success, `1` general error, `2` usage, `3` not-a-git-repo, `4` config error (invalid/unparseable `wtb.yaml`). Code `5` (Docker error) is **reserved and not currently emitted** — Docker is optional and degrades gracefully, so Docker trouble either just warns (command still succeeds) or surfaces as `1`. **Caveat:** `wtb create` exits `0` even when a volume clone *failed* OR a `--seed` seed command *failed* (the worktree is still created). Do **not** gate data-readiness on `$?` alone — detect the `⚠️  Worktree created, but N volume(s) FAILED to clone` / `⚠️  Worktree created, but the seed command FAILED … data is NOT ready` banner on stdout (see [Recovering a skipped/empty volume clone](#recovering-a-skippedempty-volume-clone)).
 - `wtb --help` and `wtb <command> --help` are always available for live reference.

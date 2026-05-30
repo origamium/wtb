@@ -5,9 +5,12 @@ import type { ComposeConfig } from "../../types/index.js"
 import { execDockerSafe } from "../../utils/exec.js"
 import {
   copyVolume,
+  copyVolumeWithRsync,
+  createVolume,
   discoverCloneableVolumes,
   formatBytes,
   formatEta,
+  parseRsyncProgress,
   resolveVolumeName,
 } from "./volume"
 
@@ -232,6 +235,9 @@ describe("copyVolume atomic overwrite", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {})
+    // staging-failure tests deliberately fail rsync → copyVolume logs a
+    // "rsync copy failed, falling back to cp" warning. Silence it for clean output.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
     // default: rsync succeeds; source & temp both non-empty
     vi.mocked(spawn).mockImplementation(() => fakeRsyncProc(0) as never)
     vi.mocked(execDockerSafe).mockImplementation((args: string[]) => {
@@ -340,5 +346,121 @@ describe("copyVolume atomic overwrite", () => {
     expect(removedTemp()).toBe(false)
     // and the user is told how to recover from the temp volume
     expect(logged()).toContain("preserved in temp volume")
+  })
+})
+
+describe("createVolume", () => {
+  it("creates the volume with the wtb.managed=true label (self-identifying)", () => {
+    vi.clearAllMocks()
+    vi.mocked(execDockerSafe).mockReturnValue("")
+    createVolume("some_vol")
+    const args = vi.mocked(execDockerSafe).mock.calls[0][0] as string[]
+    expect(args[0]).toBe("volume")
+    expect(args[1]).toBe("create")
+    expect(args).toContain("--label")
+    expect(args).toContain("wtb.managed=true")
+    // the volume name remains the final argument
+    expect(args.at(-1)).toBe("some_vol")
+  })
+})
+
+describe("parseRsyncProgress", () => {
+  it("parses a full progress2 line with ETA", () => {
+    const r = parseRsyncProgress("      1,234,567  45%   12.34MB/s    0:00:12")
+    expect(r).toEqual({
+      bytesTransferred: 1234567,
+      percentage: 45,
+      speed: 12.34 * 1024 * 1024,
+      eta: 12,
+    })
+  })
+
+  it("computes ETA across hours/minutes/seconds", () => {
+    const r = parseRsyncProgress("100 50% 1.0kB/s 1:02:03")
+    expect(r?.eta).toBe(3600 + 2 * 60 + 3)
+    expect(r?.speed).toBe(1024)
+  })
+
+  it("tolerates a missing ETA (eta=0)", () => {
+    const r = parseRsyncProgress("  9,999  88%   5.00GB/s")
+    expect(r).not.toBeNull()
+    expect(r?.percentage).toBe(88)
+    expect(r?.bytesTransferred).toBe(9999)
+    expect(r?.speed).toBe(5 * 1024 * 1024 * 1024)
+    expect(r?.eta).toBe(0)
+  })
+
+  it("reports speed=0 for an unknown unit instead of misreading it as bytes", () => {
+    // a hypothetical/unknown unit must NOT be silently treated as B/s (×1)
+    const r = parseRsyncProgress("500 10% 3.00pb/s 0:00:01")
+    expect(r).not.toBeNull()
+    expect(r?.speed).toBe(0)
+  })
+
+  it("returns null for a non-progress line", () => {
+    expect(parseRsyncProgress("sending incremental file list")).toBeNull()
+    expect(parseRsyncProgress("")).toBeNull()
+  })
+})
+
+/**
+ * rsync の失敗診断 (#10 stderr capture) と、rsync→cp フォールバックが fresh target
+ * を必ず clean にしてからコピーする (#4) ことを boundary mock で検証する。
+ */
+describe("copyVolume rsync robustness", () => {
+  const SOURCE = "src_vol"
+  const TARGET = "tgt_vol"
+  const DU_CMD = "du -sb /data 2>/dev/null | cut -f1"
+  const CLEAR_CMD = "find /target -mindepth 1 -delete"
+  const CP_CMD = "cp -a /source/. /target/"
+
+  const calls = () => vi.mocked(execDockerSafe).mock.calls.map((c) => c[0] as string[])
+
+  // stderr を吐いてから指定コードで close する fake rsync プロセス
+  const fakeProcWithStderr = (closeCode: number, stderrText?: string) => {
+    const proc = new EventEmitter() as EventEmitter & {
+      stdout: EventEmitter
+      stderr: EventEmitter
+    }
+    proc.stdout = new EventEmitter()
+    proc.stderr = new EventEmitter()
+    setImmediate(() => {
+      if (stderrText) proc.stderr.emit("data", Buffer.from(stderrText))
+      proc.emit("close", closeCode)
+    })
+    return proc
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    vi.mocked(execDockerSafe).mockImplementation((args: string[]) =>
+      args.includes(DU_CMD) ? "100" : ""
+    )
+  })
+
+  it("folds rsync stderr into the thrown error so failures are diagnosable", async () => {
+    vi.mocked(spawn).mockImplementation(
+      () => fakeProcWithStderr(23, "rsync: failed to set permissions: Operation not permitted") as never
+    )
+    await expect(copyVolumeWithRsync(SOURCE, TARGET)).rejects.toThrow(
+      /exit code 23.*Operation not permitted/s
+    )
+  })
+
+  it("cp fallback starts from a clean target after a partial rsync (non-atomic path)", async () => {
+    // rsync fails partway → copyVolume falls back to cp. The fallback must clear the
+    // target first to discard rsync's partial tree, reproducing --delete semantics.
+    vi.mocked(spawn).mockImplementation(() => fakeProcWithStderr(1, "partial write") as never)
+
+    await copyVolume(SOURCE, TARGET, {})
+
+    const seq = calls()
+    const clearIdx = seq.findIndex((a) => a.includes(CLEAR_CMD) && a.includes(`${TARGET}:/target`))
+    const cpIdx = seq.findIndex(
+      (a) => a.includes(CP_CMD) && a.includes(`${SOURCE}:/source:ro`) && a.includes(`${TARGET}:/target`)
+    )
+    expect(clearIdx).toBeGreaterThanOrEqual(0)
+    expect(cpIdx).toBeGreaterThan(clearIdx)
   })
 })

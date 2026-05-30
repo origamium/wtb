@@ -7,8 +7,9 @@ import { existsSync } from "node:fs"
 import * as path from "node:path"
 import fs from "fs-extra"
 import { parse } from "yaml"
-import { CONFIG_FILE_NAMES, DEFAULT_CONFIG } from "../../constants/index.js"
+import { CONFIG_FILE_NAMES, DEFAULT_CONFIG, EXIT_CODES } from "../../constants/index.js"
 import type { WtbConfig } from "../../types/index.js"
+import { CLIError } from "../../utils/error.js"
 import { validateConfig } from "./validator.js"
 
 /**
@@ -65,6 +66,10 @@ export function mergeWithDefaults(partial: Partial<WtbConfig>): WtbConfig {
     },
     volumes: {
       exclude: partial.volumes?.exclude ?? [...DEFAULT_CONFIG.volumes.exclude],
+      // seed_command はデフォルト無し。設定されていれば保持する (--seed 用)。
+      ...(partial.volumes?.seed_command !== undefined
+        ? { seed_command: partial.volumes.seed_command }
+        : {}),
     },
   }
 }
@@ -114,15 +119,25 @@ env:
 
   # Environment variable adjustments
   # Values can be:
-  #   - string: direct replacement
-  #   - number: increment by this amount (for ports)
-  #   - null: remove the variable
+  #   - number: marks the key as a PORT — wtb picks the next free port starting
+  #             at (original + 1), avoiding other worktrees' ports. The number
+  #             itself is only a type marker (any positive integer works); it is
+  #             NOT added to the original.
+  #   - string: direct replacement with this literal value
+  #   - null:   remove the variable entirely
   adjust:
-    # Example port adjustments:
-    # APP_PORT: 1000        # Add 1000 to original port
-    # DB_PORT: 1000         # Add 1000 to original port
-    # API_URL: "string"     # Replace with this string
-    # DEBUG_MODE: null      # Remove this variable
+    # Example adjustments:
+    # APP_PORT: 1            # PORT → auto-bump to the next free port
+    # DB_PORT: 1             # PORT → auto-bump to the next free port
+    # API_URL: "string"      # Replace with this literal string
+    # DEBUG_MODE: null       # Remove this variable
+
+# Volume cloning (Docker named volumes are auto-cloned to each worktree)
+# volumes:
+#   exclude:                 # volume keys to skip cloning (e.g. regenerable caches)
+#     - cache_data
+#   # Run instead of cloning when 'wtb create --seed' is used (fresh DB per worktree):
+#   seed_command: docker compose up -d db && npm run db:migrate && npm run db:seed
 `
 
   fs.writeFileSync(targetPath, yamlContent, "utf-8")
@@ -160,12 +175,22 @@ export function loadConfig(configDir: string = process.cwd()): WtbConfig {
     } catch (validationError) {
       const message =
         validationError instanceof Error ? validationError.message : String(validationError)
-      throw new Error(`Configuration validation failed: ${message}`)
+      // 設定不正は専用の exit code 4 (CONFIG_ERROR) で終了させ、一般エラー (1) と
+      // 区別する。coding agent / スクリプトが $? で設定ミスを判別できるようにする。
+      throw new CLIError(`Configuration validation failed: ${message}`, EXIT_CODES.CONFIG_ERROR)
     }
 
     return config
   } catch (error) {
+    // 既に CLIError (= 適切な exit code 付き、主に CONFIG_ERROR) ならそのまま伝播。
+    if (error instanceof CLIError) {
+      throw error
+    }
+    // パース失敗・読み込み失敗も設定起因なので CONFIG_ERROR(4) として扱う。
     const message = error instanceof Error ? error.message : String(error)
-    throw new Error(`Failed to load configuration from ${configResult.path}: ${message}`)
+    throw new CLIError(
+      `Failed to load configuration from ${configResult.path}: ${message}`,
+      EXIT_CODES.CONFIG_ERROR
+    )
   }
 }
