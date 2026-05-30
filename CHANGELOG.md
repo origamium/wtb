@@ -86,6 +86,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unit/e2e CI suites.
 
 ### Fixed
+- **`wtb ls -l` columns stay aligned with CJK relative dates.** The AGE column width
+  was measured with `.length` (code units) while padding used display width, so a
+  wide relative date (e.g. `3日前` — 3 code units, 5 columns) desynced the AGE column
+  and everything after it in CJK locales. AGE now uses display width like the other
+  columns.
 - **`wtb ls` now marks the current worktree from a subdirectory.** The `→` marker
   used an exact cwd↔worktree-path match, so running `wtb ls` from anywhere below a
   worktree root showed no marker. cwd is now resolved to its containing worktree

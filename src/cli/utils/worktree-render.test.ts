@@ -10,6 +10,7 @@ import {
   renderLong,
   renderPaths,
   resolveCurrentWorktreePath,
+  visualWidth,
 } from "./worktree-render.js"
 
 describe("resolveCurrentWorktreePath", () => {
@@ -200,5 +201,44 @@ describe("renderJson", () => {
 
   it("produces valid JSON for empty array", () => {
     expect(JSON.parse(renderJson([], "/", "/"))).toEqual([])
+  })
+})
+
+describe("renderLong column alignment with wide (CJK) ageRelative", () => {
+  // Regression: ageWidth was computed with .length while padRight uses visualWidth,
+  // so CJK relative dates (e.g. "3日前" = 3 code units but 5 display columns)
+  // desynced the AGE column and everything after it.
+  const enriched = (
+    path: string,
+    branch: string,
+    ageRelative: string
+  ): EnrichedWorktreeInfo => ({
+    path,
+    branch,
+    head: "h",
+    shortHash: "abcdef0",
+    subject: "subject",
+    ageRelative,
+    ageTimestamp: "2026-04-19T00:00:00Z",
+    dirty: false,
+  })
+
+  it("keeps the PATH column at one visual offset across mixed-width ages", () => {
+    // All-CJK so the widest-by-display entry ("3日前", width 5) has a SMALLER .length
+    // (3) than its width — the exact shape that broke the old .length-based ageWidth.
+    const rows: EnrichedWorktreeInfo[] = [
+      enriched("/repoA", "main", "3日前"), // visualWidth 5, length 3
+      enriched("/repoB", "dev", "今"), // visualWidth 2, length 1
+    ]
+    const out = renderLong(rows, "/none", "/repoA")
+    const lines = out.split("\n").filter(Boolean)
+
+    // The header's PATH column must start at the same VISUAL column as every row's path.
+    const header = lines[0]
+    const headerPathOffset = visualWidth(header.slice(0, header.indexOf("PATH")))
+    for (const line of lines.slice(1)) {
+      const pathOffset = visualWidth(line.slice(0, line.indexOf("/repo")))
+      expect(pathOffset).toBe(headerPathOffset)
+    }
   })
 })

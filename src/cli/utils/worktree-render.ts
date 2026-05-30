@@ -135,7 +135,10 @@ export function renderLong(
 
   const branchWidth = Math.max(...rows.map((r) => visualWidth(r.branch)), "BRANCH".length)
   const hashWidth = Math.max(...rows.map((r) => r.shortHash.length), "COMMIT".length)
-  const ageWidth = Math.max(...rows.map((r) => r.ageRelative.length), "AGE".length)
+  // 表示幅 (visualWidth) で計算する。padRight も visualWidth で詰めるため、ここで
+  // .length を使うと CJK 相対日付（例: "3日前" は .length 3 だが 5 カラム幅）で
+  // AGE 列以降がずれる。branch/path 列と同じく visualWidth に統一する。
+  const ageWidth = Math.max(...rows.map((r) => visualWidth(r.ageRelative)), "AGE".length)
   const pathWidth = Math.max(...rows.map((r) => visualWidth(r.path)), "PATH".length)
 
   const columns = process.stdout.columns || 120
