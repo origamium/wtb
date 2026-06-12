@@ -102,11 +102,7 @@ function truncate(value: string, max: number): string {
  *   → main            /Users/me/proj                 [main]
  *     feature/api     /Users/me/worktree-feature-api
  */
-export function renderDefault(
-  rows: WorktreeInfo[],
-  currentPath: string,
-  gitRoot: string
-): string {
+export function renderDefault(rows: WorktreeInfo[], currentPath: string, gitRoot: string): string {
   if (rows.length === 0) return "No worktrees found\n"
 
   const branchWidth = Math.max(...rows.map((r) => visualWidth(r.branch)), "BRANCH".length)
@@ -117,7 +113,9 @@ export function renderDefault(
     const marker = isCurrentWorktree(wt, currentPath) ? CURRENT_MARKER : NO_MARKER
     const tags = buildTags(wt, isMainWorktree(wt, gitRoot))
     const tagsStr = tags.length > 0 ? `  ${tags.join(" ")}` : ""
-    lines.push(`${marker}${padRight(wt.branch, branchWidth)}  ${padRight(wt.path, pathWidth)}${tagsStr}`.trimEnd())
+    lines.push(
+      `${marker}${padRight(wt.branch, branchWidth)}  ${padRight(wt.path, pathWidth)}${tagsStr}`.trimEnd()
+    )
   }
   return `${lines.join("\n")}\n`
 }
@@ -146,8 +144,7 @@ export function renderLong(
     CURRENT_MARKER.length + branchWidth + 2 + hashWidth + 2 + ageWidth + 2 + 2 + 2 + pathWidth + 2
   const subjectBudget = Math.max(20, columns - fixedWidth - 20)
 
-  const header =
-    `${NO_MARKER}${padRight("BRANCH", branchWidth)}  ${padRight("COMMIT", hashWidth)}  ${padRight("AGE", ageWidth)}  D  ${padRight("PATH", pathWidth)}  TAGS / SUBJECT`
+  const header = `${NO_MARKER}${padRight("BRANCH", branchWidth)}  ${padRight("COMMIT", hashWidth)}  ${padRight("AGE", ageWidth)}  D  ${padRight("PATH", pathWidth)}  TAGS / SUBJECT`
 
   const lines: string[] = [header]
   for (const wt of rows) {

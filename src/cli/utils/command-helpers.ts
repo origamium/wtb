@@ -12,7 +12,7 @@ import { CLIError, getErrorMessage } from "../../utils/error.js"
  * その他のエラーは GENERAL_ERROR で終了させる。
  */
 export function withErrorHandling<A extends unknown[]>(
-  handler: (...args: A) => Promise<void>,
+  handler: (...args: A) => Promise<void>
 ): (...args: A) => Promise<void> {
   return async (...args: A) => {
     try {

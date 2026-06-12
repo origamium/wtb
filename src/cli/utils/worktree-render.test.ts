@@ -208,11 +208,7 @@ describe("renderLong column alignment with wide (CJK) ageRelative", () => {
   // Regression: ageWidth was computed with .length while padRight uses visualWidth,
   // so CJK relative dates (e.g. "3日前" = 3 code units but 5 display columns)
   // desynced the AGE column and everything after it.
-  const enriched = (
-    path: string,
-    branch: string,
-    ageRelative: string
-  ): EnrichedWorktreeInfo => ({
+  const enriched = (path: string, branch: string, ageRelative: string): EnrichedWorktreeInfo => ({
     path,
     branch,
     head: "h",

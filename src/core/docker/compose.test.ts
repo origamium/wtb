@@ -28,9 +28,7 @@ describe("resolveComposeProjectName", () => {
 
   it("strips dots (not replaces them)", () => {
     // matches `docker compose config` empirical output
-    expect(resolveComposeProjectName(empty(), "/tmp/wtb-vc-real.hk4L")).toBe(
-      "wtb-vc-realhk4l",
-    )
+    expect(resolveComposeProjectName(empty(), "/tmp/wtb-vc-real.hk4L")).toBe("wtb-vc-realhk4l")
   })
 
   it("strips spaces and other punctuation", () => {
@@ -196,8 +194,10 @@ describe("adjustPortsInCompose", () => {
 
   it("resolves collisions across services within a single pass", () => {
     const out = adjustPortsInCompose(
-      { services: { a: { image: "x", ports: ["3000:80"] }, b: { image: "y", ports: ["3000:80"] } } },
-      [],
+      {
+        services: { a: { image: "x", ports: ["3000:80"] }, b: { image: "y", ports: ["3000:80"] } },
+      },
+      []
     )
     const all = [...out.services.a.ports, ...out.services.b.ports]
     expect(all).toEqual(["3000:80", "3001:80"])

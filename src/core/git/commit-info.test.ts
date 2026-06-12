@@ -18,9 +18,12 @@ describe("getCommitInfo", () => {
 
   it("splits git log output on unit separators", () => {
     // Simulate git log output with \x1f separators (subject contains a tab to prove we don't split on it)
-    const output = ["a1b2c3d", "feat: \tadd thing", "2 hours ago", "2026-04-19T10:00:00+00:00"].join(
-      "\x1f"
-    )
+    const output = [
+      "a1b2c3d",
+      "feat: \tadd thing",
+      "2 hours ago",
+      "2026-04-19T10:00:00+00:00",
+    ].join("\x1f")
     vi.mocked(execFileSync).mockReturnValue(output)
 
     const info = getCommitInfo("/some/worktree")

@@ -143,7 +143,9 @@ describe("Config Validator (Refactored)", () => {
         env: { file: [], adjust: {} },
         volumes: { exclude: [], seed_command: 123 as unknown as string },
       } as WtbConfig
-      expect(() => validateConfig(invalidConfig, configFile)).toThrow(/seed_command must be a string/)
+      expect(() => validateConfig(invalidConfig, configFile)).toThrow(
+        /seed_command must be a string/
+      )
     })
 
     it("should accept a string volumes.seed_command", () => {
