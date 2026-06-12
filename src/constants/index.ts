@@ -113,6 +113,7 @@ export const EXIT_CODES = {
   NOT_GIT_REPOSITORY: 3,
   CONFIG_ERROR: 4,
   DOCKER_ERROR: 5,
+  WORKTREE_EXISTS: 6,
 } as const
 
 /** ログレベル */

@@ -76,10 +76,16 @@ export function mergeWithDefaults(partial: Partial<WtbConfig>): WtbConfig {
 
 /**
  * デフォルト設定ファイルを作成
+ *
+ * @param configPath - 書き込み先（省略時は getConfigFilePath() の結果）
+ * @param overrides - デフォルト値に対する部分上書き（例: 検出した base_branch）
  */
-export function createDefaultConfig(configPath?: string): WtbConfig {
+export function createDefaultConfig(
+  configPath?: string,
+  overrides: Partial<WtbConfig> = {}
+): WtbConfig {
   const targetPath = configPath || getConfigFilePath()
-  const defaultConfig = mergeWithDefaults({})
+  const defaultConfig = mergeWithDefaults(overrides)
 
   const yamlContent = `# wtb Configuration File
 # Git worktree management with Docker Compose environment isolation
@@ -156,7 +162,9 @@ export function loadConfig(configDir: string = process.cwd()): WtbConfig {
   const configResult = findConfigFile(configDir)
 
   if (!configResult.exists) {
-    process.stderr.write("⚠️  No wtb.yaml found, using default configuration\n")
+    process.stderr.write(
+      "⚠️  No wtb.yaml found — using defaults (base_branch: main, copy ./.env unchanged, no port remapping). Run `wtb init` to scaffold a wtb.yaml.\n"
+    )
     return mergeWithDefaults({})
   }
 

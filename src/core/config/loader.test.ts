@@ -46,6 +46,19 @@ describe("Config Loader (Refactored)", () => {
       expect(config.env.file).toEqual(["./.env"])
     })
 
+    it("warns with the defaults and points at `wtb init` when no wtb.yaml exists", () => {
+      vi.mocked(existsSync).mockReturnValue(false)
+      const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+
+      loadConfig(testRepoPath)
+
+      const warning = stderrSpy.mock.calls.map((c) => c[0]).join("")
+      expect(warning).toContain("No wtb.yaml found")
+      expect(warning).toContain("base_branch: main")
+      expect(warning).toContain("wtb init")
+      stderrSpy.mockRestore()
+    })
+
     it("should load custom config from wtb.yaml", () => {
       const mockContent = `
 base_branch: develop
@@ -204,6 +217,22 @@ env:
         "utf-8"
       )
       expect(config.base_branch).toBe("main")
+    })
+
+    it("applies partial overrides (e.g. a detected base_branch) to the template", () => {
+      const configPath = path.join(testRepoPath, "wtb.yaml")
+      vi.mocked(existsSync).mockReturnValue(false)
+
+      const config = createDefaultConfig(configPath, { base_branch: "develop" })
+
+      expect(fs.writeFileSync).toHaveBeenCalledWith(
+        configPath,
+        expect.stringContaining('base_branch: "develop"'),
+        "utf-8"
+      )
+      expect(config.base_branch).toBe("develop")
+      // 上書きしていない項目はデフォルトのまま
+      expect(config.env.file).toEqual(["./.env"])
     })
   })
 })
