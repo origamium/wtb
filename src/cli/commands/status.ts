@@ -50,7 +50,10 @@ interface StatusJson {
       ports: string[]
       isWtb: boolean
     }>
-    volumes: { total: number; wtb: Array<{ name: string; driver: string }> }
+    volumes: {
+      total: number
+      wtb: Array<{ name: string; driver: string; labelled: boolean }>
+    }
   }
 }
 
@@ -139,9 +142,7 @@ function buildStatusJson(
     const worktrees = listWorktrees()
     const currentBranch = getCurrentBranch()
     const gitRoot = getGitRoot()
-    const filtered = showAll
-      ? worktrees
-      : worktrees.filter((wt) => wt.branch === currentBranch)
+    const filtered = showAll ? worktrees : worktrees.filter((wt) => wt.branch === currentBranch)
 
     for (const wt of filtered) {
       const composeFilePath = findComposeFile(wt.path)
@@ -205,7 +206,13 @@ function buildStatusJson(
         const wtbVolumes = volumes.filter((v) => isWtbVolume(v.name, managed))
         docker.volumes = {
           total: volumes.length,
-          wtb: wtbVolumes.map((v) => ({ name: v.name, driver: v.driver })),
+          // labelled=false は命名ヒューリスティックのみで拾った legacy/疑似 volume。
+          // wtb 管理の正確な判定にはこのフラグ (= wtb.managed=true ラベル) を使う。
+          wtb: wtbVolumes.map((v) => ({
+            name: v.name,
+            driver: v.driver,
+            labelled: managed.has(v.name),
+          })),
         }
       } catch {
         // leave volumes at defaults on docker error

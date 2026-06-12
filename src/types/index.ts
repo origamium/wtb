@@ -161,6 +161,8 @@ export interface InitClaudeOptions {
   user?: boolean
   /** 書き込まずに対象パスだけ出力 */
   dryRun?: boolean
+  /** インストール済み SKILL.md の鮮度のみ検証（stale なら非ゼロ終了） */
+  check?: boolean
 }
 
 // =============================================================================

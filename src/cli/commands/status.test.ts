@@ -358,6 +358,36 @@ describe("Status Command (Refactored)", () => {
       expect(names).toContain("customproj_data") // matched by label
       expect(names).not.toContain("unrelated_cache") // neither label nor name heuristic
       expect(payload.docker.volumes.total).toBe(2)
+      // label-detected entries carry labelled=true
+      expect(payload.docker.volumes.wtb).toEqual([
+        { name: "customproj_data", driver: "local", labelled: true },
+      ])
+    })
+
+    it("marks name-heuristic (legacy) volumes with labelled=false", async () => {
+      vi.mocked(dockerClientModule.getDockerInfo).mockReturnValue({
+        dockerVersion: "x",
+        composeVersion: "y",
+        isAvailable: true,
+      })
+      vi.mocked(dockerClientModule.getDockerVolumes).mockReturnValue([
+        // pre-label era volume: matches the name heuristic but has no label
+        { name: "worktree-old_pg", driver: "local", mountpoint: "/v/worktree-old_pg" },
+        { name: "labelled_data", driver: "local", mountpoint: "/v/labelled_data" },
+      ])
+      vi.mocked(dockerClientModule.getWtbManagedVolumeNames).mockReturnValue(["labelled_data"])
+
+      await command.parseAsync(["--json"], { from: "user" })
+
+      const payload = parseStdout()
+      const byName = Object.fromEntries(
+        payload.docker.volumes.wtb.map((v: { name: string; labelled: boolean }) => [
+          v.name,
+          v.labelled,
+        ])
+      )
+      expect(byName["worktree-old_pg"]).toBe(false) // heuristic-only → not authoritative
+      expect(byName.labelled_data).toBe(true)
     })
 
     it("omits worktrees with --docker-only", async () => {
