@@ -1,5 +1,5 @@
-import { EventEmitter } from "node:events"
 import { spawn } from "node:child_process"
+import { EventEmitter } from "node:events"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { ComposeConfig } from "../../types/index.js"
 import { execDockerSafe } from "../../utils/exec.js"
@@ -260,9 +260,12 @@ describe("copyVolume atomic overwrite", () => {
     const seq = calls()
     const clearIdx = seq.findIndex((a) => a.includes(CLEAR_CMD) && a.includes(`${TARGET}:/target`))
     const refillIdx = seq.findIndex(
-      (a) => a.includes(CP_CMD) && a.includes(`${tmp}:/source:ro`) && a.includes(`${TARGET}:/target`)
+      (a) =>
+        a.includes(CP_CMD) && a.includes(`${tmp}:/source:ro`) && a.includes(`${TARGET}:/target`)
     )
-    const rmIdx = seq.findIndex((a) => a[0] === "volume" && a[1] === "rm" && a.includes(tmp as string))
+    const rmIdx = seq.findIndex(
+      (a) => a[0] === "volume" && a[1] === "rm" && a.includes(tmp as string)
+    )
 
     // target is cleared and refilled from the verified temp, then temp removed last
     expect(clearIdx).toBeGreaterThanOrEqual(0)
@@ -441,7 +444,8 @@ describe("copyVolume rsync robustness", () => {
 
   it("folds rsync stderr into the thrown error so failures are diagnosable", async () => {
     vi.mocked(spawn).mockImplementation(
-      () => fakeProcWithStderr(23, "rsync: failed to set permissions: Operation not permitted") as never
+      () =>
+        fakeProcWithStderr(23, "rsync: failed to set permissions: Operation not permitted") as never
     )
     await expect(copyVolumeWithRsync(SOURCE, TARGET)).rejects.toThrow(
       /exit code 23.*Operation not permitted/s
@@ -458,7 +462,8 @@ describe("copyVolume rsync robustness", () => {
     const seq = calls()
     const clearIdx = seq.findIndex((a) => a.includes(CLEAR_CMD) && a.includes(`${TARGET}:/target`))
     const cpIdx = seq.findIndex(
-      (a) => a.includes(CP_CMD) && a.includes(`${SOURCE}:/source:ro`) && a.includes(`${TARGET}:/target`)
+      (a) =>
+        a.includes(CP_CMD) && a.includes(`${SOURCE}:/source:ro`) && a.includes(`${TARGET}:/target`)
     )
     expect(clearIdx).toBeGreaterThanOrEqual(0)
     expect(cpIdx).toBeGreaterThan(clearIdx)
