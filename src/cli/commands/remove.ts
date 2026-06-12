@@ -3,7 +3,6 @@
  * Git worktreeの削除を担当
  */
 
-import { execSync } from "node:child_process"
 import { existsSync } from "node:fs"
 import * as path from "node:path"
 import { Command } from "commander"
@@ -17,7 +16,7 @@ import {
   removeWorktree,
 } from "../../core/git/worktree.js"
 import { CLIError, getErrorMessage } from "../../utils/error.js"
-import { executeLifecycleCommand } from "../../utils/exec.js"
+import { execDockerSafe, execGitSafe, executeLifecycleCommand } from "../../utils/exec.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
 
 interface RemoveOptions {
@@ -39,7 +38,7 @@ export function removeCommand(): Command {
     .option("--no-end", "Skip end_command execution")
     .option(
       "--remove-volumes",
-      "Also delete this worktree's Docker volumes (docker compose down -v)",
+      "Also delete this worktree's Docker volumes (docker compose down -v). No effect when teardown is skipped (--no-docker, or end_command is set — your end_command must drop volumes itself)"
     )
     .action(withErrorHandling(executeRemoveCommand))
 }
@@ -53,12 +52,12 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
   // worktreeのパスを取得
   const worktreePath = getWorktreePath(branch)
   if (!worktreePath) {
-    console.error(`Error: No worktree found for branch '${branch}'`)
-    console.log("")
-    console.log("Available worktrees:")
+    // 一覧はエラー診断の一部なので stderr に出す (stdout を script 出力用に汚さない)。
+    // "Error: ..." 本文は withErrorHandling が CLIError から stderr へ出力する。
+    console.error("Available worktrees:")
     const worktrees = listWorktrees()
     for (const wt of worktrees) {
-      console.log(`  ${wt.branch}: ${wt.path}`)
+      console.error(`  ${wt.branch}: ${wt.path}`)
     }
     throw new CLIError(`No worktree found for branch '${branch}'`, EXIT_CODES.GENERAL_ERROR)
   }
@@ -75,6 +74,17 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
 
   if (options.force) {
     console.log("⚠️  Force removal enabled")
+  } else {
+    // 破壊的処理 (volume 削除 / end_command) より前に dirty チェックで fail fast する。
+    // 最後の `git worktree remove` は未コミット変更があると拒否するため、先に volume を
+    // 消してから失敗すると「worktree は残るがデータ基盤だけ破壊済み」になってしまう。
+    const status = execGitSafe(["status", "--porcelain"], { cwd: worktreePath })
+    if (status.length > 0) {
+      throw new CLIError(
+        `Worktree for '${branch}' has uncommitted or untracked changes; commit/stash them or pass -f to force removal`,
+        EXIT_CODES.GENERAL_ERROR
+      )
+    }
   }
 
   const config = loadConfig(gitRoot)
@@ -115,7 +125,7 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
         } else {
           console.log("🐳 Stopping Docker Compose services...")
         }
-        await runDockerComposeDown(worktreePath, removeVolumes)
+        await runDockerComposeDown(worktreePath, worktreeComposePath, removeVolumes)
       } else if (removeVolumes) {
         // compose file が worktree に無いと down -v を実行できない
         console.log("")
@@ -169,20 +179,24 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
  * worktreeディレクトリで docker compose down を実行
  * Docker が利用できない場合は警告のみ（削除処理は継続）
  *
+ * docker_compose_file は compose.dev.yml のような非デフォルト名でも良いので、
+ * compose のデフォルト探索に頼らず `-f <path>` で明示的に渡す (composeStop と同じ流儀)。
+ *
  * @param worktreePath - worktree のパス
+ * @param composeFilePath - worktree 内の Compose ファイルの絶対パス
  * @param removeVolumes - true なら `down -v` で named volume も削除
  */
 async function runDockerComposeDown(
   worktreePath: string,
-  removeVolumes: boolean = false,
+  composeFilePath: string,
+  removeVolumes: boolean = false
 ): Promise<void> {
   try {
-    const cmd = removeVolumes ? "docker compose down -v" : "docker compose down"
-    execSync(cmd, {
-      cwd: worktreePath,
-      stdio: "inherit",
-      shell: "/bin/sh",
-    })
+    const args = ["compose", "-f", composeFilePath, "down"]
+    if (removeVolumes) {
+      args.push("-v")
+    }
+    execDockerSafe(args, { cwd: worktreePath })
     console.log(
       removeVolumes
         ? "  ✅ Docker Compose services stopped and volumes removed"
