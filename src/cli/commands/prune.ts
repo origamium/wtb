@@ -13,6 +13,7 @@
 
 import * as path from "node:path"
 import { Command } from "commander"
+import { EXIT_CODES } from "../../constants/index.js"
 import { loadConfig } from "../../core/config/loader.js"
 import { getWtbManagedVolumeNames } from "../../core/docker/client.js"
 import {
@@ -25,7 +26,6 @@ import { getGitRootOrThrow } from "../../core/git/repository.js"
 import { listWorktrees } from "../../core/git/worktree.js"
 import type { WorktreeInfo } from "../../types/index.js"
 import { CLIError } from "../../utils/error.js"
-import { EXIT_CODES } from "../../constants/index.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
 
 interface PruneOptions {
@@ -143,9 +143,14 @@ async function executePruneCommand(options: PruneOptions): Promise<void> {
 
   if (options.json) {
     const removed: PruneCandidate[] = []
+    const failed: PruneCandidate[] = []
     if (options.yes) {
       for (const c of removable) {
-        if (safeRemove(c.name)) removed.push(c)
+        if (safeRemove(c.name)) {
+          removed.push(c)
+        } else {
+          failed.push(c)
+        }
       }
     }
     process.stdout.write(
@@ -156,13 +161,21 @@ async function executePruneCommand(options: PruneOptions): Promise<void> {
             name: c.name,
             reason: c.reason,
             inUse: c.inUseBy.length > 0,
+            inUseBy: c.inUseBy,
           })),
           removed: removed.map((c) => c.name),
+          failed: failed.map((c) => c.name),
         },
         null,
         2
       )}\n`
     )
+    // 削除失敗は CI が検知できるよう非ゼロで終わらせる。ただし throw すると
+    // withErrorHandling が即 process.exit して JSON が壊れる恐れがあるため、
+    // payload を書き切ったうえで exitCode のみ設定する。
+    if (failed.length > 0) {
+      process.exitCode = EXIT_CODES.DOCKER_ERROR
+    }
     return
   }
 
@@ -171,9 +184,7 @@ async function executePruneCommand(options: PruneOptions): Promise<void> {
     return
   }
 
-  console.log(
-    `🔎 Found ${candidates.length} wtb-managed volume(s) not belonging to any worktree:`
-  )
+  console.log(`🔎 Found ${candidates.length} wtb-managed volume(s) not belonging to any worktree:`)
   for (const c of removable) {
     console.log(`  • ${c.name}  (${c.reason === "temp" ? "leftover temp volume" : "orphaned"})`)
   }
@@ -191,16 +202,28 @@ async function executePruneCommand(options: PruneOptions): Promise<void> {
 
   console.log("")
   let removedCount = 0
+  const failed: string[] = []
   for (const c of removable) {
     if (safeRemove(c.name)) {
       console.log(`  🗑️  Removed ${c.name}`)
       removedCount++
     } else {
       console.log(`  ⚠️  Failed to remove ${c.name}`)
+      failed.push(c.name)
     }
   }
   console.log("")
-  console.log(`✅ Pruned ${removedCount} volume(s)${skipped.length ? `, skipped ${skipped.length} in use` : ""}.`)
+  console.log(
+    `✅ Pruned ${removedCount} volume(s)${skipped.length ? `, skipped ${skipped.length} in use` : ""}.`
+  )
+
+  // prune --yes は単一目的の破壊的コマンドなので、部分成功を exit 0 で覆い隠さない。
+  if (failed.length > 0) {
+    throw new CLIError(
+      `Failed to remove ${failed.length} volume(s): ${failed.join(", ")}`,
+      EXIT_CODES.DOCKER_ERROR
+    )
+  }
 }
 
 /** volume を削除し、実際に消えたか検証する。removeVolume は best-effort で throw

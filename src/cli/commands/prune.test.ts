@@ -9,9 +9,10 @@
 
 import type { Command } from "commander"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { EXIT_CODES } from "../../constants/index.js"
+import * as loaderModule from "../../core/config/loader.js"
 import * as clientModule from "../../core/docker/client.js"
 import * as volumeModule from "../../core/docker/volume.js"
-import * as loaderModule from "../../core/config/loader.js"
 import * as repositoryModule from "../../core/git/repository.js"
 import * as worktreeModule from "../../core/git/worktree.js"
 import { pruneCommand } from "./prune.js"
@@ -153,5 +154,51 @@ describe("prune command", () => {
     const j = jsonOut()
     expect(j.dryRun).toBe(false)
     expect(j.removed).toEqual(["worktree-gone_data"])
+    expect(j.failed).toEqual([])
+  })
+
+  it("--json exposes inUse and the blocking container names via inUseBy", async () => {
+    vi.mocked(clientModule.getWtbManagedVolumeNames).mockReturnValue(["worktree-gone_data"])
+    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue(["blocking-container"])
+    await command.parseAsync(["--json"], { from: "user" })
+    const j = jsonOut()
+    expect(j.candidates[0]).toMatchObject({
+      name: "worktree-gone_data",
+      inUse: true,
+      inUseBy: ["blocking-container"],
+    })
+  })
+
+  it("--yes exits with DOCKER_ERROR when a removal fails", async () => {
+    vi.mocked(clientModule.getWtbManagedVolumeNames).mockReturnValue(["worktree-gone_data"])
+    vi.mocked(volumeModule.volumeExists).mockReturnValue(true) // still exists → removal failed
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit")
+    })
+
+    await expect(command.parseAsync(["--yes"], { from: "user" })).rejects.toThrow("exit")
+    expect(exit).toHaveBeenCalledWith(EXIT_CODES.DOCKER_ERROR)
+    // サマリ出力 (Failed to remove ...) は exit より先に出ていること
+    expect(logged()).toContain("Failed to remove worktree-gone_data")
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to remove 1 volume(s): worktree-gone_data")
+    )
+    exit.mockRestore()
+    errorSpy.mockRestore()
+  })
+
+  it("--json --yes lists failures in failed[] and sets exitCode DOCKER_ERROR (JSON stays intact)", async () => {
+    vi.mocked(clientModule.getWtbManagedVolumeNames).mockReturnValue(["worktree-gone_data"])
+    vi.mocked(volumeModule.volumeExists).mockReturnValue(true) // still exists → removal failed
+    const previousExitCode = process.exitCode
+
+    await command.parseAsync(["--json", "--yes"], { from: "user" })
+
+    const j = jsonOut()
+    expect(j.removed).toEqual([])
+    expect(j.failed).toEqual(["worktree-gone_data"])
+    expect(process.exitCode).toBe(EXIT_CODES.DOCKER_ERROR)
+    process.exitCode = previousExitCode
   })
 })
