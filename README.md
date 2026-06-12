@@ -19,12 +19,14 @@ A CLI tool built on Git worktrees that gives every branch its own isolated worki
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [Commands](#commands)
+  - [`init`](#wtb-init)
   - [`create`](#wtb-create-branch)
   - [`remove`](#wtb-remove-branch)
   - [`reclone`](#wtb-reclone-branch)
   - [`prune`](#wtb-prune)
   - [`ls` / `list`](#wtb-ls-alias-list)
-  - [`ports`](#wtb-ports)
+  - [`path`](#wtb-path-branch)
+  - [`ports`](#wtb-ports-branch)
   - [`status`](#wtb-status)
   - [`init-claude`](#wtb-init-claude)
 - [Configuration](#configuration)
@@ -86,7 +88,7 @@ worktree-feature-auth/          ← created by `wtb create feature/auth`
 
 When you run `wtb create <branch>`, the tool walks these phases in order:
 
-1. **Worktree** — `git worktree add` at `../worktree-<sanitized-branch>/` (or a custom `-p <path>`), branching from `base_branch` unless the branch already exists.
+1. **Worktree** — `git worktree add` at `../worktree-<sanitized-branch>/` (or a custom `-p <path>`), branching from `base_branch` unless the branch already exists (a branch that exists only on `origin` becomes a local tracking branch from `origin/<branch>`).
 2. **Copy files** — `copy_files` (gitignored configs, secrets, etc.) are copied over. Paths also listed in `link_files` are skipped here.
 3. **Symlink** — `link_files` entries are symlinked back to the source (existing files/dirs/symlinks are replaced safely).
 4. **Environment files** — `env.file` entries are copied; if `env.adjust` is non-empty, port-style values are bumped to the next free port that doesn't collide with other worktrees' `.env` files.
@@ -106,7 +108,13 @@ npm install -g @schemelisp/wtb
 npx @schemelisp/wtb create feature/awesome
 ```
 
-### 2. Drop a config in your repo root
+### 2. Scaffold a config in your repo root
+
+```bash
+wtb init          # writes a commented wtb.yaml (base_branch detected from origin/HEAD)
+```
+
+Then edit the generated file. A minimal config looks like:
 
 ```yaml
 # wtb.yaml
@@ -144,9 +152,25 @@ wtb create feature/awesome --dry-run
 
 ## Commands
 
+### `wtb init`
+
+Scaffolds a commented `wtb.yaml` at the repository root — the fastest way to get started. `base_branch` is detected from `origin/HEAD` (falls back to `main` when no remote default branch is set).
+
+| Option | Description |
+|--------|-------------|
+| `-f, --force` | Overwrite an existing config file |
+
+Fails with exit `1` if a config file already exists (use `--force` to overwrite it), and exit `3` outside a git repository.
+
 ### `wtb create <branch>`
 
-Creates a new worktree for `<branch>`, branching from `base_branch` unless the branch already exists.
+Creates a new worktree for `<branch>`. Branch resolution, in order:
+
+1. **Local branch exists** — it's used as-is.
+2. **Branch exists only on `origin`** — wtb creates a local tracking branch (`git worktree add -b <branch> --track origin/<branch>`) instead of silently shadowing it with a new branch off `base_branch` (message: `ℹ️ Branch <branch> exists on origin — creating local tracking branch from origin/<branch>`).
+3. **Brand-new branch** — created from `base_branch`. wtb first verifies that `base_branch` resolves (`git rev-parse --verify <base>^{commit}`, so tags/SHAs/remote refs are valid bases too) and fails with exit `1` and a hint to set `base_branch` in `wtb.yaml` if it doesn't (e.g. repos whose default branch is `master`).
+
+If the branch's worktree already exists, `create` fails with exit `6` — pass `--exists-ok` to print its path and exit `0` instead (idempotent "ensure this worktree exists").
 
 **Pipeline (short version):** worktree → copy → symlink → env → compose → start.
 
@@ -166,6 +190,8 @@ Creates a new worktree for `<branch>`, branching from `base_branch` unless the b
 | `--no-stop` | Don't auto-stop the source Compose stack before cloning; skip in-use volumes instead (the old behavior) |
 | `--seed` | Seed the data instead of cloning: skip the volume-clone phase and run `volumes.seed_command` in the new worktree. Never touches the source volume, so the source stack is left running. Requires `volumes.seed_command` in the config; mutually exclusive with `--force-volume-copy`. See [Volume cloning](#volume-cloning) |
 | `--strict` | Exit non-zero (`1`) if any volume clone or the seed command fails (default: exit `0` — the worktree still exists). For CI / coding-agent pipelines that must detect incomplete data isolation. See [Volume cloning](#volume-cloning) |
+| `--exists-ok` | If a worktree for the branch already exists, print its path and exit `0` instead of failing with exit `6` |
+| `--json` | Write exactly one machine-readable JSON object to stdout; human progress moves to stderr. See below |
 | `--dry-run` | Print the plan, make no changes |
 
 Examples:
@@ -180,18 +206,45 @@ wtb create feature/test --dry-run               # preview
 wtb create feature/auth -p /tmp/auth-wt         # custom path
 ```
 
+In human mode, `create` echoes every adjustment it applied — per-key env bumps (`APP_PORT: 3000 → 3001`) under the env phase, per-service Compose remaps (`web: 3000 → 3001`) under the Compose phase — and the final *Next steps* block suggests `wtb ports --pretty` to review the worktree's assigned ports.
+
+**JSON output (`--json`):** exactly one pretty-printed object on stdout; all human progress goes to stderr.
+
+```json
+{
+  "branch": "feature/auth",
+  "path": "/Users/me/worktree-feature-auth",
+  "created": true,
+  "existing": false,
+  "createdBranch": true,
+  "dryRun": false,
+  "env": { "APP_PORT": { "from": "3000", "to": "3001" } },
+  "composePorts": { "web": [{ "from": 3000, "to": 3001 }] },
+  "volumes": { "cloned": ["db_data"], "skipped": [], "failed": [] },
+  "seed": null,
+  "startCommand": { "ran": true, "failed": false },
+  "ok": true
+}
+```
+
+- `volumes.skipped` entries are `{ name, reason }`; `volumes.failed` entries are `{ name, error }`. `seed` is `{ ran, failed }` when `--seed` was used, else `null`; same shape for `startCommand` when `start_command` is configured.
+- `ok` is `false` when a volume clone or the seed command failed. `--strict --json` still exits `1` on such failures — the JSON is written first, then the exit code is set.
+- With `--exists-ok` on an already-existing worktree the object is reduced to `{ branch, path, created: false, existing: true, createdBranch: false, dryRun, ok: true }`.
+
 ### `wtb remove <branch>`
 
 Removes the worktree that owns `<branch>`. Guards against removing the main repository.
 
 | Option | Description |
 |--------|-------------|
-| `-f, --force` | Pass `--force` to `git worktree remove` (uncommitted changes) |
+| `-f, --force` | Skip the dirty-worktree pre-flight check and pass `--force` to `git worktree remove` (uncommitted changes are lost) |
 | `--no-docker` | Skip `docker compose down` in the worktree |
 | `--no-end` | Skip `end_command` |
 | `--remove-volumes` | Also delete this worktree's Docker volumes (`docker compose down -v`). Has **no effect** (wtb warns) when teardown is skipped — i.e. with `--no-docker` or when `end_command` is set (your `end_command` must drop the volumes itself) |
 
-Ordering: Docker teardown → `end_command` → `git worktree remove`. If `end_command` is set, wtb assumes you own teardown and skips the automatic `docker compose down`.
+Without `-f`, a worktree with uncommitted or untracked changes fails fast with exit `1` (`Worktree for '<branch>' has uncommitted or untracked changes; commit/stash them or pass -f to force removal`) — **before** any Docker teardown or volume deletion, so a doomed removal can't tear down services or drop volumes first.
+
+Ordering: Docker teardown → `end_command` → `git worktree remove`. If `end_command` is set, wtb assumes you own teardown and skips the automatic `docker compose down`. The automatic teardown passes your configured Compose file explicitly (`docker compose -f <docker_compose_file> down [-v]`), so non-default filenames like `compose.dev.yml` are torn down correctly.
 
 ```bash
 wtb remove feature/old --no-docker          # Docker daemon already stopped
@@ -207,6 +260,7 @@ Re-runs **only the volume-clone phase** for an existing worktree — useful when
 | `--force-volume-copy` | Clone even when the source container is running or the target already has data (overwrite is atomic) |
 | `--no-stop` | Don't auto-stop the source Compose stack; skip in-use volumes instead |
 | `--strict` | Exit non-zero (`1`) if any volume fails to clone (default: exit `0`). For CI / coding-agent pipelines that must detect incomplete data isolation |
+| `--json` | Write one machine-readable JSON object to stdout (`{ branch, path, dryRun, volumes: { cloned, skipped, failed }, ok }` — same per-volume shape as `create --json`); human progress moves to stderr |
 | `--dry-run` | Print which volumes would be cloned; make no changes |
 
 ```bash
@@ -215,7 +269,7 @@ wtb reclone feature/auth          # a specific worktree
 wtb reclone feature/auth --force-volume-copy   # overwrite stale target data
 ```
 
-Prints the same `N cloned, N skipped, N failed` summary as `create`; a failure exits `0` with the loud `⚠️  … data is NOT fully isolated` line (resolve and re-run). Refuses to target the main repository worktree (source and target would be the same project). If `docker_compose_file` isn't configured, it's a no-op with a message. To re-*seed* instead of re-clone, run your `volumes.seed_command` inside the worktree.
+Prints the same `N cloned, N skipped, N failed` summary as `create`; a failure exits `0` with the loud `⚠️  … data is NOT fully isolated` line (resolve and re-run). With `--json`, `ok: false` flags the failure, and `--strict` still exits `1` after the JSON is written. Refuses to target the main repository worktree (source and target would be the same project). If `docker_compose_file` isn't configured, it's a no-op with a message. To re-*seed* instead of re-clone, run your `volumes.seed_command` inside the worktree.
 
 ### `wtb prune`
 
@@ -224,7 +278,7 @@ Removes **wtb-managed Docker volumes that are orphaned** — i.e., volumes wtb c
 | Option | Description |
 |--------|-------------|
 | `-y, --yes` | Actually remove the volumes. **Without this, `prune` is a dry run** (lists candidates only) |
-| `--json` | Machine-readable output (`{ dryRun, candidates, removed }`) |
+| `--json` | Machine-readable output: `{ dryRun, candidates, removed, failed }` — each candidate is `{ name, reason, inUse, inUseBy }`, where `inUseBy` lists the blocking container names; `removed`/`failed` are volume-name arrays |
 
 ```bash
 wtb prune            # preview what would be removed (safe; deletes nothing)
@@ -233,6 +287,8 @@ wtb prune --json     # machine-readable preview for scripts/agents
 ```
 
 Safety: it's **dry-run by default** (deletion needs `--yes`); a volume currently in use by a container is skipped; and a worktree's volume is matched by its exact Compose project prefix (`<project>_…`), so it never removes a live worktree's data. Determines "live" worktrees from `git worktree list` for this repo.
+
+With `--yes`, any volume-removal failure exits `5` (Docker error — treat it as a partial prune): without `--json` the error is `Error: Failed to remove N volume(s): <names>` on stderr; with `--json` the full JSON payload is still written to stdout (the failures listed in `failed`) and the exit code is set afterwards, so the JSON stays intact.
 
 ### `wtb ls` (alias: `list`)
 
@@ -243,6 +299,8 @@ Lightweight, scriptable listing of worktrees — like Unix `ls`. Use this instea
 | `-l, --long` | Long format: short hash, relative age, dirty flag, subject |
 | `--json` | Machine-readable JSON (combines with `-l` for enriched fields) |
 | `-p, --paths` | Absolute paths only, one per line — pipe-friendly |
+
+Flags are prioritized, not combined: `-p` overrides `--json` and `-l` (paths-only output wins).
 
 **Default (compact, 1 git call):**
 
@@ -275,6 +333,8 @@ cd "$(wtb ls -p | fzf)"                       # fuzzy-jump between worktrees
 wtb ls -p | xargs -I{} du -sh {}              # disk usage per worktree
 ```
 
+When you already know the branch, skip the interactive picker — [`wtb path`](#wtb-path-branch) resolves it deterministically: `cd "$(wtb path feature/x)"`.
+
 **JSON:**
 
 ```bash
@@ -285,14 +345,34 @@ wtb ls -l --json | jq '.[] | select(.dirty == true)'
 JSON fields (always): `path, branch, head, isMain, isCurrent, locked, prunable, bare, detached`.
 With `-l`: adds `shortHash, subject, ageRelative, ageTimestamp, dirty` — plus `enrichmentError` if per-worktree enrichment failed (e.g., prunable).
 
-### `wtb ports`
+### `wtb path <branch>`
 
-Prints the adjusted `env.adjust` values, Docker Compose host/container ports, and a pre-rendered `http://localhost:<port>` endpoint list for the current worktree (or all worktrees).
+Prints the absolute path of the worktree that owns `<branch>` — one newline-terminated line, nothing else on stdout. The deterministic primitive for shell pipelines and coding agents:
+
+```bash
+cd "$(wtb path feature/x)"                    # jump straight to a worktree
+wtcd() { cd "$(wtb path "$1")"; }             # handy shell function
+```
+
+If no worktree matches, it prints an `Available worktrees:` listing to stderr and exits `1` (stdout stays clean for pipelines). Exits `3` outside a git repository.
+
+### `wtb ports [branch]`
+
+Prints the adjusted `env.adjust` values, Docker Compose host/container ports, and a pre-rendered `http://localhost:<port>` endpoint list — for the current worktree, a specific branch's worktree, or all worktrees.
 
 | Option | Description |
 |--------|-------------|
-| `--all` | Output an array of every worktree's ports (default: current worktree as an object) |
+| `-a, --all` | Output an array of every worktree's ports (default: current worktree as an object). Cannot be combined with a branch argument (exit `2`) |
 | `--pretty` | Human-readable table instead of JSON |
+| `--json` | Accepted as a no-op for consistency — JSON is already the default output. Conflicts with `--pretty` (exit `2`) |
+
+```bash
+wtb ports                  # current worktree
+wtb ports feature/x        # a specific worktree by branch (no cd needed)
+wtb ports -a               # every worktree, as a JSON array
+```
+
+An unknown branch prints an `Available worktrees:` listing to stderr and exits `1`.
 
 Designed to be called from Claude Code (via the [shipped skill](#claude-code-integration)) or from shell scripts. See [Claude Code integration](#claude-code-integration) for the full output schema.
 
@@ -316,7 +396,7 @@ Richer inspection: worktrees + Docker Compose services + running containers + vo
    🔧 Environment: .env, .env.local
 ```
 
-`--json` returns one structured object (`{ worktrees: [...], docker: {...} }`) and stays valid JSON even when Docker is down (`docker.available: false`). This completes the machine-readable trio with `wtb ls --json` and `wtb ports`.
+`--json` returns one structured object (`{ worktrees: [...], docker: {...} }`) and stays valid JSON even when Docker is down (`docker.available: false`). Each `docker.volumes.wtb` entry carries a `labelled` boolean: `true` means the volume has the `wtb.managed=true` label (the source of truth); `false` means it was matched only by the legacy `wtb`/`worktree` name heuristic — check `labelled` before treating a volume as wtb-managed. Together with `wtb ls --json`, `wtb ports` (JSON by default), and `wtb create --json` / `wtb reclone --json`, every wtb read *and* mutation now has a machine-readable form.
 
 ```bash
 wtb status --json | jq '.docker.containers[] | select(.isWtb) | .name'   # this project's containers
@@ -332,6 +412,9 @@ Installs the bundled Claude Code skill into this repo (or globally). See [Claude
 | `-f, --force` | Overwrite an existing `SKILL.md` |
 | `--user` | Install at `~/.claude/skills/wtb/` instead of the repo |
 | `--dry-run` | Print the target path; don't write |
+| `--check` | Verify the installed `SKILL.md` against this CLI's version — exit `0` when up to date, `1` when it's missing, unstamped, or stale. Respects `--user`; writes nothing |
+
+The installer stamps `SKILL.md` with `<!-- wtb-skill-version: X.Y.Z -->` right after the frontmatter. `--check` (and the skip message when the file already exists without `--force`) compares that stamp to the CLI version, so a stale skill is machine-detectable after upgrading wtb — refresh it with `wtb init-claude --force`.
 
 ## Configuration
 
@@ -344,7 +427,7 @@ wtb searches for a config file in this order and stops at the first match:
 5. `.wtb/config.yaml`
 6. `.wtb/config.yml`
 
-If nothing is found, wtb still runs with defaults (prints a warning to stderr). The config is **merged with defaults** — any field you omit gets the default.
+If nothing is found, wtb still runs with defaults — it prints a warning to stderr spelling out what those defaults mean (`base_branch: main`, copy `./.env` unchanged, no port remapping) and suggests running [`wtb init`](#wtb-init) to scaffold a config. The config is **merged with defaults** — any field you omit gets the default.
 
 ### Reference
 
@@ -409,7 +492,7 @@ env:
 
 | Value type | Behavior on existing key | Behavior when key is absent |
 |------------|--------------------------|-----------------------------|
-| **number** | Scans other worktrees + this file for the same key's port, then picks the first free port starting at `original + 1`. The number literal itself is used as a type marker — any positive integer works. | **Nothing is added** — wtb prints a warning. A port adjustment needs an existing value to bump, so writing the marker integer (e.g. `PORT=1`) would be meaningless. Define the key in the file, or use a string value to add a literal. |
+| **number** | Scans other worktrees + this file for the port values of every key listed as a number in `env.adjust` (so cross-key collisions between worktrees are avoided too), then picks the first free port starting at `original + 1`. The number literal itself is used as a type marker — any positive integer works. | **Nothing is added** — wtb prints a warning. A port adjustment needs an existing value to bump, so writing the marker integer (e.g. `PORT=1`) would be meaningless. Define the key in the file, or use a string value to add a literal. |
 | **string** | Value is replaced verbatim. | Key is appended with the string value. |
 | **null**   | Key is removed from the output. | No-op. |
 
@@ -433,8 +516,9 @@ Notes:
 
 - Port format recognized: `HOST:CONTAINER`, `0.0.0.0:HOST:CONTAINER`, optional `/tcp`/`/udp`.
 - The **original** host port is tried first — if the base port is free, it's kept. (Env-file adjustment is stricter and always starts at `original + 1`.)
-- If Docker isn't installed or the daemon isn't running, wtb copies the Compose file without remapping and prints a warning — your worktree still works, you just own port collisions.
-- `wtb remove` calls `docker compose down` in the worktree before removing it, unless `end_command` is set (then you own teardown) or `--no-docker` is passed.
+- The Compose copy is parsed and re-serialized — YAML comments, anchors, and original formatting are **not** preserved. This is true of every Compose file wtb writes.
+- If Docker isn't installed or the daemon isn't running, wtb still parses and rewrites the Compose file, but with no running containers to avoid, the host ports keep their original values (a warning is printed) — your worktree still works, you just own port collisions.
+- `wtb remove` runs `docker compose -f <your configured compose file> down` in the worktree before removing it (so non-default filenames like `compose.dev.yml` work), unless `end_command` is set (then you own teardown) or `--no-docker` is passed.
 - Disable Compose integration entirely by omitting the field or setting it to `""`.
 
 ## Volume cloning
@@ -467,7 +551,7 @@ volumes:
 
 Disable the whole phase per-invocation with `wtb create <branch> --no-volume-copy`. Keep the source stack running and skip in-use volumes with `--no-stop`. Force-clone running source volumes live (data-loss risk, dev only) with `--force-volume-copy`.
 
-The per-volume summary reports `N cloned, N skipped, N failed`. If any volume **fails** to clone, the worktree is still created but the final banner changes from `🎉 Worktree created successfully!` to `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`, so the incomplete state is obvious. By default the command still exits `0` (the worktree exists) — pass **`--strict`** to make a clone (or `--seed`) failure exit `1` instead, so CI and coding-agent pipelines can detect incomplete data isolation. A *skip* is intentional (external/excluded volume, missing source, in-use under `--no-stop`, or a target that already has data); a *failure* means the copy itself errored.
+The per-volume summary reports `N cloned, N skipped, N failed`. If any volume **fails** to clone, the worktree is still created but the final banner changes from `🎉 Worktree created successfully!` to `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated`, so the incomplete state is obvious. By default the command still exits `0` (the worktree exists) — pass **`--strict`** to make a clone (or `--seed`) failure exit `1` instead, so CI and coding-agent pipelines can detect incomplete data isolation. A *skip* is intentional — missing source; in-use (under `--no-stop`, or even after stopping the source stack when another Compose project is holding the same named volume); or a target that already has data. External and `exclude`-listed volumes are filtered out before counting and never appear in the summary. A *failure* means the copy itself errored.
 
 `wtb remove <branch>` does **not** delete cloned volumes by default (consistent with `docker compose down`). Pass `wtb remove <branch> --remove-volumes` to also drop them (`docker compose down -v`). Because that runs through the automatic teardown, `--remove-volumes` is a no-op (with a warning) when teardown is skipped — under `--no-docker`, or when `end_command` is set (then your `end_command` owns volume removal). Volumes left behind this way accumulate as orphans over time — sweep them with [`wtb prune`](#wtb-prune) (every wtb-created volume carries the `wtb.managed=true` label).
 
@@ -504,7 +588,7 @@ Script failures are **non-fatal** — wtb prints a warning and the worktree is l
 ```
 src/
 ├── cli/
-│   ├── commands/      create, remove, reclone, prune, ls, ports, status, init-claude
+│   ├── commands/      init, create, remove, reclone, prune, ls, path, ports, status, init-claude
 │   ├── utils/         worktree/ports renderers, command error wrapper, claude skill installer
 │   └── index.ts       commander wiring + global error handlers
 ├── core/
@@ -534,10 +618,12 @@ Exit codes (`src/constants/index.ts`):
 |------|---------|
 | `0` | Success |
 | `1` | General error |
-| `2` | Invalid CLI usage |
+| `2` | Invalid CLI usage — missing argument, unknown option/command, invalid/excess arguments, and conflicting options (e.g. `wtb ports --json --pretty`, or a branch argument combined with `--all`). `--help`/`--version` still exit `0` |
 | `3` | Not in a git repository |
 | `4` | Configuration error (config not found-but-invalid, parse failure, or validation failure) |
-| `5` | Docker error — **reserved.** Docker is optional and degrades gracefully (warn + continue), so wtb does not currently exit with this code; Docker problems either warn (and the command still succeeds) or surface as `1`. |
+| `5` | Docker error — currently emitted only by `wtb prune --yes` when one or more volume removals fail (a partial prune). Other Docker problems still degrade gracefully (warn + continue) or surface as `1` |
+| `6` | Worktree already exists — `wtb create` for a branch that already has a worktree, without `--exists-ok` |
+| `130` / `143` | Interrupted by SIGINT (Ctrl-C) / SIGTERM. Treat the run as aborted — an interrupted `create` may be partially done |
 
 ## Development
 
@@ -607,15 +693,18 @@ Prefer a global install?
 wtb init-claude --user                   # writes ~/.claude/skills/wtb/SKILL.md
 ```
 
-Flags: `-f, --force` (overwrite existing), `--user` (global), `--dry-run` (preview target path only).
+Flags: `-f, --force` (overwrite existing), `--user` (global), `--dry-run` (preview target path only), `--check` (verify the installed skill against the CLI version; writes nothing).
+
+The installed `SKILL.md` is stamped with `<!-- wtb-skill-version: X.Y.Z -->`, so after upgrading wtb you can run `wtb init-claude --check` (exit `0` when current, `1` when missing/unstamped/stale) and refresh with `wtb init-claude --force`.
 
 ### `wtb ports` — the data source
 
-The skill tells Claude to call `wtb ports` (JSON is the default output — there is no `--json` flag). The command is useful on its own too:
+The skill tells Claude to call `wtb ports` (JSON is the default output — `--json` is accepted as a no-op and conflicts with `--pretty`). The command is useful on its own too:
 
 ```bash
 wtb ports                                # current worktree as a JSON object
-wtb ports --all                          # every worktree as a JSON array
+wtb ports feature/auth                   # a specific worktree by branch
+wtb ports -a                             # every worktree as a JSON array (alias: --all)
 wtb ports --pretty                       # human-readable
 ```
 
@@ -642,7 +731,7 @@ Notes:
 - `env` only contains keys listed under `env.adjust` in `wtb.yaml` — other `.env` entries (secrets, API keys) are **not leaked**.
 - `compose.services` is populated from the worktree's copy of the Compose file, so it reflects the *already-adjusted* ports.
 - `endpoints` is a convenience list of `http://localhost:<port>` entries built from compose host ports.
-- stdout stays valid JSON even if Docker isn't installed (`compose.services` becomes `{}`). Warnings go to stderr.
+- `wtb ports` reads the Compose YAML from disk and never calls Docker, so output is identical whether or not Docker is installed. `compose.services` is `{}` only when no compose file is found or it can't be parsed (warning on stderr); stdout always stays valid JSON.
 
 ### What Claude sees
 
@@ -652,6 +741,8 @@ With the skill installed, typical prompts just work:
 |---------|-------------|
 | "What port is the API on here?" | `wtb ports` → picks the right host port (JSON by default) |
 | "List the worktrees." | `wtb ls -l` |
+| "Go to the worktree for feature/x." | `cd "$(wtb path feature/x)"` — deterministic branch → path lookup |
+| "Set up wtb in this repo." | `wtb init` → scaffolds a commented `wtb.yaml` |
 | "Make a worktree for feature/login." | `wtb create feature/login` (prompts you first if destructive) |
 | "Clean up feature/old." | `wtb ls -l` to show the target → confirms → `wtb remove feature/old` |
 | "This worktree's DB is empty / the clone failed." | `wtb reclone` → re-runs just the volume-clone phase, no worktree recreation |
@@ -667,13 +758,13 @@ Run wtb from anywhere inside your repo. It discovers the git root via `git rev-p
 ### Ports still collide
 wtb adjusts against *known* sources:
 
-- For `.env` files: other worktrees' `.env` files containing the same key.
+- For `.env` files: other worktrees' `.env` files, for any key listed as a number in `env.adjust` (not just the same key).
 - For Docker Compose: currently running containers and the ports it remapped earlier in the same pass.
 
 It does **not** probe arbitrary OS-level listening sockets. If something outside Docker is holding a port (a native dev server you started by hand, another project on the same machine, etc.), you'll need to stop it or edit `env.adjust` manually. Check `wtb status -a` to see what wtb thinks is going on.
 
-### "Worktree for branch 'X' already exists"
-The branch already has a worktree. `wtb ls` shows where it is. `wtb remove X` cleans it up first.
+### "Worktree for branch 'X' already exists" (exit 6)
+The branch already has a worktree. `wtb ls` shows where it is. `wtb remove X` cleans it up first — or pass `--exists-ok` to `wtb create` if reusing it is fine (prints the path, exits `0`).
 
 ### `git worktree add` fails with "invalid reference"
 The branch doesn't exist and you passed `--no-create-branch`. Drop that flag to create it, or check your branch name.
@@ -685,7 +776,7 @@ The config is structurally invalid — the error lists each bad field. Warnings 
 wtb leaves the worktree in place and prints a warning. Finish setup manually in the worktree, then proceed.
 
 ### Docker daemon stopped mid-session
-`docker compose down` on `remove` fails silently with a warning; the worktree still gets removed. On `create`, wtb skips port adjustment (Compose file is copied verbatim).
+`docker compose down` on `remove` fails silently with a warning; the worktree still gets removed. On `create`, the Compose file is still parsed and rewritten, but with no running containers to avoid, host ports keep their original values. Note that YAML comments, anchors, and formatting are not preserved — this is true of every Compose copy wtb writes.
 
 ## FAQ
 

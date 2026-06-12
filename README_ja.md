@@ -19,12 +19,14 @@ Git worktree をベースにした CLI ツールで、ブランチごとに独�
 - [仕組み](#仕組み)
 - [クイックスタート](#クイックスタート)
 - [コマンド](#コマンド)
+  - [`init`](#wtb-init)
   - [`create`](#wtb-create-branch)
   - [`remove`](#wtb-remove-branch)
   - [`reclone`](#wtb-reclone-branch)
   - [`prune`](#wtb-prune)
   - [`ls` / `list`](#wtb-ls-alias-list)
-  - [`ports`](#wtb-ports)
+  - [`path`](#wtb-path-branch)
+  - [`ports`](#wtb-ports-branch)
   - [`status`](#wtb-status)
   - [`init-claude`](#wtb-init-claude)
 - [設定ファイル](#設定ファイル)
@@ -86,7 +88,7 @@ worktree-feature-auth/          ← `wtb create feature/auth` で作成
 
 `wtb create <branch>` は以下のフェーズを順に実行します:
 
-1. **Worktree** — `git worktree add` で `../worktree-<sanitized-branch>/`(または `-p <path>`)に作成。新規ブランチは `base_branch` を起点に切り出し。
+1. **Worktree** — `git worktree add` で `../worktree-<sanitized-branch>/`(または `-p <path>`)に作成。新規ブランチは `base_branch` を起点に切り出し(origin にだけ存在するブランチは `origin/<branch>` からローカルのトラッキングブランチを作成)。
 2. **ファイルコピー** — `copy_files`(gitignore された設定や秘密鍵など)をコピー。`link_files` にも含まれるパスはここでスキップ。
 3. **シンボリックリンク** — `link_files` のエントリをソースリポジトリへ symlink(既存のファイル/ディレクトリ/symlink は安全に置き換え)。
 4. **環境変数ファイル** — `env.file` をコピーし、`env.adjust` が空でなければポート風の値を他 worktree とぶつからない次の空きポートまでずらす。
@@ -106,7 +108,13 @@ npm install -g @schemelisp/wtb
 npx @schemelisp/wtb create feature/awesome
 ```
 
-### 2. リポジトリのルートに設定を置く
+### 2. リポジトリのルートに設定を生成する
+
+```bash
+wtb init          # コメント付きの wtb.yaml を生成(base_branch は origin/HEAD から検出)
+```
+
+生成されたファイルを編集します。最小構成の例:
 
 ```yaml
 # wtb.yaml
@@ -144,6 +152,16 @@ wtb create feature/awesome --dry-run
 
 ## コマンド
 
+### `wtb init`
+
+リポジトリのルートにコメント付きの `wtb.yaml` を生成します — 最速のセットアップ手段です。`base_branch` は `origin/HEAD` から検出されます(リモートのデフォルトブランチが未設定なら `main` にフォールバック)。
+
+| オプション | 説明 |
+|-----------|------|
+| `-f, --force` | 既存の設定ファイルを上書き |
+
+設定ファイルが既に存在する場合は exit `1` で失敗します(`--force` で上書き)。git リポジトリ外では exit `3`。
+
 ### `wtb create <branch>`
 
 新しいworktreeを作成します。
@@ -152,6 +170,14 @@ wtb create feature/awesome --dry-run
 wtb create feature/new-feature
 wtb create bugfix/urgent-fix
 ```
+
+**ブランチの解決順序:**
+
+1. **ローカルブランチが存在する** — そのまま使用。
+2. **origin にだけ存在する** — `base_branch` から新規ブランチを切って黙って shadow せず、ローカルのトラッキングブランチを作成します(`git worktree add -b <branch> --track origin/<branch>`。メッセージ: `ℹ️ Branch <branch> exists on origin — creating local tracking branch from origin/<branch>`)。
+3. **完全に新規** — `base_branch` から作成。その前に `base_branch` が解決可能か検証し(`git rev-parse --verify <base>^{commit}` ベースなのでタグ/SHA/remote ref も有効)、解決できなければ exit `1` で失敗し `wtb.yaml` に `base_branch` を設定するよう案内します(デフォルトブランチが `master` のリポジトリなど)。
+
+ブランチの worktree が既に存在する場合、`create` は exit `6` で失敗します — `--exists-ok` を渡すとパスを表示して exit `0` で成功します(冪等な「worktree の存在を保証する」用途)。
 
 **処理内容:**
 1. `git worktree add` でブランチ用の作業ディレクトリを作成（`base_branch` からブランチを作成）
@@ -177,6 +203,8 @@ wtb create bugfix/urgent-fix
 | `--no-stop` | クローン前にソース Compose スタックを自動 stop せず、稼働中 volume を skip する（旧挙動） |
 | `--seed` | クローンの代わりに seed する: volume クローンフェーズをスキップし、新 worktree 内で `volumes.seed_command` を実行する。ソース volume に一切触れないためソーススタックは止めない。`volumes.seed_command` の設定が必須で、`--force-volume-copy` とは排他。詳細は [Volume の自動クローン](#volume-の自動クローン) |
 | `--strict` | volume クローンまたは seed コマンドが 1 つでも失敗したら非ゼロ (`1`) で終了する(既定は exit `0` — worktree は作成済み)。データ分離の不完全さを検知したい CI / コーディングエージェント向け。詳細は [Volume の自動クローン](#volume-の自動クローン) |
+| `--exists-ok` | ブランチの worktree が既に存在する場合、exit `6` で失敗する代わりにパスを表示して exit `0` |
+| `--json` | 機械可読な JSON オブジェクトを stdout にちょうど 1 つ出力する。人間向けの進捗は stderr へ。下記参照 |
 | `--dry-run` | 実際の変更を行わず、実行内容をプレビュー |
 
 **使用例:**
@@ -201,6 +229,31 @@ wtb create feature/auth -p /tmp/auth-worktree
 wtb create release/v2.0 --no-create-branch
 ```
 
+人間向けモードでは、適用した調整を 1 件ずつ表示します — env フェーズではキーごとのポート bump(`APP_PORT: 3000 → 3001`)、Compose フェーズではサービスごとの remap(`web: 3000 → 3001`)。最後の *Next steps* ブロックは、この worktree に割り当てられたポートを確認する `wtb ports --pretty` を提案します。
+
+**JSON 出力(`--json`):** stdout に pretty-print された JSON オブジェクトをちょうど 1 つ出力し、人間向けの進捗はすべて stderr に流れます。
+
+```json
+{
+  "branch": "feature/auth",
+  "path": "/Users/me/worktree-feature-auth",
+  "created": true,
+  "existing": false,
+  "createdBranch": true,
+  "dryRun": false,
+  "env": { "APP_PORT": { "from": "3000", "to": "3001" } },
+  "composePorts": { "web": [{ "from": 3000, "to": 3001 }] },
+  "volumes": { "cloned": ["db_data"], "skipped": [], "failed": [] },
+  "seed": null,
+  "startCommand": { "ran": true, "failed": false },
+  "ok": true
+}
+```
+
+- `volumes.skipped` の各要素は `{ name, reason }`、`volumes.failed` は `{ name, error }`。`seed` は `--seed` 使用時に `{ ran, failed }`、未使用なら `null`(`startCommand` も `start_command` 設定時に同じ形)。
+- volume クローンまたは seed が失敗すると `ok` は `false`。`--strict --json` でもその失敗で exit `1` になります — JSON を書き切ってから exit code が設定されます。
+- 既存 worktree に対する `--exists-ok` では `{ branch, path, created: false, existing: true, createdBranch: false, dryRun, ok: true }` に縮小されます。
+
 ### `wtb remove <branch>`
 
 worktreeを削除します。
@@ -218,10 +271,14 @@ wtb remove feature/new-feature
 
 | オプション | 説明 |
 |-----------|------|
-| `-f, --force` | 未コミットの変更があっても強制削除 |
+| `-f, --force` | dirty チェックをスキップし、`git worktree remove` に `--force` を渡して強制削除(未コミットの変更は失われる) |
 | `--no-docker` | Docker Composeの停止をスキップ（`docker compose down`） |
 | `--no-end` | `end_command` の実行をスキップ |
 | `--remove-volumes` | この worktree の Docker volume も削除 (`docker compose down -v`)。teardown が省略されるケース（`--no-docker` 時、または `end_command` 設定時）では**効果なし**（wtb が警告を出す。`end_command` 側で volume を削除すること) |
+
+`-f` なしの場合、未コミット/未追跡の変更がある worktree は exit `1` で即座に失敗します(`Worktree for '<branch>' has uncommitted or untracked changes; commit/stash them or pass -f to force removal`)。このチェックは Docker teardown や volume 削除の**前**に走るため、失敗が確定している削除がサービス停止や volume 削除だけ先に実行してしまうことはありません。
+
+自動 teardown は設定された Compose ファイルを明示的に渡して実行します(`docker compose -f <docker_compose_file> down [-v]`)。`compose.dev.yml` のような非デフォルト名でも正しく停止されます。
 
 **使用例:**
 
@@ -242,6 +299,7 @@ wtb remove feature/abandoned -f --no-end
 | `--force-volume-copy` | source 稼働中・target に既存データがあってもクローン(上書きは atomic) |
 | `--no-stop` | source Compose スタックを自動 stop せず、稼働中 volume を skip |
 | `--strict` | volume が 1 つでもクローン失敗したら非ゼロ (`1`) で終了(既定は exit `0`)。データ分離の不完全さを検知したい CI / コーディングエージェント向け |
+| `--json` | 機械可読な JSON オブジェクトを stdout に 1 つ出力(`{ branch, path, dryRun, volumes: { cloned, skipped, failed }, ok }` — volume ごとの形は `create --json` と同じ)。人間向けの進捗は stderr へ |
 | `--dry-run` | クローン対象をプレビューし、変更しない |
 
 ```bash
@@ -250,7 +308,7 @@ wtb reclone feature/auth          # 特定の worktree
 wtb reclone feature/auth --force-volume-copy   # 古い target データを上書き
 ```
 
-`create` と同じ `N cloned, N skipped, N failed` サマリを出力します。既定では failure があっても exit `0` で、`⚠️  … data is NOT fully isolated` を明示します(解消して再実行。`--strict` を渡すと exit `1`)。main リポジトリ worktree は対象にできません(source と target が同一 project になるため)。`docker_compose_file` 未設定なら no-op(メッセージのみ)。再クローンではなく再 seed したい場合は worktree 内で `volumes.seed_command` を実行してください。
+`create` と同じ `N cloned, N skipped, N failed` サマリを出力します。既定では failure があっても exit `0` で、`⚠️  … data is NOT fully isolated` を明示します(解消して再実行。`--strict` を渡すと exit `1`)。`--json` では `ok: false` が失敗を示し、`--strict` でも JSON を書き切ってから exit `1` になります。main リポジトリ worktree は対象にできません(source と target が同一 project になるため)。`docker_compose_file` 未設定なら no-op(メッセージのみ)。再クローンではなく再 seed したい場合は worktree 内で `volumes.seed_command` を実行してください。
 
 ### `wtb prune`
 
@@ -259,7 +317,7 @@ wtb reclone feature/auth --force-volume-copy   # 古い target データを上�
 | オプション | 説明 |
 |-----------|------|
 | `-y, --yes` | 実際に削除する。**指定しなければ dry-run**(候補の表示のみ) |
-| `--json` | 機械可読出力(`{ dryRun, candidates, removed }`) |
+| `--json` | 機械可読出力: `{ dryRun, candidates, removed, failed }` — 各 candidate は `{ name, reason, inUse, inUseBy }` で、`inUseBy` はブロックしているコンテナ名の一覧。`removed`/`failed` は volume 名の配列 |
 
 ```bash
 wtb prune            # 削除対象をプレビュー(安全・何も消さない)
@@ -268,6 +326,8 @@ wtb prune --json     # スクリプト/agent 向けの機械可読プレビュ�
 ```
 
 安全策: **デフォルトは dry-run**(削除は `--yes` 必須)、コンテナ使用中の volume はスキップ、worktree の volume は Compose プロジェクト名の前方一致(`<project>_…`)で厳密判定するため稼働中 worktree のデータは消しません。live 判定は `git worktree list`(このリポジトリ)に基づきます。
+
+`--yes` 指定時、volume の削除に 1 つでも失敗すると exit `5`(Docker エラー — 部分的な prune として扱うこと)になります。`--json` なしではエラーは stderr に `Error: Failed to remove N volume(s): <names>` として出ます。`--json` ありでは JSON ペイロード全体が stdout に書き出され(失敗した volume は `failed` に列挙)、その後に exit code が設定されるため JSON は壊れません。
 
 ### `wtb ls` (alias: `list`)
 
@@ -285,6 +345,8 @@ wtb list      # 同じ
 | `-l, --long` | 長形式（短縮コミットハッシュ、経過時間、dirty状態、サブジェクト） |
 | `--json` | 機械可読JSON出力（`-l` と組み合わせると拡張フィールドも追加） |
 | `-p, --paths` | 絶対パスのみを1行ずつ出力（`$(wtb ls -p \| fzf)` 等の用途に便利） |
+
+フラグは組み合わせではなく優先順位で解決されます: `-p` は `--json` と `-l` を上書きします(パスのみの出力が優先)。
 
 **出力例:**
 
@@ -311,21 +373,43 @@ wtb list      # 同じ
 cd "$(wtb ls -p | fzf)"
 ```
 
+ブランチ名が分かっているなら対話的なピッカーは不要です — [`wtb path`](#wtb-path-branch) が決定的に解決します: `cd "$(wtb path feature/x)"`。
+
 JSON（`--json`）:
 ```bash
 wtb ls --json | jq '.[] | select(.isMain == false) | .path'
 ```
 
-### `wtb ports`
+### `wtb path <branch>`
 
-現 worktree(または全 worktree)の `env.adjust` 調整済み値、Docker Compose の host/container ポート、`http://localhost:<port>` エンドポイント一覧を出力します。Claude Code の [skill](#claude-code連携) から呼び出される想定ですが、シェルスクリプトからも使えます。
+`<branch>` を持つ worktree の絶対パスを出力します — 改行で終わる 1 行のみで、stdout には他に何も出ません。シェルパイプラインや coding agent 向けの決定的な primitive です:
+
+```bash
+cd "$(wtb path feature/x)"                    # worktree に直接移動
+wtcd() { cd "$(wtb path "$1")"; }             # 便利なシェル関数
+```
+
+一致する worktree が無い場合は `Available worktrees:` の一覧を stderr に出して exit `1` で失敗します(stdout はパイプライン用にクリーンなまま)。git リポジトリ外では exit `3`。
+
+### `wtb ports [branch]`
+
+現 worktree・指定ブランチの worktree・全 worktree の `env.adjust` 調整済み値、Docker Compose の host/container ポート、`http://localhost:<port>` エンドポイント一覧を出力します。Claude Code の [skill](#claude-code-連携) から呼び出される想定ですが、シェルスクリプトからも使えます。
 
 | オプション | 説明 |
 |-----------|------|
-| `--all` | 全 worktree を配列で出力（デフォルトは現在の worktree 1 件をオブジェクトで） |
+| `-a, --all` | 全 worktree を配列で出力（デフォルトは現在の worktree 1 件をオブジェクトで）。branch 引数とは併用不可(exit `2`) |
 | `--pretty` | JSON ではなく人間向けテーブル |
+| `--json` | 一貫性のために受け付ける no-op — JSON が既にデフォルト出力。`--pretty` とは排他(exit `2`) |
 
-出力スキーマと利用例は [Claude Code連携](#claude-code連携) を参照。
+```bash
+wtb ports                  # 現在の worktree
+wtb ports feature/x        # ブランチ指定(cd 不要)
+wtb ports -a               # 全 worktree を JSON 配列で
+```
+
+未知のブランチを渡すと `Available worktrees:` の一覧を stderr に出して exit `1` になります。
+
+出力スキーマと利用例は [Claude Code連携](#claude-code-連携) を参照。
 
 ### `wtb status`
 
@@ -343,7 +427,7 @@ wtb status
 | `--docker-only` | Docker関連の情報のみ表示 |
 | `--json` | 機械可読な JSON(worktree + Docker 状態)を stdout に出力 — スクリプト / agent 向け |
 
-`--json` は 1 つの構造化オブジェクト(`{ worktrees: [...], docker: {...} }`)を返し、Docker が止まっていても valid JSON のまま(`docker.available: false`)です。`wtb ls --json` / `wtb ports` と合わせて機械可読の三点セットを構成します。
+`--json` は 1 つの構造化オブジェクト(`{ worktrees: [...], docker: {...} }`)を返し、Docker が止まっていても valid JSON のまま(`docker.available: false`)です。`docker.volumes.wtb` の各エントリには `labelled` boolean が付きます: `true` は `wtb.managed=true` ラベル付き(真のソース)、`false` はレガシーな `wtb`/`worktree` 名前ヒューリスティックでのみマッチしたもの — wtb 管理 volume として扱う前に `labelled` を確認してください。`wtb ls --json`、`wtb ports`(JSON がデフォルト)、`wtb create --json` / `wtb reclone --json` と合わせて、wtb の読み取りと変更操作の両方が機械可読になります。
 
 出力例:
 ```
@@ -364,13 +448,16 @@ wtb status
 
 ### `wtb init-claude`
 
-同梱の Claude Code Skill をこのリポジトリ(またはグローバル)に展開します。詳しくは [Claude Code連携](#claude-code連携) を参照。
+同梱の Claude Code Skill をこのリポジトリ(またはグローバル)に展開します。詳しくは [Claude Code連携](#claude-code-連携) を参照。
 
 | オプション | 説明 |
 |-----------|------|
 | `-f, --force` | 既存 `SKILL.md` を上書き |
 | `--user` | リポジトリではなく `~/.claude/skills/wtb/` にインストール |
 | `--dry-run` | 対象パスのみ出力し書き込まない |
+| `--check` | インストール済み `SKILL.md` をこの CLI のバージョンと照合 — 最新なら exit `0`、未インストール/stamp なし/古い場合は exit `1`。`--user` に対応。何も書き込まない |
+
+インストーラは frontmatter 直後に `<!-- wtb-skill-version: X.Y.Z -->` の stamp を埋め込みます。`--check`(および `--force` なしで既存ファイルがあったときの skip メッセージ)はこの stamp を CLI バージョンと比較するため、wtb をアップグレードした後の skill の陳腐化を機械的に検知できます — `wtb init-claude --force` で更新してください。
 
 ## 設定ファイル
 
@@ -382,6 +469,8 @@ wtb status
 - `.wtb.yml`
 - `.wtb/config.yaml`
 - `.wtb/config.yml`
+
+どれも見つからない場合でも wtb はデフォルト設定で動作します — stderr にデフォルトの内容(`base_branch: main`、`./.env` を無調整コピー、ポート remap なし)を明示した警告を出し、[`wtb init`](#wtb-init) での雛形生成を案内します。
 
 ### 基本設定
 
@@ -455,7 +544,9 @@ env:
 `docker_compose_file` を設定すると、wtbが自動的に:
 - Composeファイルを各worktreeにコピー
 - 実行中コンテナとのポート衝突を回避してリマップ
-- worktree削除前に `docker compose down` を実行
+- worktree削除前に `docker compose -f <docker_compose_file> down` を実行(設定したファイルを明示的に渡すので `compose.dev.yml` のような非デフォルト名でも正しく停止)
+
+なお、コピーされる Compose ファイルはパースして再シリアライズされるため、YAML のコメント・アンカー・元の整形は保持されません(wtb が書き出すすべての Compose ファイルに当てはまります)。Docker が未インストール/デーモン停止中でも Compose ファイルはパース・書き出しされますが、避けるべき稼働中コンテナが無いため host ポートは元の値のままになります(警告が出ます)。
 
 ```yaml
 docker_compose_file: ./docker-compose.yml
@@ -548,7 +639,7 @@ volumes:
 
 その実行回だけスキップしたいときは `wtb create <branch> --no-volume-copy`、ソーススタックを止めずに稼働中 volume を skip したいときは `--no-stop`、稼働中ソースを止めずに強制ライブコピーしたい (dev のみ・データ破損リスクあり) ときは `--force-volume-copy`。
 
-volume ごとのサマリは `N cloned, N skipped, N failed` の形式で出力されます。いずれかの volume のクローンが **failed** になった場合、worktree 自体は作成されますが、最後のバナーが `🎉 Worktree created successfully!` から `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated` に変わり、不完全な状態が明示されます。既定では終了コードは `0` のまま(worktree は存在するため)ですが、**`--strict`** を渡すとクローン(または `--seed`)失敗時に exit `1` になり、CI やコーディングエージェントがデータ分離の不完全さを検知できます。*skip* は意図的(external/除外 volume、source 不在、`--no-stop` 下での稼働中、target に既存データ)、*failure* はコピー自体がエラーになったことを意味します。
+volume ごとのサマリは `N cloned, N skipped, N failed` の形式で出力されます。いずれかの volume のクローンが **failed** になった場合、worktree 自体は作成されますが、最後のバナーが `🎉 Worktree created successfully!` から `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated` に変わり、不完全な状態が明示されます。既定では終了コードは `0` のまま(worktree は存在するため)ですが、**`--strict`** を渡すとクローン(または `--seed`)失敗時に exit `1` になり、CI やコーディングエージェントがデータ分離の不完全さを検知できます。*skip* は意図的なものです — source 不在、稼働中 (in-use。`--no-stop` 時のほか、ソーススタック停止後も別の Compose project が同名 volume を掴んでいる場合にも起こる)、target に既存データ、の 3 ケース。external/`exclude` 指定の volume は集計前にクローン対象から外れるためサマリには現れません。*failure* はコピー自体がエラーになったことを意味します。
 
 `wtb remove <branch>` はデフォルトでは clone した volume を削除しません(`docker compose down` のデフォルト挙動と整合)。`wtb remove <branch> --remove-volumes` で `docker compose down -v` 相当に切り替わり volume も削除されます。これは自動 teardown 経由で動くため、teardown が省略される場合(`--no-docker` 時、または `end_command` 設定時)は no-op になり警告が出ます(その場合は `end_command` 側で volume を削除してください)。こうして残った volume は時間とともに孤児として溜まるので、[`wtb prune`](#wtb-prune) でまとめて掃除できます(wtb が作る volume には `wtb.managed=true` ラベルが付きます)。
 
@@ -579,7 +670,7 @@ wtb create feature/clean-db --seed
 ```
 src/
 ├── cli/
-│   ├── commands/      create, remove, reclone, prune, ls, ports, status, init-claude
+│   ├── commands/      init, create, remove, reclone, prune, ls, path, ports, status, init-claude
 │   ├── utils/         worktree/ports レンダラ、共通エラーラッパー、Claude Skill インストーラ
 │   └── index.ts       commander の組み立て + グローバルエラーハンドラ
 ├── core/
@@ -609,10 +700,12 @@ src/
 |------|---------|
 | `0` | 成功 |
 | `1` | 一般エラー |
-| `2` | CLI 引数エラー |
+| `2` | CLI 引数エラー — 引数不足、未知のオプション/コマンド、不正/過剰な引数、排他オプションの併用(例: `wtb ports --json --pretty`、branch 引数と `--all` の併用)。`--help`/`--version` は exit `0` のまま |
 | `3` | git リポジトリ外 |
 | `4` | 設定エラー(設定ファイルのパース失敗・バリデーション失敗) |
-| `5` | Docker エラー — **予約**。Docker はオプションで graceful に degrade する(警告して継続)ため、現状このコードで終了することはない。Docker の問題は警告(コマンドは成功)になるか、`1` として表面化する。 |
+| `5` | Docker エラー — 現状は `wtb prune --yes` で volume 削除に失敗したときのみ(部分的な prune)。それ以外の Docker の問題は従来どおり graceful に degrade する(警告して継続)か、`1` として表面化する |
+| `6` | worktree が既に存在 — 既に worktree を持つブランチへの `wtb create`(`--exists-ok` なし) |
+| `130` / `143` | SIGINT (Ctrl-C) / SIGTERM による中断。中断扱いにすること — 中断された `create` は途中状態の可能性がある |
 
 ## 開発
 
@@ -682,15 +775,18 @@ git commit -m "chore: install wtb Claude Code skill"
 wtb init-claude --user                   # ~/.claude/skills/wtb/SKILL.md
 ```
 
-フラグ: `-f, --force`(上書き)、`--user`(グローバル)、`--dry-run`(対象パスのみ確認)。
+フラグ: `-f, --force`(上書き)、`--user`(グローバル)、`--dry-run`(対象パスのみ確認)、`--check`(インストール済み skill を CLI バージョンと照合。何も書き込まない)。
+
+インストールされた `SKILL.md` には `<!-- wtb-skill-version: X.Y.Z -->` の stamp が入るので、wtb のアップグレード後は `wtb init-claude --check`(最新なら exit `0`、未インストール/stamp なし/古い場合は `1`)で確認し、`wtb init-claude --force` で更新できます。
 
 ### データソース: `wtb ports`
 
-Skill は `wtb ports` を呼び出して結果を読み取ります(JSON がデフォルト出力 — `--json` フラグは存在しません)。シェルから直接使うこともできます:
+Skill は `wtb ports` を呼び出して結果を読み取ります(JSON がデフォルト出力 — `--json` は一貫性のための no-op として受け付けられ、`--pretty` とは排他です)。シェルから直接使うこともできます:
 
 ```bash
 wtb ports                                # 現 worktree を JSON オブジェクトで
-wtb ports --all                          # 全 worktree を JSON 配列で
+wtb ports feature/auth                   # ブランチ指定で特定の worktree を
+wtb ports -a                             # 全 worktree を JSON 配列で(エイリアス: --all)
 wtb ports --pretty                       # 人間向けテーブル
 ```
 
@@ -717,7 +813,7 @@ wtb ports --pretty                       # 人間向けテーブル
 - `env` には `env.adjust` に登録した key のみが入る。`.env` 内の他の値(API キー等のシークレット)は**漏れない**。
 - `compose.services` は worktree のコピー済み Compose ファイルから読むので、**リマップ後のポート値**が得られる。
 - `endpoints` は compose の host ポートから `http://localhost:<port>` を組み立てる簡易一覧。
-- Docker 不在でも stdout は有効な JSON(`compose.services` が `{}` になるだけ)。警告は stderr。
+- `wtb ports` は Compose YAML をディスクから読むだけで Docker を呼ばないため、Docker の有無で出力は変わらない。`compose.services` が `{}` になるのは compose ファイルが見つからない/パースできない場合のみ(警告は stderr)。stdout は常に有効な JSON。
 
 ### Claude が何をできるようになるか
 
@@ -727,6 +823,8 @@ Skill インストール後は、次のような依頼が自然に通ります:
 |-----|---------------|
 | 「ここの API のポート教えて」 | `wtb ports` を実行(JSON がデフォルト)→ 該当ポートを返答 |
 | 「worktree 一覧見せて」 | `wtb ls -l` |
+| 「feature/x の worktree に移動して」 | `cd "$(wtb path feature/x)"` — ブランチ → パスの決定的な解決 |
+| 「このリポジトリに wtb をセットアップして」 | `wtb init` → コメント付き `wtb.yaml` を生成 |
 | 「feature/login の worktree 作って」 | `wtb create feature/login`(破壊的変更は事前確認) |
 | 「feature/old 片付けて」 | `wtb ls -l` で対象表示 → 確認 → `wtb remove feature/old` |
 | 「この worktree の DB が空/クローン失敗した」 | `wtb reclone` → volume クローンフェーズだけ再実行(worktree は作り直さない) |
@@ -752,9 +850,9 @@ Gitリポジトリ内からwtbを実行してください。ツールはGitル�
 
 Dockerがインストールされていない、またはデーモンが起動していない場合、wtbはDocker操作を優雅にスキップします。`--no-docker` を使うとDocker関連の警告を完全に抑制できます。
 
-### Worktreeが既に存在する
+### Worktreeが既に存在する (exit 6)
 
-ブランチが既にworktreeとして存在するため `git worktree add` が失敗した場合は、`wtb status` で既存のworktreeを確認し、`wtb remove` で古いものを先に削除してください。
+ブランチが既にworktreeとして存在する場合は exit `6` で失敗します。`wtb ls` で既存のworktreeの場所を確認し、`wtb remove` で古いものを先に削除してください — そのまま再利用してよければ `wtb create` に `--exists-ok` を渡します(パスを表示して exit `0`)。
 
 ## FAQ
 
