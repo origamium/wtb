@@ -5,6 +5,7 @@
 
 import type { VolumeCopyProgress } from "../../core/docker/volume.js"
 import { formatBytes, formatEta } from "../../core/docker/volume.js"
+import { outStream } from "../../utils/output.js"
 
 /**
  * プログレスバーのオプション
@@ -70,14 +71,14 @@ export function formatVolumeCopyProgress(
  * @param message - 表示するメッセージ
  */
 export function updateProgressLine(message: string): void {
-  process.stdout.write(`\r\x1b[K${message}`)
+  outStream().write(`\r\x1b[K${message}`)
 }
 
 /**
  * 進捗表示を完了（改行を追加）
  */
 export function finishProgressLine(): void {
-  process.stdout.write("\n")
+  outStream().write("\n")
 }
 
 /**
@@ -105,4 +106,3 @@ export function createVolumeCopyProgressHandler(
     }
   }
 }
-

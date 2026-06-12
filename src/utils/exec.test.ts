@@ -79,7 +79,9 @@ describe("execGitSafe / execDockerSafe", () => {
   it("execDockerSafe targets the docker binary (throws via docker, not a shell)", () => {
     // Works whether or not Docker is installed: a bogus subcommand errors, and a missing
     // binary ENOENTs — both throw with the "docker" command in the message.
-    expect(() => execDockerSafe(["not-a-real-docker-subcommand-xyz"])).toThrow(/Command failed: docker/)
+    expect(() => execDockerSafe(["not-a-real-docker-subcommand-xyz"])).toThrow(
+      /Command failed: docker/
+    )
   })
 })
 

@@ -14,14 +14,21 @@ import { loadConfig } from "../../core/config/loader.js"
 import { getGitRootOrThrow } from "../../core/git/repository.js"
 import { getWorktreePath, isSamePath, listWorktrees } from "../../core/git/worktree.js"
 import { CLIError } from "../../utils/error.js"
+import { out, setJsonOutputMode } from "../../utils/output.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
-import { previewVolumeCopy, setupVolumeCopy } from "./create.js"
+import {
+  emptyVolumeCopyResult,
+  previewVolumeCopy,
+  setupVolumeCopy,
+  type VolumeCopyResult,
+} from "./create.js"
 
 interface RecloneOptions {
   forceVolumeCopy?: boolean
   stop?: boolean
   strict?: boolean
   dryRun?: boolean
+  json?: boolean
 }
 
 /**
@@ -48,6 +55,10 @@ export function recloneCommand(): Command {
       "--strict",
       "Exit non-zero (1) if any volume fails to clone (default: exit 0). Use in CI / coding-agent pipelines that must detect incomplete data isolation."
     )
+    .option(
+      "--json",
+      "Output one machine-readable JSON result on stdout (human progress goes to stderr)"
+    )
     .option("--dry-run", "Show what would be cloned without making changes")
     .action(withErrorHandling(executeRecloneCommand))
 }
@@ -59,6 +70,10 @@ async function executeRecloneCommand(
   branch: string | undefined,
   options: RecloneOptions
 ): Promise<void> {
+  // モジュール状態なので毎回明示的に設定する (前回実行のモードを引き継がない)。
+  const json = options.json === true
+  setJsonOutputMode(json)
+
   const gitRoot = getGitRootOrThrow()
 
   // 対象 worktree の解決: branch 指定があればそれ、無ければ cwd を含む worktree。
@@ -67,11 +82,11 @@ async function executeRecloneCommand(
   if (branch) {
     const resolved = getWorktreePath(branch)
     if (!resolved) {
-      console.error(`Error: No worktree found for branch '${branch}'`)
-      console.log("")
-      console.log("Available worktrees:")
+      // 一覧はエラー診断の一部なので stderr に出す (stdout を script 出力用に汚さない)。
+      // "Error: ..." 本文は withErrorHandling が CLIError から stderr へ出力する。
+      console.error("Available worktrees:")
       for (const wt of listWorktrees()) {
-        console.log(`  ${wt.branch}: ${wt.path}`)
+        console.error(`  ${wt.branch}: ${wt.path}`)
       }
       throw new CLIError(`No worktree found for branch '${branch}'`, EXIT_CODES.GENERAL_ERROR)
     }
@@ -105,18 +120,41 @@ async function executeRecloneCommand(
 
   const config = loadConfig(gitRoot)
 
+  // --json: stdout には JSON オブジェクトを 1 つだけ出力する (人間向け出力は stderr 済み)。
+  const writeJsonResult = (volumes: VolumeCopyResult, ok: boolean): void => {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          branch: targetBranch,
+          path: worktreePath,
+          dryRun: options.dryRun === true,
+          volumes,
+          ok,
+        },
+        null,
+        2
+      )}\n`
+    )
+  }
+
   if (!config.docker_compose_file) {
-    console.log("ℹ️  No docker_compose_file configured — there are no volumes to clone.")
+    out("ℹ️  No docker_compose_file configured — there are no volumes to clone.")
+    if (json) {
+      writeJsonResult(emptyVolumeCopyResult(), true)
+    }
     return
   }
 
-  console.log(`🔁 Re-cloning volumes for branch: ${targetBranch}`)
-  console.log(`📂 Worktree path: ${worktreePath}`)
-  console.log("")
+  out(`🔁 Re-cloning volumes for branch: ${targetBranch}`)
+  out(`📂 Worktree path: ${worktreePath}`)
+  out("")
 
   if (options.dryRun) {
-    console.log("🔍 Dry run mode — no changes will be made")
+    out("🔍 Dry run mode — no changes will be made")
     previewVolumeCopy(gitRoot, config)
+    if (json) {
+      writeJsonResult(emptyVolumeCopyResult(), true)
+    }
     return
   }
 
@@ -125,19 +163,31 @@ async function executeRecloneCommand(
     stop: options.stop,
   })
 
-  console.log("")
-  if (result.failed > 0) {
+  out("")
+  if (result.failed.length > 0) {
     // 既定では create と同じ contract: コマンドは exit 0 だが、データ未達成を明示する。
-    console.log(
-      `⚠️  Reclone finished, but ${result.failed} volume(s) FAILED — this worktree's data is NOT fully isolated. See the errors above; resolve them and re-run \`wtb reclone\`.`
+    out(
+      `⚠️  Reclone finished, but ${result.failed.length} volume(s) FAILED — this worktree's data is NOT fully isolated. See the errors above; resolve them and re-run \`wtb reclone\`.`
     )
+    if (json) {
+      writeJsonResult(result, false)
+    }
     // --strict のときだけ非ゼロ終了して CI/エージェントに失敗を伝える。
+    // JSON モードでは payload を書き切ってから exitCode のみ設定する (即 process.exit
+    // すると stdout の flush 前に落ちて JSON が壊れる恐れがある)。
     if (options.strict === true) {
-      process.exit(EXIT_CODES.GENERAL_ERROR)
+      if (json) {
+        process.exitCode = EXIT_CODES.GENERAL_ERROR
+      } else {
+        process.exit(EXIT_CODES.GENERAL_ERROR)
+      }
     }
   } else {
-    console.log(
-      `✅ Reclone complete — ${result.copied} cloned, ${result.skipped} skipped, 0 failed.`
+    out(
+      `✅ Reclone complete — ${result.cloned.length} cloned, ${result.skipped.length} skipped, 0 failed.`
     )
+    if (json) {
+      writeJsonResult(result, true)
+    }
   }
 }

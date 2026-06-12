@@ -222,6 +222,38 @@ describe("copyAndAdjustEnvFile", () => {
     expect(result).toContain("APP_PORT=3002")
   })
 
+  it("should report per-key value changes via the optional changes out-parameter", () => {
+    const sourcePath = path.join(tmpDir, ".env")
+    const targetPath = path.join(tmpDir, ".env.adjusted")
+    fs.writeFileSync(
+      sourcePath,
+      "APP_PORT=3000\nAPI_URL=http://localhost:3000\nNAME=x\nDELETE_ME=1\n"
+    )
+
+    const changes: Array<{ key: string; from: string; to: string }> = []
+    const count = copyAndAdjustEnvFile(
+      sourcePath,
+      targetPath,
+      {
+        APP_PORT: 1,
+        API_URL: "http://staging.example.com",
+        NAME: (value) => `${value}-wt`,
+        DELETE_ME: null,
+      },
+      undefined,
+      [],
+      changes
+    )
+
+    // 戻り値のカウント契約は従来どおり (削除も含む)。changes は値変更だけを報告する。
+    expect(count).toBe(4)
+    expect(changes).toEqual([
+      { key: "APP_PORT", from: "3000", to: "3001" },
+      { key: "API_URL", from: "http://localhost:3000", to: "http://staging.example.com" },
+      { key: "NAME", from: "x", to: "x-wt" },
+    ])
+  })
+
   it("should replace with string values", () => {
     const sourcePath = path.join(tmpDir, ".env")
     const targetPath = path.join(tmpDir, ".env.out")

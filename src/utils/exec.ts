@@ -5,6 +5,7 @@
 
 import { execFileSync, execSync } from "node:child_process"
 import { FILE_ENCODING } from "../constants/index.js"
+import { isJsonOutputMode } from "./output.js"
 
 interface SafeExecOptions {
   cwd?: string
@@ -58,11 +59,14 @@ export function execDockerSafe(args: string[], options?: SafeExecOptions): strin
 /**
  * ライフサイクルコマンド（start_command / end_command）を実行
  * ユーザー指定のシェルスクリプトなので shell: "/bin/sh" を使用
+ *
+ * JSON 出力モード中は子プロセスの stdout を stderr (fd 2) に流し、
+ * stdout を JSON 専用に保つ。
  */
 export function executeLifecycleCommand(command: string, cwd: string): void {
   execSync(command, {
     cwd,
-    stdio: "inherit",
+    stdio: isJsonOutputMode() ? [0, 2, 2] : "inherit",
     shell: "/bin/sh",
   })
 }

@@ -8,6 +8,7 @@ import { spawn } from "node:child_process"
 import { FILE_ENCODING } from "../../constants/index.js"
 import type { ComposeConfig } from "../../types/index.js"
 import { execDockerSafe } from "../../utils/exec.js"
+import { out } from "../../utils/output.js"
 
 /**
  * ボリュームコピーの進捗情報
@@ -268,11 +269,7 @@ export async function copyVolumeWithRsync(
         resolve()
       } else {
         const detail = stderrBuffer.trim()
-        reject(
-          new Error(
-            `Volume copy failed with exit code ${code}${detail ? `: ${detail}` : ""}`
-          )
-        )
+        reject(new Error(`Volume copy failed with exit code ${code}${detail ? `: ${detail}` : ""}`))
       }
     })
 
@@ -451,13 +448,9 @@ async function copyVolumeAtomicOverwrite(
     //    tmp が唯一の完全コピーのため)。それ以外 (staging/verify 失敗 = target 無傷、
     //    または commit 成功) では tmp は不要なので削除する。
     if (commitStarted && !commitDone) {
-      console.log(
-        `  ⚠️  Overwrite of '${targetVolume}' failed mid-commit — its data may be incomplete.`
-      )
-      console.log(
-        `      A verified full copy is preserved in temp volume '${tmp}'. Recover with:`
-      )
-      console.log(
+      out(`  ⚠️  Overwrite of '${targetVolume}' failed mid-commit — its data may be incomplete.`)
+      out(`      A verified full copy is preserved in temp volume '${tmp}'. Recover with:`)
+      out(
         `        docker run --rm -v ${tmp}:/from -v ${targetVolume}:/to alpine sh -c 'find /to -mindepth 1 -delete && cp -a /from/. /to/' && docker volume rm ${tmp}`
       )
     } else {
@@ -527,7 +520,7 @@ export interface ResolvedVolume {
 export function resolveVolumeName(
   composeConfig: ComposeConfig,
   volumeKey: string,
-  projectName: string,
+  projectName: string
 ): ResolvedVolume | null {
   const volumes = composeConfig.volumes
   if (!volumes || !(volumeKey in volumes)) {
@@ -590,7 +583,7 @@ export function resolveVolumeName(
  */
 export function discoverCloneableVolumes(
   composeConfig: ComposeConfig,
-  exclude: string[] = [],
+  exclude: string[] = []
 ): string[] {
   if (!composeConfig.volumes) return []
   const excludeSet = new Set(exclude)
@@ -618,7 +611,7 @@ export function getContainersUsingVolume(volumeName: string): string[] {
   try {
     const output = execDockerSafe(
       ["ps", "--filter", `volume=${volumeName}`, "--format", "{{.Names}}"],
-      {},
+      {}
     )
     if (!output) return []
     return output

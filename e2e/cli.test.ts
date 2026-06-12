@@ -180,7 +180,7 @@ describe("Create Command - Basic Project", () => {
       // Try to create duplicate
       const result = testRepo.runCLI("create duplicate-test")
 
-      expect(result.exitCode).toBe(1)
+      expect(result.exitCode).toBe(6) // EXIT_CODES.WORKTREE_EXISTS
       expect(result.combined).toContain("already exists")
     })
 

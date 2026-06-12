@@ -8,6 +8,7 @@ import * as path from "node:path"
 import fs from "fs-extra"
 import { BACKUP_EXTENSION, FILE_ENCODING, PORT_RANGE } from "../../constants/index.js"
 import type { FileOperationOptions } from "../../types/index.js"
+import { out } from "../../utils/output.js"
 
 // =============================================================================
 // 統合行型（順序保持のため）
@@ -213,7 +214,7 @@ export function writeEnvFile(
     if (options?.createBackup && existsSync(filePath)) {
       const backupPath = `${filePath}${BACKUP_EXTENSION}`
       fs.copyFileSync(filePath, backupPath)
-      console.log(`📋 Created backup: ${backupPath}`)
+      out(`📋 Created backup: ${backupPath}`)
     }
 
     const content = serializeEnvFile(parsed)
@@ -227,7 +228,7 @@ export function writeEnvFile(
       encoding: options?.encoding || FILE_ENCODING,
     })
 
-    console.log(`🔧 Wrote environment file: ${filePath}`)
+    out(`🔧 Wrote environment file: ${filePath}`)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new Error(`Failed to write environment file: ${message}`)
@@ -239,9 +240,21 @@ export function writeEnvFile(
 // =============================================================================
 
 /**
+ * copyAndAdjustEnvFile が報告する 1 件の値変更 (削除は含まない)。
+ */
+export interface EnvAdjustmentChange {
+  key: string
+  from: string
+  to: string
+}
+
+/**
  * 環境変数ファイルをコピーして値を調整
  * null の削除は Set で管理し、__DELETE__ センチネル値の衝突を防ぐ
  *
+ * @param changes - 渡すと string/number/function 調整による値変更 (key/from/to) を
+ *   追記する out-parameter。呼び出し側が「どのキーがどのポートになったか」を
+ *   表示するために使う (戻り値の件数カウントは従来どおり)。
  * @returns 調整された環境変数の数
  */
 export function copyAndAdjustEnvFile(
@@ -249,7 +262,8 @@ export function copyAndAdjustEnvFile(
   targetPath: string,
   adjustments: Record<string, string | number | null | ((value: string) => string)>,
   options?: FileOperationOptions,
-  usedPorts: number[] = []
+  usedPorts: number[] = [],
+  changes?: EnvAdjustmentChange[]
 ): number {
   const parsed = parseEnvFile(sourcePath, options)
   let adjustedCount = 0
@@ -273,6 +287,7 @@ export function copyAndAdjustEnvFile(
       keysToDelete.add(line.key)
       adjustedCount++
     } else if (typeof adjustment === "string") {
+      changes?.push({ key: line.key, from: line.value, to: adjustment })
       line.value = adjustment
       // entries 配列も同期
       const entry = entryByKey.get(line.key)
@@ -284,6 +299,7 @@ export function copyAndAdjustEnvFile(
         const newPort = findNextFreePort(originalValue, assignedPorts)
         assignedPorts.add(newPort)
         const newValue = newPort.toString()
+        changes?.push({ key: line.key, from: line.value, to: newValue })
         line.value = newValue
         const entry = entryByKey.get(line.key)
         if (entry) entry.value = newValue
@@ -291,6 +307,7 @@ export function copyAndAdjustEnvFile(
       }
     } else if (typeof adjustment === "function") {
       const newValue = adjustment(line.value)
+      changes?.push({ key: line.key, from: line.value, to: newValue })
       line.value = newValue
       const entry = entryByKey.get(line.key)
       if (entry) entry.value = newValue
@@ -344,7 +361,7 @@ export function backupEnvFile(filePath: string, backupSuffix?: string): string {
 
   if (existsSync(filePath)) {
     fs.copyFileSync(filePath, backupPath)
-    console.log(`📋 Created backup: ${backupPath}`)
+    out(`📋 Created backup: ${backupPath}`)
   }
 
   return backupPath
@@ -362,5 +379,5 @@ export function restoreEnvFile(filePath: string, backupSuffix?: string): void {
   }
 
   fs.copyFileSync(backupPath, filePath)
-  console.log(`📋 Restored from backup: ${backupPath}`)
+  out(`📋 Restored from backup: ${backupPath}`)
 }

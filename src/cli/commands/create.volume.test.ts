@@ -265,17 +265,48 @@ describe("setupVolumeCopy orchestration", () => {
     expect(messages).toContain("0 volume(s) cloned, 0 skipped, 1 failed")
     // The parsable result distinguishes a real failure from an intentional skip,
     // so the create banner can be qualified instead of reporting clean success.
-    expect(result).toEqual({ copied: 0, skipped: 0, failed: 1 })
+    expect(result).toEqual({
+      cloned: [],
+      skipped: [],
+      failed: [{ name: "postgres_data", error: "rsync exploded" }],
+    })
   })
 
-  it("returns a counts summary distinguishing copied / skipped / failed", async () => {
+  it("returns per-volume entries distinguishing cloned / skipped / failed (counts derivable via length)", async () => {
     // postgres_data clones; cache's source is absent (intentional skip).
     vi.mocked(composeModule.readComposeFile).mockReturnValue(
       composeFixture({ postgres_data: null, cache: null })
     )
     vi.mocked(volumeModule.volumeExists).mockImplementation((name) => name !== "source_proj_cache")
     const result = await run()
-    expect(result).toEqual({ copied: 1, skipped: 1, failed: 0 })
+    expect(result).toEqual({
+      cloned: ["postgres_data"],
+      skipped: [{ name: "cache", reason: "source volume does not exist yet" }],
+      failed: [],
+    })
+  })
+
+  it("records a per-volume skip reason when the target volume already has data", async () => {
+    vi.mocked(volumeModule.getVolumeSize).mockImplementation((name) =>
+      name === "target_proj_postgres_data" ? 1024 : 0
+    )
+    const result = await run(false)
+    expect(result.skipped).toEqual([
+      { name: "postgres_data", reason: "target volume already has data" },
+    ])
+    expect(result.cloned).toEqual([])
+    expect(result.failed).toEqual([])
+  })
+
+  it("records the --no-stop skip reason for an in-use source volume", async () => {
+    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue(["pg-main"])
+    const result = await run(false, baseConfig(), false)
+    expect(result.skipped).toEqual([
+      {
+        name: "postgres_data",
+        reason: "source volume is in use by a running container (--no-stop)",
+      },
+    ])
   })
 
   it("respects volumes.exclude", async () => {

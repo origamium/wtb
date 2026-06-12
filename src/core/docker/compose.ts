@@ -9,6 +9,7 @@ import { parse, stringify } from "yaml"
 import { COMPOSE_FILE_NAMES, FILE_ENCODING, PORT_RANGE } from "../../constants/index.js"
 import type { ComposeConfig, FileOperationOptions } from "../../types/index.js"
 import { execDockerSafe } from "../../utils/exec.js"
+import { out } from "../../utils/output.js"
 
 /**
  * Docker Composeファイルを読み込んでパース
@@ -87,7 +88,7 @@ export function writeComposeFile(
     if (options?.createBackup && existsSync(filePath)) {
       const backupPath = `${filePath}.backup`
       fs.copyFileSync(filePath, backupPath)
-      console.log(`📋 Created backup: ${backupPath}`)
+      out(`📋 Created backup: ${backupPath}`)
     }
 
     const yamlContent = stringify(config, {
@@ -100,7 +101,7 @@ export function writeComposeFile(
       encoding: options?.encoding || FILE_ENCODING,
     })
 
-    console.log(`📄 Wrote Docker Compose file: ${filePath}`)
+    out(`📄 Wrote Docker Compose file: ${filePath}`)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new Error(`Failed to write Docker Compose file: ${message}`)

@@ -14,6 +14,7 @@ import {
   adjustPortsInCompose,
   composeStart,
   composeStop,
+  parsePortMapping,
   readComposeFile,
   resolveComposeProjectName,
   writeComposeFile,
@@ -26,12 +27,22 @@ import {
   resolveVolumeName,
   volumeExists,
 } from "../../core/docker/volume.js"
-import { copyAndAdjustEnvFile, parseEnvFile } from "../../core/environment/processor.js"
-import { branchExists, getGitRootOrThrow } from "../../core/git/repository.js"
+import {
+  copyAndAdjustEnvFile,
+  type EnvAdjustmentChange,
+  parseEnvFile,
+} from "../../core/environment/processor.js"
+import {
+  branchExists,
+  getGitRootOrThrow,
+  remoteBranchExists,
+  revisionExists,
+} from "../../core/git/repository.js"
 import { createWorktree, getWorktreePath, listWorktrees } from "../../core/git/worktree.js"
 import type { WtbConfig } from "../../types/index.js"
 import { CLIError, getErrorMessage } from "../../utils/error.js"
 import { executeLifecycleCommand } from "../../utils/exec.js"
+import { out, setJsonOutputMode } from "../../utils/output.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
 import { createVolumeCopyProgressHandler } from "../utils/progress.js"
 
@@ -49,20 +60,32 @@ interface CreateOptions {
   seed?: boolean
   strict?: boolean
   dryRun?: boolean
+  existsOk?: boolean
+  json?: boolean
 }
 
+/** `wtb create --json` / `wtb reclone --json` で報告する host ポートの remap。 */
+export type ComposePortChanges = Record<string, Array<{ from: number; to: number }>>
+
 /**
- * setupVolumeCopy の結果サマリ。
- * - copied: 正常にクローンできた volume 数
- * - skipped: 意図的に skip した数 (external / source 不在 / target にデータあり /
- *   --no-stop で稼働中 / 停止後も別 project が使用中)
- * - failed: copyVolume が例外を投げた数 (= データ分離が未達成)。これが 1 以上なら
- *   worktree は作成されてもデータ的に半端な状態なので、呼び出し側で明示的に surface する。
+ * setupVolumeCopy の per-volume 結果。
+ * - cloned: 正常にクローンできた volume の compose key 一覧
+ * - skipped: 意図的に skip した volume と理由 (external / source 不在 /
+ *   target にデータあり / --no-stop で稼働中 / 停止後も別 project が使用中)
+ * - failed: copyVolume が例外を投げた volume とエラー (= データ分離が未達成)。
+ *   1 件以上なら worktree は作成されてもデータ的に半端な状態なので、呼び出し側で
+ *   明示的に surface する。
+ * 件数は各配列の length から導出する (旧 copied/skipped/failed カウント)。
  */
 export interface VolumeCopyResult {
-  copied: number
-  skipped: number
-  failed: number
+  cloned: string[]
+  skipped: Array<{ name: string; reason: string }>
+  failed: Array<{ name: string; error: string }>
+}
+
+/** 空の VolumeCopyResult を生成する (共有 mutable 定数を避けるためのファクトリ)。 */
+export function emptyVolumeCopyResult(): VolumeCopyResult {
+  return { cloned: [], skipped: [], failed: [] }
 }
 
 /**
@@ -74,7 +97,10 @@ export function createCommand(): Command {
     .argument("<branch>", "Branch name to create worktree for")
     .option("-p, --path <path>", "Custom path for the worktree")
     .option("--no-create-branch", "Use existing branch instead of creating new one")
-    .option("--no-docker", "Skip Docker Compose setup")
+    .option(
+      "--no-docker",
+      "Skip Docker Compose copy/port-remap (also skips volume cloning — the worktree starts with empty volumes)"
+    )
     .option("--no-env", "Skip environment file processing")
     .option("--no-copy", "Skip file copying")
     .option("--no-link", "Skip symlink creation")
@@ -96,6 +122,14 @@ export function createCommand(): Command {
       "--strict",
       "Exit non-zero (1) if any volume clone or the seed command fails (default: exit 0 — the worktree still exists). Use in CI / coding-agent pipelines that must detect incomplete data isolation."
     )
+    .option(
+      "--exists-ok",
+      "If a worktree for the branch already exists, print its path and exit 0 instead of failing"
+    )
+    .option(
+      "--json",
+      "Output one machine-readable JSON result on stdout (human progress goes to stderr)"
+    )
     .option("--dry-run", "Show what would be done without making changes")
     .action(withErrorHandling(executeCreateCommand))
 }
@@ -104,14 +138,34 @@ export function createCommand(): Command {
  * createコマンドのメイン実行ロジック
  */
 async function executeCreateCommand(branch: string, options: CreateOptions): Promise<void> {
+  // モジュール状態なので毎回明示的に設定する (前回実行のモードを引き継がない)。
+  const json = options.json === true
+  setJsonOutputMode(json)
+
   const gitRoot = getGitRootOrThrow()
 
   // 既存のworktreeチェック
   const existingPath = getWorktreePath(branch)
   if (existingPath) {
+    if (options.existsOk === true) {
+      // 冪等な "ensure worktree exists" 経路: 何も触らず exit 0 で返す。
+      out(`ℹ️  Worktree for branch '${branch}' already exists at: ${existingPath} (--exists-ok)`)
+      if (json) {
+        writeJsonResult({
+          branch,
+          path: existingPath,
+          created: false,
+          existing: true,
+          createdBranch: false,
+          dryRun: options.dryRun === true,
+          ok: true,
+        })
+      }
+      return
+    }
     throw new CLIError(
       `Worktree for branch '${branch}' already exists at: ${existingPath}`,
-      EXIT_CODES.GENERAL_ERROR
+      EXIT_CODES.WORKTREE_EXISTS
     )
   }
 
@@ -134,12 +188,12 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
   const dryRun = options.dryRun === true
 
   if (dryRun) {
-    console.log("🔍 Dry run mode — no changes will be made")
-    console.log("")
+    out("🔍 Dry run mode — no changes will be made")
+    out("")
   }
 
-  console.log(`🌿 Creating worktree for branch: ${branch}`)
-  console.log(`📂 Worktree path: ${worktreePath}`)
+  out(`🌿 Creating worktree for branch: ${branch}`)
+  out(`📂 Worktree path: ${worktreePath}`)
 
   // ブランチが既に存在するかチェック
   const branchAlreadyExists = branchExists(branch)
@@ -153,10 +207,20 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
   }
 
   const useExistingBranch = branchAlreadyExists || options.createBranch === false
+
+  // ローカルには無いが origin には存在するブランチ (teammate の push 済みブランチ等) を
+  // base_branch から新規作成して黙って shadow しない。origin/<branch> から
+  // トラッキングブランチを作る (素の `git worktree add` の DWIM と同等の挙動)。
+  const trackRemoteBranch = !useExistingBranch && remoteBranchExists(branch)
+
   if (useExistingBranch) {
-    console.log(`ℹ️  Branch '${branch}' already exists, using existing branch`)
+    out(`ℹ️  Branch '${branch}' already exists, using existing branch`)
+  } else if (trackRemoteBranch) {
+    out(
+      `ℹ️  Branch '${branch}' exists on origin — creating local tracking branch from origin/${branch}`
+    )
   } else {
-    console.log(`✨ Creating new branch: ${branch}`)
+    out(`✨ Creating new branch: ${branch}`)
   }
 
   // 設定ファイルを先に読み込み（base_branch を worktree 作成前に取得するため）
@@ -179,15 +243,34 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
     }
   }
 
+  // 新規ブランチを base_branch から切る場合は、base_branch が解決できることを先に検証する。
+  // branchExists は refs/heads/ しか見ないので、タグ/SHA/remote ref も許容する
+  // rev-parse --verify <base>^{commit} ベースの revisionExists を使う。
+  // 検証しないと `git worktree add` の奥で生の git エラーになり、wtb のデフォルト
+  // base_branch ('main') が原因だと気付けない (default branch が 'master' のリポジトリ等)。
+  if (!useExistingBranch && !trackRemoteBranch && !revisionExists(config.base_branch)) {
+    throw new CLIError(
+      `base_branch '${config.base_branch}' does not resolve in this repository. wtb defaults to 'main' when no wtb.yaml is present — set base_branch in wtb.yaml (e.g. 'master').`,
+      EXIT_CODES.GENERAL_ERROR
+    )
+  }
+
   // worktreeを作成（新規ブランチの場合は base_branch を使用）
   if (dryRun) {
-    console.log(`  [dry-run] Would create worktree at ${worktreePath}`)
+    out(`  [dry-run] Would create worktree at ${worktreePath}`)
   } else {
     createWorktree(branch, worktreePath, {
       useExistingBranch,
-      baseBranch: useExistingBranch ? undefined : config.base_branch,
+      baseBranch: useExistingBranch || trackRemoteBranch ? undefined : config.base_branch,
+      trackFrom: trackRemoteBranch ? `origin/${branch}` : undefined,
     })
   }
+
+  // --json 用の各 phase の結果トラッカー
+  let envChanges: Record<string, { from: string; to: string }> = {}
+  let composePorts: ComposePortChanges = {}
+  let volumeResult: VolumeCopyResult = emptyVolumeCopyResult()
+  let startCommandFailed = false
 
   // link_files に含まれるパスはコピーをスキップしてシンボリックリンクを優先する
   const linkFileSet = new Set(config.link_files ?? [])
@@ -195,13 +278,13 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
 
   // File copying phase
   if (filesToCopy.length > 0) {
-    console.log("")
+    out("")
     if (skipCopy) {
-      console.log("⏭️  Skipping file copy (--no-copy)")
+      out("⏭️  Skipping file copy (--no-copy)")
     } else if (dryRun) {
-      console.log(`📋 Would copy files: ${filesToCopy.join(", ")}`)
+      out(`📋 Would copy files: ${filesToCopy.join(", ")}`)
     } else {
-      console.log("📋 Copying files/directories...")
+      out("📋 Copying files/directories...")
       await copyConfiguredFiles(gitRoot, worktreePath, filesToCopy)
     }
   }
@@ -209,50 +292,48 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
   // Symlink phase
   const linkFiles = config.link_files ?? []
   if (linkFiles.length > 0) {
-    console.log("")
+    out("")
     if (skipLink) {
-      console.log("⏭️  Skipping symlink creation (--no-link)")
+      out("⏭️  Skipping symlink creation (--no-link)")
     } else if (dryRun) {
-      console.log(`🔗 Would create symlinks: ${linkFiles.join(", ")}`)
+      out(`🔗 Would create symlinks: ${linkFiles.join(", ")}`)
     } else {
-      console.log("🔗 Creating symlinks...")
+      out("🔗 Creating symlinks...")
       await linkConfiguredFiles(gitRoot, worktreePath, linkFiles)
     }
   }
 
   // Environment file phase
   if (config.env.file.length > 0) {
-    console.log("")
+    out("")
     if (skipEnv) {
-      console.log("⏭️  Skipping environment file processing (--no-env)")
+      out("⏭️  Skipping environment file processing (--no-env)")
     } else if (dryRun) {
       const mode = Object.keys(config.env.adjust).length > 0 ? "adjust" : "copy"
-      console.log(`🔧 Would process environment files (${mode}): ${config.env.file.join(", ")}`)
+      out(`🔧 Would process environment files (${mode}): ${config.env.file.join(", ")}`)
     } else if (Object.keys(config.env.adjust).length > 0) {
-      console.log("🔧 Adjusting environment files...")
-      await applyEnvAdjustments(gitRoot, worktreePath, config)
+      out("🔧 Adjusting environment files...")
+      envChanges = await applyEnvAdjustments(gitRoot, worktreePath, config)
     } else {
-      console.log("📋 Copying environment files...")
+      out("📋 Copying environment files...")
       await copyConfiguredFiles(gitRoot, worktreePath, config.env.file)
     }
   }
 
   // Docker Compose phase
   if (config.docker_compose_file) {
-    console.log("")
+    out("")
     if (skipDocker) {
-      console.log("⏭️  Skipping Docker Compose setup (--no-docker)")
+      out("⏭️  Skipping Docker Compose setup (--no-docker)")
     } else if (dryRun) {
       const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
       if (existsSync(sourceComposePath)) {
-        console.log(`🐳 Would configure Docker Compose: ${config.docker_compose_file}`)
+        out(`🐳 Would configure Docker Compose: ${config.docker_compose_file}`)
       } else {
-        console.log(
-          `⚠️  Docker Compose source not found: ${config.docker_compose_file} (would skip)`
-        )
+        out(`⚠️  Docker Compose source not found: ${config.docker_compose_file} (would skip)`)
       }
     } else {
-      await setupDockerCompose(gitRoot, worktreePath, config)
+      composePorts = await setupDockerCompose(gitRoot, worktreePath, config)
     }
   }
 
@@ -263,89 +344,121 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
   let seedFailed = false
   if (useSeed) {
     // seedCommand is guaranteed non-empty here (validated above).
-    console.log("")
+    out("")
     if (dryRun) {
-      console.log(`🌱 Would seed data instead of cloning volumes: ${seedCommand}`)
+      out(`🌱 Would seed data instead of cloning volumes: ${seedCommand}`)
     } else {
-      console.log(`🌱 Seeding data instead of cloning volumes: ${seedCommand}`)
+      out(`🌱 Seeding data instead of cloning volumes: ${seedCommand}`)
       seedFailed = !(await executeSeedCommand(seedCommand as string, worktreePath))
     }
   } else if (config.docker_compose_file && !skipDocker) {
-    console.log("")
+    out("")
     if (skipVolumeCopy) {
-      console.log("⏭️  Skipping volume clone (--no-volume-copy)")
+      out("⏭️  Skipping volume clone (--no-volume-copy)")
     } else if (dryRun) {
       previewVolumeCopy(gitRoot, config)
     } else {
-      const volumeResult = await setupVolumeCopy(gitRoot, worktreePath, config, {
+      volumeResult = await setupVolumeCopy(gitRoot, worktreePath, config, {
         force: forceVolumeCopy,
         stop: options.stop,
       })
-      volumeFailures = volumeResult.failed
+      volumeFailures = volumeResult.failed.length
     }
   }
 
   // start_command phase
   if (config.start_command) {
-    console.log("")
+    out("")
     if (skipStart) {
-      console.log("⏭️  Skipping start command (--no-start)")
+      out("⏭️  Skipping start command (--no-start)")
     } else if (dryRun) {
-      console.log(`🚀 Would run start command: ${config.start_command}`)
+      out(`🚀 Would run start command: ${config.start_command}`)
     } else {
-      console.log(`🚀 Running start command: ${config.start_command}`)
-      await executeStartCommand(config.start_command, worktreePath)
+      out(`🚀 Running start command: ${config.start_command}`)
+      startCommandFailed = !(await executeStartCommand(config.start_command, worktreePath))
     }
   }
 
   // 成功メッセージ
-  console.log("")
+  out("")
   if (dryRun) {
-    console.log("🔍 Dry run complete — no changes were made")
+    out("🔍 Dry run complete — no changes were made")
   } else {
     if (volumeFailures > 0) {
       // worktree itself is created, but its data isolation is incomplete. Make this
       // loud and machine-parsable so an autonomous agent doesn't treat it as clean.
-      console.log(
+      out(
         `⚠️  Worktree created, but ${volumeFailures} volume(s) FAILED to clone — this worktree's data is NOT fully isolated. See the errors above; re-run the clone after resolving them.`
       )
     } else if (seedFailed) {
       // Same contract as a volume-clone failure: worktree exists but its data is
       // not ready. Keep the signal loud and machine-parsable for autonomous agents.
-      console.log(
+      out(
         "⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready. See the error above; re-run the seed in the worktree after resolving it."
       )
     } else {
-      console.log("🎉 Worktree created successfully!")
+      out("🎉 Worktree created successfully!")
     }
-    console.log("")
-    console.log("Next steps:")
-    console.log(`  cd ${worktreePath}`)
-    console.log("  # Start working on your branch")
+    out("")
+    out("Next steps:")
+    out(`  cd ${worktreePath}`)
+    out("  wtb ports --pretty   # see this worktree's assigned ports")
+    out("  # Start working on your branch")
 
-    console.log("")
-    console.log("📋 Current worktrees:")
+    out("")
+    out("📋 Current worktrees:")
     const worktrees = listWorktrees()
     for (const wt of worktrees) {
       const isNew = wt.branch === branch
-      console.log(`  ${isNew ? "→" : " "} ${wt.branch}: ${wt.path}`)
+      out(`  ${isNew ? "→" : " "} ${wt.branch}: ${wt.path}`)
     }
 
     // Claude Code skill 未導入なら案内を 1 行だけ出す
     if (!existsSync(path.join(gitRoot, ".claude", "skills", "wtb"))) {
-      console.log("")
-      console.log(
-        '💡 Tip: Run "wtb init-claude" to let Claude Code auto-detect this worktree\'s ports.'
-      )
+      out("")
+      out('💡 Tip: Run "wtb init-claude" to let Claude Code auto-detect this worktree\'s ports.')
     }
+  }
+
+  // --json: stdout には JSON オブジェクトを 1 つだけ出力する (人間向け出力は stderr 済み)。
+  if (json) {
+    writeJsonResult({
+      branch,
+      path: worktreePath,
+      created: !dryRun,
+      existing: false,
+      createdBranch: !dryRun && !useExistingBranch,
+      dryRun,
+      env: envChanges,
+      composePorts,
+      volumes: volumeResult,
+      seed: useSeed ? { ran: !dryRun, failed: seedFailed } : null,
+      startCommand: config.start_command
+        ? { ran: !dryRun && !skipStart, failed: startCommandFailed }
+        : null,
+      ok: volumeFailures === 0 && !seedFailed,
+    })
   }
 
   // --strict: worktree は作成済みでも、データ分離が未達成 (volume クローン失敗 / seed 失敗)
   // なら非ゼロ終了する。既定 (exit 0) は「worktree は存在する」契約を維持しつつ、CI や
   // コーディングエージェントが失敗を確実に検知できるオプトインの経路を提供する。
+  // JSON モードでは payload を書き切ってから exitCode のみ設定する (prune と同じ理由:
+  // 即 process.exit すると stdout の flush 前に落ちて JSON が壊れる恐れがある)。
   if (!dryRun && options.strict === true && (volumeFailures > 0 || seedFailed)) {
-    process.exit(EXIT_CODES.GENERAL_ERROR)
+    if (json) {
+      process.exitCode = EXIT_CODES.GENERAL_ERROR
+    } else {
+      process.exit(EXIT_CODES.GENERAL_ERROR)
+    }
   }
+}
+
+/**
+ * --json 用の機械可読な結果オブジェクトを stdout に 1 つだけ書き込む。
+ */
+function writeJsonResult(payload: Record<string, unknown>): void {
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`)
 }
 
 /**
@@ -361,7 +474,7 @@ async function copyConfiguredFiles(
     const targetPath = path.resolve(targetRoot, relativePath)
 
     if (!existsSync(sourcePath)) {
-      console.log(`  ⚠️  Skip (not found): ${relativePath}`)
+      out(`  ⚠️  Skip (not found): ${relativePath}`)
       continue
     }
 
@@ -370,14 +483,14 @@ async function copyConfiguredFiles(
 
       if (stat.isDirectory()) {
         await fs.copy(sourcePath, targetPath, { overwrite: true })
-        console.log(`  ✅ Copied directory: ${relativePath}`)
+        out(`  ✅ Copied directory: ${relativePath}`)
       } else {
         await fs.ensureDir(path.dirname(targetPath))
         await fs.copy(sourcePath, targetPath, { overwrite: true })
-        console.log(`  ✅ Copied file: ${relativePath}`)
+        out(`  ✅ Copied file: ${relativePath}`)
       }
     } catch (error) {
-      console.log(`  ❌ Failed to copy ${relativePath}: ${getErrorMessage(error)}`)
+      out(`  ❌ Failed to copy ${relativePath}: ${getErrorMessage(error)}`)
     }
   }
 }
@@ -395,7 +508,7 @@ async function linkConfiguredFiles(
     const targetPath = path.resolve(targetRoot, relativePath)
 
     if (!existsSync(sourcePath)) {
-      console.log(`  ⚠️  Skip (not found): ${relativePath}`)
+      out(`  ⚠️  Skip (not found): ${relativePath}`)
       continue
     }
 
@@ -415,48 +528,52 @@ async function linkConfiguredFiles(
         try {
           targetStat = lstatSync(targetPath)
         } catch {
-          console.log(`  ❌ Failed to stat target ${relativePath}: cannot read target`)
+          out(`  ❌ Failed to stat target ${relativePath}: cannot read target`)
           continue
         }
 
         if (targetStat.isSymbolicLink()) {
           const currentLink = readlinkSync(targetPath)
           if (currentLink === sourcePath) {
-            console.log(`  ✅ Symlink already correct: ${relativePath}`)
+            out(`  ✅ Symlink already correct: ${relativePath}`)
             continue
           }
           await fs.remove(targetPath)
-          console.log(`  🔄 Replacing symlink (was → ${currentLink}): ${relativePath}`)
+          out(`  🔄 Replacing symlink (was → ${currentLink}): ${relativePath}`)
         } else if (targetStat.isDirectory()) {
           await fs.remove(targetPath)
-          console.log(`  🔄 Replacing existing directory with symlink: ${relativePath}`)
+          out(`  🔄 Replacing existing directory with symlink: ${relativePath}`)
         } else {
           await fs.remove(targetPath)
-          console.log(`  🔄 Replacing existing file with symlink: ${relativePath}`)
+          out(`  🔄 Replacing existing file with symlink: ${relativePath}`)
         }
       }
 
       symlinkSync(sourcePath, targetPath)
-      console.log(`  ✅ Symlinked: ${relativePath} → ${sourcePath}`)
+      out(`  ✅ Symlinked: ${relativePath} → ${sourcePath}`)
     } catch (error) {
-      console.log(`  ❌ Failed to symlink ${relativePath}: ${getErrorMessage(error)}`)
+      out(`  ❌ Failed to symlink ${relativePath}: ${getErrorMessage(error)}`)
     }
   }
 }
 
 /**
  * start_commandを実行
+ *
+ * @returns 成功したか (失敗しても worktree 作成自体は続行する)
  */
-async function executeStartCommand(command: string, worktreePath: string): Promise<void> {
+async function executeStartCommand(command: string, worktreePath: string): Promise<boolean> {
   try {
     const commandPath = path.resolve(worktreePath, command)
     const actualCommand = existsSync(commandPath) ? commandPath : command
 
     executeLifecycleCommand(actualCommand, worktreePath)
-    console.log("  ✅ Start command completed successfully")
+    out("  ✅ Start command completed successfully")
+    return true
   } catch (error) {
-    console.log(`  ⚠️  Start command failed: ${getErrorMessage(error)}`)
-    console.log("  (Worktree was created, but start command had issues)")
+    out(`  ⚠️  Start command failed: ${getErrorMessage(error)}`)
+    out("  (Worktree was created, but start command had issues)")
+    return false
   }
 }
 
@@ -474,10 +591,10 @@ async function executeSeedCommand(command: string, worktreePath: string): Promis
     const actualCommand = existsSync(commandPath) ? commandPath : command
 
     executeLifecycleCommand(actualCommand, worktreePath)
-    console.log("  ✅ Seed command completed successfully")
+    out("  ✅ Seed command completed successfully")
     return true
   } catch (error) {
-    console.log(`  ❌ Seed command failed: ${getErrorMessage(error)}`)
+    out(`  ❌ Seed command failed: ${getErrorMessage(error)}`)
     return false
   }
 }
@@ -485,27 +602,30 @@ async function executeSeedCommand(command: string, worktreePath: string): Promis
 /**
  * Docker Compose ファイルをworktreeにコピーし、ポートを調整する
  * Docker が利用できない場合は無調整でコピーする
+ *
+ * @returns サービスごとの host ポート remap (original → adjusted)。調整なし/スキップ時は空。
  */
 async function setupDockerCompose(
   gitRoot: string,
   worktreePath: string,
   config: WtbConfig
-): Promise<void> {
-  if (!config.docker_compose_file) return
+): Promise<ComposePortChanges> {
+  const portChanges: ComposePortChanges = {}
+  if (!config.docker_compose_file) return portChanges
 
   const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
   if (!existsSync(sourceComposePath)) {
-    console.log(`⚠️  Docker Compose source not found: ${config.docker_compose_file} (skipped)`)
-    return
+    out(`⚠️  Docker Compose source not found: ${config.docker_compose_file} (skipped)`)
+    return portChanges
   }
 
   const targetComposePath = path.resolve(worktreePath, config.docker_compose_file)
 
   // ターゲットに既にファイルが存在する場合はスキップ（start_command 等でコピー済みの場合）
-  if (existsSync(targetComposePath)) return
+  if (existsSync(targetComposePath)) return portChanges
 
   try {
-    console.log("🐳 Configuring Docker Compose...")
+    out("🐳 Configuring Docker Compose...")
 
     const composeConfig = readComposeFile(sourceComposePath)
 
@@ -521,15 +641,40 @@ async function setupDockerCompose(
     const adjustedConfig = adjustPortsInCompose(composeConfig, usedPorts)
     await fs.ensureDir(path.dirname(targetComposePath))
     writeComposeFile(targetComposePath, adjustedConfig)
-    console.log(`  ✅ Docker Compose file configured: ${config.docker_compose_file}`)
+    out(`  ✅ Docker Compose file configured: ${config.docker_compose_file}`)
+
+    // どの host ポートがどこへ remap されたかをサービス単位で表示・収集する。
+    // adjustPortsInCompose は ports 配列の順序を保つので index で突き合わせる。
+    for (const [serviceName, service] of Object.entries(composeConfig.services ?? {})) {
+      const originalPorts = service.ports
+      const adjustedPorts = adjustedConfig.services?.[serviceName]?.ports
+      if (!Array.isArray(originalPorts) || !Array.isArray(adjustedPorts)) continue
+      for (const [index, original] of originalPorts.entries()) {
+        const adjusted = adjustedPorts[index]
+        if (typeof original !== "string" || typeof adjusted !== "string") continue
+        const originalParsed = parsePortMapping(original)
+        const adjustedParsed = parsePortMapping(adjusted)
+        if (!originalParsed || !adjustedParsed) continue
+        if (originalParsed.hostPort === adjustedParsed.hostPort) continue
+        if (!portChanges[serviceName]) {
+          portChanges[serviceName] = []
+        }
+        portChanges[serviceName].push({
+          from: originalParsed.hostPort,
+          to: adjustedParsed.hostPort,
+        })
+        out(`     ${serviceName}: ${originalParsed.hostPort} → ${adjustedParsed.hostPort}`)
+      }
+    }
 
     // start_command がない場合は使い方を提案
     if (!config.start_command) {
-      console.log("  ℹ️  Tip: Run 'docker compose up -d' in the worktree to start services")
+      out("  ℹ️  Tip: Run 'docker compose up -d' in the worktree to start services")
     }
   } catch (error) {
-    console.log(`  ⚠️  Docker Compose setup skipped: ${getErrorMessage(error)}`)
+    out(`  ⚠️  Docker Compose setup skipped: ${getErrorMessage(error)}`)
   }
+  return portChanges
 }
 
 /**
@@ -540,25 +685,25 @@ export function previewVolumeCopy(gitRoot: string, config: WtbConfig): void {
   if (!config.docker_compose_file) return
   const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
   if (!existsSync(sourceComposePath)) {
-    console.log("📦 Would clone Docker volumes — but compose file not found, skipping")
+    out("📦 Would clone Docker volumes — but compose file not found, skipping")
     return
   }
   let composeConfig: ReturnType<typeof readComposeFile>
   try {
     composeConfig = readComposeFile(sourceComposePath)
   } catch {
-    console.log("📦 Would clone Docker volumes — but compose file unreadable, skipping")
+    out("📦 Would clone Docker volumes — but compose file unreadable, skipping")
     return
   }
   const exclude = config.volumes?.exclude ?? []
   const cloneable = discoverCloneableVolumes(composeConfig, exclude)
   if (cloneable.length === 0) {
-    console.log("📦 No volumes to clone (none defined in compose, all external, or all excluded)")
+    out("📦 No volumes to clone (none defined in compose, all external, or all excluded)")
     return
   }
-  console.log(`📦 Would clone ${cloneable.length} volume(s):`)
+  out(`📦 Would clone ${cloneable.length} volume(s):`)
   for (const key of cloneable) {
-    console.log(`    - ${key}`)
+    out(`    - ${key}`)
   }
 }
 
@@ -579,24 +724,23 @@ export async function setupVolumeCopy(
   config: WtbConfig,
   options: { force?: boolean; stop?: boolean }
 ): Promise<VolumeCopyResult> {
-  const NONE: VolumeCopyResult = { copied: 0, skipped: 0, failed: 0 }
-  if (!config.docker_compose_file) return NONE
+  if (!config.docker_compose_file) return emptyVolumeCopyResult()
 
   const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
-  if (!existsSync(sourceComposePath)) return NONE
+  if (!existsSync(sourceComposePath)) return emptyVolumeCopyResult()
 
   let composeConfig: ReturnType<typeof readComposeFile>
   try {
     composeConfig = readComposeFile(sourceComposePath)
   } catch (error) {
-    console.log(`📦 Volume clone skipped: cannot read compose file (${getErrorMessage(error)})`)
-    return NONE
+    out(`📦 Volume clone skipped: cannot read compose file (${getErrorMessage(error)})`)
+    return emptyVolumeCopyResult()
   }
 
   const exclude = config.volumes?.exclude ?? []
   const cloneable = discoverCloneableVolumes(composeConfig, exclude)
   if (cloneable.length === 0) {
-    return NONE // nothing to copy — silent
+    return emptyVolumeCopyResult() // nothing to copy — silent
   }
 
   // Compose の実際のプロジェクト名 (compose-spec 準拠) を解決する。
@@ -605,7 +749,7 @@ export async function setupVolumeCopy(
   // (underscore や dot をダッシュに置換) ため、ここでは使えない。
   const sourceProject = resolveComposeProjectName(composeConfig, gitRoot)
   const targetProject = resolveComposeProjectName(composeConfig, worktreePath)
-  console.log("📦 Cloning Docker volumes...")
+  out("📦 Cloning Docker volumes...")
 
   // stop-then-copy: source volume を使う稼働中コンテナがあり、--no-stop でも
   // --force-volume-copy でもなければ、source スタックを停止してから安全にコピーし、
@@ -630,7 +774,7 @@ export async function setupVolumeCopy(
       )
     })
     if (anyInUse) {
-      console.log(
+      out(
         "  ⏸️  Source Compose stack is running — stopping it to clone volumes safely (will restart after)..."
       )
       try {
@@ -647,16 +791,14 @@ export async function setupVolumeCopy(
           process.prependListener(sig, restartOnAbort)
         }
       } catch (error) {
-        console.log(
+        out(
           `  ⚠️  Could not stop source stack (${getErrorMessage(error)}) — falling back to per-volume skip`
         )
       }
     }
   }
 
-  let copiedCount = 0
-  let skippedCount = 0
-  let failedCount = 0
+  const result = emptyVolumeCopyResult()
 
   try {
     for (const key of cloneable) {
@@ -673,8 +815,8 @@ export async function setupVolumeCopy(
 
       // source 存在チェック
       if (!volumeExists(source.name)) {
-        console.log(`  ℹ️  ${key}: source volume '${source.name}' does not exist yet — skipping`)
-        skippedCount++
+        out(`  ℹ️  ${key}: source volume '${source.name}' does not exist yet — skipping`)
+        result.skipped.push({ name: key, reason: "source volume does not exist yet" })
         continue
       }
 
@@ -685,15 +827,20 @@ export async function setupVolumeCopy(
       if (!options.force) {
         const usingContainers = getContainersUsingVolume(source.name)
         if (usingContainers.length > 0) {
-          console.log(
+          out(
             `  ⚠️  ${key}: source volume '${source.name}' is in use by ${usingContainers.join(", ")}`
           )
-          console.log(
+          out(
             stoppedStack
               ? "      → skipping: still in use after stopping the source stack (likely held by another Compose project sharing this named volume) — stop that side or pass --force-volume-copy"
               : "      → skipping (--no-stop set; stop the source stack manually, drop --no-stop to auto stop-then-copy, or pass --force-volume-copy to clone live with data-corruption risk)"
           )
-          skippedCount++
+          result.skipped.push({
+            name: key,
+            reason: stoppedStack
+              ? "still in use after stopping the source stack"
+              : "source volume is in use by a running container (--no-stop)",
+          })
           continue
         }
       }
@@ -711,8 +858,14 @@ export async function setupVolumeCopy(
               targetSize === null
                 ? "size could not be determined — skipping (use --force-volume-copy to overwrite anyway)"
                 : "already has data — skipping (use --force-volume-copy to overwrite)"
-            console.log(`  ⚠️  ${key}: target volume '${target.name}' ${reason}`)
-            skippedCount++
+            out(`  ⚠️  ${key}: target volume '${target.name}' ${reason}`)
+            result.skipped.push({
+              name: key,
+              reason:
+                targetSize === null
+                  ? "target volume size could not be determined"
+                  : "target volume already has data",
+            })
             continue
           }
           // force=true: 既存データを上書きする。clearTarget=true を渡すと copyVolume が
@@ -727,16 +880,16 @@ export async function setupVolumeCopy(
           onProgress: createVolumeCopyProgressHandler(`  📦 ${key}`),
           clearTarget: targetHadData,
         })
-        console.log(`  ✅ Cloned ${source.name} → ${target.name}`)
-        copiedCount++
+        out(`  ✅ Cloned ${source.name} → ${target.name}`)
+        result.cloned.push(key)
       } catch (error) {
-        console.log(`  ❌ Failed to clone ${key}: ${getErrorMessage(error)}`)
-        failedCount++
+        out(`  ❌ Failed to clone ${key}: ${getErrorMessage(error)}`)
+        result.failed.push({ name: key, error: getErrorMessage(error) })
       }
     }
 
-    console.log(
-      `  → ${copiedCount} volume(s) cloned, ${skippedCount} skipped, ${failedCount} failed`
+    out(
+      `  → ${result.cloned.length} volume(s) cloned, ${result.skipped.length} skipped, ${result.failed.length} failed`
     )
   } finally {
     if (restartOnAbort) {
@@ -745,20 +898,20 @@ export async function setupVolumeCopy(
       }
     }
     if (stoppedStack) {
-      console.log("  ▶️  Restarting source Compose stack...")
+      out("  ▶️  Restarting source Compose stack...")
       try {
         composeStart(sourceComposePath, sourceProject, gitRoot)
-        console.log("  ✅ Source stack restarted")
+        out("  ✅ Source stack restarted")
       } catch (error) {
-        console.log(`  ⚠️  Failed to restart source stack: ${getErrorMessage(error)}`)
-        console.log(
+        out(`  ⚠️  Failed to restart source stack: ${getErrorMessage(error)}`)
+        out(
           "     Bring it back up manually: 'docker compose start' (or 'up -d') in the source repo."
         )
       }
     }
   }
 
-  return { copied: copiedCount, skipped: skippedCount, failed: failedCount }
+  return result
 }
 
 /**
@@ -818,36 +971,47 @@ function collectWorktreeEnvPorts(targetRoot: string, config: WtbConfig): number[
 
 /**
  * env.fileに記載された環境変数ファイルをworktreeにコピーしenv.adjustを適用
+ *
+ * @returns 変更されたキーごとの from/to (例: APP_PORT: 3000 → 3001)。--json の env フィールドにも使う。
  */
 async function applyEnvAdjustments(
   sourceRoot: string,
   targetRoot: string,
   config: WtbConfig
-): Promise<void> {
+): Promise<Record<string, { from: string; to: string }>> {
   // 他の全 worktree (main 含む) で使用中のポートを収集（衝突防止）
   const usedPorts = collectWorktreeEnvPorts(targetRoot, config)
+  const allChanges: Record<string, { from: string; to: string }> = {}
 
   for (const relativePath of config.env.file) {
     const sourcePath = path.resolve(sourceRoot, relativePath)
     const targetPath = path.resolve(targetRoot, relativePath)
 
     if (!existsSync(sourcePath)) {
-      console.log(`  ⚠️  Skip (not found): ${relativePath}`)
+      out(`  ⚠️  Skip (not found): ${relativePath}`)
       continue
     }
 
     try {
       await fs.ensureDir(path.dirname(targetPath))
+      const changes: EnvAdjustmentChange[] = []
       const adjustedCount = copyAndAdjustEnvFile(
         sourcePath,
         targetPath,
         config.env.adjust,
         undefined,
-        usedPorts
+        usedPorts,
+        changes
       )
-      console.log(`  ✅ Applied ${adjustedCount} adjustment(s): ${relativePath}`)
+      out(`  ✅ Applied ${adjustedCount} adjustment(s): ${relativePath}`)
+      for (const change of changes) {
+        out(`     ${change.key}: ${change.from} → ${change.to}`)
+        allChanges[change.key] = { from: change.from, to: change.to }
+      }
     } catch (error) {
-      console.log(`  ❌ Failed to adjust ${relativePath}: ${getErrorMessage(error)}`)
+      out(`  ❌ Failed to adjust ${relativePath}: ${getErrorMessage(error)}`)
     }
   }
+
+  return allChanges
 }

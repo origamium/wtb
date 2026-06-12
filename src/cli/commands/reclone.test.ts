@@ -44,7 +44,11 @@ describe("reclone command", () => {
       env: { file: [], adjust: {} },
       volumes: { exclude: [] },
     })
-    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({ copied: 1, skipped: 0, failed: 0 })
+    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({
+      cloned: ["postgres_data"],
+      skipped: [],
+      failed: [],
+    })
     // 既定では「別パス」(main repo ではない) として扱う。main repo ガードのテストだけ true に上書きする。
     // clearAllMocks は実装(mockReturnValue)をリセットしないため、ここで明示的に既定値を設定する。
     vi.mocked(worktreeModule.isSamePath).mockReturnValue(false)
@@ -60,6 +64,7 @@ describe("reclone command", () => {
     const flags = command.options.map((o) => o.flags)
     expect(flags).toContain("--force-volume-copy")
     expect(flags).toContain("--no-stop")
+    expect(flags).toContain("--json")
     expect(flags).toContain("--dry-run")
   })
 
@@ -79,7 +84,9 @@ describe("reclone command", () => {
 
   it("fails with exit 1 for an unknown branch", async () => {
     vi.mocked(worktreeModule.getWorktreePath).mockReturnValue(null)
-    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([])
+    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+      { path: "/project", branch: "main", head: "a" },
+    ])
     const exit = vi.spyOn(process, "exit").mockImplementation(() => {
       throw new Error("exit")
     })
@@ -87,6 +94,10 @@ describe("reclone command", () => {
     await expect(command.parseAsync(["nope"], { from: "user" })).rejects.toThrow("exit")
     expect(exit).toHaveBeenCalledWith(EXIT_CODES.GENERAL_ERROR)
     expect(createModule.setupVolumeCopy).not.toHaveBeenCalled()
+    // エラー診断の worktree 一覧は stderr に出し、stdout は汚さない
+    expect(errorSpy).toHaveBeenCalledWith("Available worktrees:")
+    expect(errorSpy).toHaveBeenCalledWith("  main: /project")
+    expect(logSpy).not.toHaveBeenCalledWith("Available worktrees:")
     exit.mockRestore()
   })
 
@@ -119,12 +130,21 @@ describe("reclone command", () => {
     await command.parseAsync(["feature/x"], { from: "user" })
 
     expect(createModule.setupVolumeCopy).not.toHaveBeenCalled()
-    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("No docker_compose_file configured"))
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("No docker_compose_file configured")
+    )
   })
 
   it("surfaces a NOT-isolated warning when a volume fails", async () => {
     vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
-    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({ copied: 0, skipped: 0, failed: 2 })
+    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({
+      cloned: [],
+      skipped: [],
+      failed: [
+        { name: "postgres_data", error: "boom" },
+        { name: "cache", error: "boom" },
+      ],
+    })
 
     await command.parseAsync(["feature/x"], { from: "user" })
 
@@ -133,7 +153,11 @@ describe("reclone command", () => {
 
   it("exits 0 by default even when a volume fails (worktree still exists)", async () => {
     vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
-    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({ copied: 0, skipped: 0, failed: 1 })
+    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({
+      cloned: [],
+      skipped: [],
+      failed: [{ name: "postgres_data", error: "boom" }],
+    })
     const exit = vi.spyOn(process, "exit").mockImplementation(() => {
       throw new Error("exit")
     })
@@ -146,7 +170,14 @@ describe("reclone command", () => {
 
   it("exits non-zero with --strict when a volume fails", async () => {
     vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
-    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({ copied: 0, skipped: 0, failed: 2 })
+    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({
+      cloned: [],
+      skipped: [],
+      failed: [
+        { name: "postgres_data", error: "boom" },
+        { name: "cache", error: "boom" },
+      ],
+    })
     const exit = vi.spyOn(process, "exit").mockImplementation(() => {
       throw new Error("exit")
     })
@@ -159,9 +190,59 @@ describe("reclone command", () => {
     exit.mockRestore()
   })
 
+  it("--json emits exactly one JSON object on stdout and routes progress to stderr", async () => {
+    vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
+    const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
+
+    await command.parseAsync(["feature/x", "--json"], { from: "user" })
+
+    expect(writeSpy).toHaveBeenCalledTimes(1)
+    const payload = JSON.parse(writeSpy.mock.calls[0][0] as string)
+    expect(payload).toEqual({
+      branch: "feature/x",
+      path: "/project-feature",
+      dryRun: false,
+      volumes: { cloned: ["postgres_data"], skipped: [], failed: [] },
+      ok: true,
+    })
+    // stdout purity: 人間向け出力は stderr に逃がす
+    expect(logSpy).not.toHaveBeenCalled()
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Reclone complete"))
+    writeSpy.mockRestore()
+  })
+
+  it("--json --strict keeps the JSON intact and signals failure via process.exitCode", async () => {
+    vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
+    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({
+      cloned: [],
+      skipped: [],
+      failed: [{ name: "postgres_data", error: "boom" }],
+    })
+    const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit")
+    })
+
+    await command.parseAsync(["feature/x", "--json", "--strict"], { from: "user" })
+
+    // JSON モードでは即 process.exit せず exitCode を設定する (stdout flush 保護)
+    expect(exit).not.toHaveBeenCalled()
+    expect(process.exitCode).toBe(EXIT_CODES.GENERAL_ERROR)
+    const payload = JSON.parse(writeSpy.mock.calls[0][0] as string)
+    expect(payload.ok).toBe(false)
+    expect(payload.volumes.failed).toEqual([{ name: "postgres_data", error: "boom" }])
+    process.exitCode = undefined
+    writeSpy.mockRestore()
+    exit.mockRestore()
+  })
+
   it("exits 0 with --strict when all volumes succeed", async () => {
     vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
-    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({ copied: 2, skipped: 0, failed: 0 })
+    vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({
+      cloned: ["postgres_data", "cache"],
+      skipped: [],
+      failed: [],
+    })
     const exit = vi.spyOn(process, "exit").mockImplementation(() => {
       throw new Error("exit")
     })
