@@ -5,23 +5,19 @@
 
 import { accessSync, constants as fsConstants } from "node:fs"
 import * as path from "node:path"
-import { Command } from "commander"
+import { Command, Option } from "commander"
 import { EXIT_CODES } from "../../constants/index.js"
 import { loadConfig } from "../../core/config/loader.js"
-import {
-  findComposeFile,
-  parsePortMapping,
-  readComposeFile,
-} from "../../core/docker/compose.js"
+import { findComposeFile, parsePortMapping, readComposeFile } from "../../core/docker/compose.js"
 import { parseEnvFile } from "../../core/environment/processor.js"
 import { getGitRootOrThrow } from "../../core/git/repository.js"
 import { listWorktrees } from "../../core/git/worktree.js"
 import type {
   ComposeServicePorts,
   PortsCommandOptions,
-  WtbConfig,
   WorktreeInfo,
   WorktreePorts,
+  WtbConfig,
 } from "../../types/index.js"
 import { CLIError, getErrorMessage } from "../../utils/error.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
@@ -32,19 +28,55 @@ import { renderPortsJson, renderPortsPretty } from "../utils/ports-render.js"
  */
 export function portsCommand(): Command {
   return new Command("ports")
-    .description(
-      "Print the adjusted ports and endpoints for this (or all) worktree(s)"
+    .description("Print the adjusted ports and endpoints for this (or all) worktree(s)")
+    .argument(
+      "[branch]",
+      "Branch whose worktree to print ports for (default: the current worktree)"
     )
-    .option("--all", "Output an array of all worktrees (default: current worktree only)")
+    .option("-a, --all", "Output an array of all worktrees (default: current worktree only)")
     .option("--pretty", "Human-readable table instead of JSON")
+    .addOption(
+      new Option("--json", "JSON output (default; accepted for consistency)").conflicts("pretty")
+    )
     .action(withErrorHandling(executePortsCommand))
 }
 
-async function executePortsCommand(options: PortsCommandOptions): Promise<void> {
+async function executePortsCommand(
+  branch: string | undefined,
+  options: PortsCommandOptions
+): Promise<void> {
+  if (branch && options.all) {
+    throw new CLIError(
+      "Cannot combine a branch argument with --all — pass one or the other.",
+      EXIT_CODES.INVALID_USAGE
+    )
+  }
+
   const gitRoot = getGitRootOrThrow()
   const config = loadConfig(gitRoot)
   const worktrees = listWorktrees()
   const currentPath = path.resolve(process.cwd())
+
+  if (branch) {
+    // gatherPortsForWorktree は WorktreeInfo 全体を必要とするため、
+    // getWorktreePath ではなく読み込み済みの worktrees から解決する。
+    const target = worktrees.find((wt) => wt.branch === branch)
+    if (!target) {
+      // 一覧はエラー診断の一部なので stderr に出す (stdout を script 出力用に汚さない)。
+      console.error("Available worktrees:")
+      for (const wt of worktrees) {
+        console.error(`  ${wt.branch}: ${wt.path}`)
+      }
+      throw new CLIError(`No worktree found for branch '${branch}'`, EXIT_CODES.GENERAL_ERROR)
+    }
+    const row = gatherPortsForWorktree(target, gitRoot, config)
+    if (options.pretty) {
+      process.stdout.write(renderPortsPretty([row]))
+    } else {
+      process.stdout.write(`${renderPortsJson(row)}\n`)
+    }
+    return
+  }
 
   if (options.all) {
     const rows = worktrees.map((wt) => gatherPortsForWorktree(wt, gitRoot, config))
@@ -114,10 +146,7 @@ export function gatherPortsForWorktree(
   }
 }
 
-function collectEnvValues(
-  worktreePath: string,
-  config: WtbConfig
-): Record<string, string> {
+function collectEnvValues(worktreePath: string, config: WtbConfig): Record<string, string> {
   const adjustKeys = new Set(Object.keys(config.env.adjust ?? {}))
   const out: Record<string, string> = {}
   if (adjustKeys.size === 0) return out
@@ -156,8 +185,7 @@ function collectComposeServices(
       const containerPorts: number[] = []
       if (svc.ports && Array.isArray(svc.ports)) {
         for (const entry of svc.ports) {
-          const mapping =
-            typeof entry === "string" ? parsePortMapping(entry) : null
+          const mapping = typeof entry === "string" ? parsePortMapping(entry) : null
           if (mapping) {
             hostPorts.push(mapping.hostPort)
             containerPorts.push(mapping.containerPort)
@@ -205,9 +233,7 @@ function fileIsReadable(p: string): boolean {
   }
 }
 
-function buildEndpoints(
-  services: Record<string, ComposeServicePorts>
-): string[] {
+function buildEndpoints(services: Record<string, ComposeServicePorts>): string[] {
   const seen = new Set<number>()
   const out: string[] = []
   for (const svc of Object.values(services)) {

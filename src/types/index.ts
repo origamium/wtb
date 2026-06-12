@@ -147,6 +147,8 @@ export interface PortsCommandOptions {
   all?: boolean
   /** 人間向けテーブル出力（デフォルトは JSON） */
   pretty?: boolean
+  /** JSON出力（デフォルトなので no-op。--pretty とは排他） */
+  json?: boolean
 }
 
 /**

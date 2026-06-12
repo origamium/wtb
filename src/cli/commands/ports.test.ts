@@ -7,11 +7,15 @@
  * を高速・粒度細かく固定する。parsePortMapping は実関数を使う（partial mock）。
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { EXIT_CODES } from "../../constants/index.js"
+import * as loaderModule from "../../core/config/loader.js"
 import * as composeModule from "../../core/docker/compose.js"
 import * as envModule from "../../core/environment/processor.js"
+import * as repositoryModule from "../../core/git/repository.js"
+import * as worktreeModule from "../../core/git/worktree.js"
 import type { ComposeConfig, WorktreeInfo, WtbConfig } from "../../types/index.js"
-import { gatherPortsForWorktree } from "./ports.js"
+import { gatherPortsForWorktree, portsCommand } from "./ports.js"
 
 vi.mock("node:fs", () => ({
   accessSync: vi.fn(),
@@ -22,6 +26,9 @@ vi.mock("../../core/docker/compose.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../core/docker/compose.js")>()
   return { ...actual, readComposeFile: vi.fn(), findComposeFile: vi.fn() }
 })
+vi.mock("../../core/config/loader.js")
+vi.mock("../../core/git/repository.js")
+vi.mock("../../core/git/worktree.js")
 
 import { accessSync } from "node:fs"
 
@@ -56,6 +63,93 @@ beforeEach(() => {
   vi.mocked(composeModule.readComposeFile).mockReturnValue(
     compose({ web: { ports: ["3001:80"] }, db: { ports: ["5433:5432"] } })
   )
+})
+
+describe("ports command surface", () => {
+  let writeSpy: ReturnType<typeof vi.spyOn>
+  let consoleErrorSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
+    consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    vi.mocked(repositoryModule.getGitRootOrThrow).mockReturnValue("/repo")
+    vi.mocked(loaderModule.loadConfig).mockReturnValue(cfg())
+    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+      { path: "/repo", branch: "main", head: "abc" },
+      WT,
+    ])
+  })
+
+  afterEach(() => {
+    writeSpy.mockRestore()
+    consoleErrorSpy.mockRestore()
+  })
+
+  it("exposes -a/--all, --pretty, and --json options", () => {
+    const flags = portsCommand().options.map((o) => o.flags)
+    expect(flags).toContain("-a, --all")
+    expect(flags).toContain("--pretty")
+    expect(flags).toContain("--json")
+  })
+
+  it("rejects --json combined with --pretty (commander conflict)", async () => {
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+    const command = portsCommand().exitOverride()
+
+    await expect(command.parseAsync(["--json", "--pretty"], { from: "user" })).rejects.toThrow(
+      /cannot be used with/
+    )
+    stderrSpy.mockRestore()
+  })
+
+  it("accepts --json as a no-op: same JSON as the default output", async () => {
+    await portsCommand().parseAsync([], { from: "user" })
+    const bare = writeSpy.mock.calls.map((c) => c[0]).join("")
+    writeSpy.mockClear()
+
+    await portsCommand().parseAsync(["--json"], { from: "user" })
+    const withJson = writeSpy.mock.calls.map((c) => c[0]).join("")
+
+    expect(withJson).toBe(bare)
+    expect(() => JSON.parse(withJson)).not.toThrow()
+  })
+
+  it("targets a specific worktree via the positional [branch] argument", async () => {
+    await portsCommand().parseAsync(["feature/x"], { from: "user" })
+
+    const output = writeSpy.mock.calls.map((c) => c[0]).join("")
+    const parsed = JSON.parse(output)
+    expect(parsed.branch).toBe("feature/x")
+    expect(parsed.path).toBe("/repo/wt")
+  })
+
+  it("exits GENERAL_ERROR and lists worktrees on stderr for an unknown branch", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exited")
+    })
+
+    await expect(portsCommand().parseAsync(["nope"], { from: "user" })).rejects.toThrow("exited")
+
+    expect(exitSpy).toHaveBeenCalledWith(EXIT_CODES.GENERAL_ERROR)
+    expect(writeSpy).not.toHaveBeenCalled()
+    const stderr = consoleErrorSpy.mock.calls.map((c) => c[0]).join("\n")
+    expect(stderr).toContain("Available worktrees:")
+    expect(stderr).toContain("No worktree found for branch 'nope'")
+    exitSpy.mockRestore()
+  })
+
+  it("exits INVALID_USAGE when a branch argument is combined with --all", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exited")
+    })
+
+    await expect(
+      portsCommand().parseAsync(["feature/x", "--all"], { from: "user" })
+    ).rejects.toThrow("exited")
+
+    expect(exitSpy).toHaveBeenCalledWith(EXIT_CODES.INVALID_USAGE)
+    exitSpy.mockRestore()
+  })
 })
 
 describe("gatherPortsForWorktree", () => {
