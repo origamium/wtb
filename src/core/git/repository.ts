@@ -85,6 +85,56 @@ export function branchExists(branchName: string, cwd?: string): boolean {
 }
 
 /**
+ * 任意の revision (ブランチ / タグ / SHA / remote ref 等) が commit に解決できるかチェック
+ *
+ * branchExists は refs/heads/ しか見ないため、base_branch に有効なタグ・SHA・
+ * remote ref を指定したケースを誤って弾いてしまう。base_branch の事前検証には
+ * こちらを使う。
+ *
+ * @param revision - チェックする revision
+ * @param cwd - 対象ディレクトリ（デフォルト: 現在のディレクトリ）
+ * @returns commit に解決できる場合true
+ */
+export function revisionExists(revision: string, cwd?: string): boolean {
+  if (!isGitRepository(cwd)) {
+    return false
+  }
+
+  try {
+    execGitSafe(["rev-parse", "--verify", "--quiet", `${revision}^{commit}`], { cwd })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 指定したブランチがリモート (origin) に存在するかチェック
+ *
+ * ローカルに無いブランチでも、teammate が push 済みの remote-only ブランチを
+ * base_branch から作り直して黙って shadow しないために使う。
+ *
+ * @param branchName - チェックするブランチ名
+ * @param remote - リモート名（デフォルト: origin）
+ * @param cwd - 対象ディレクトリ（デフォルト: 現在のディレクトリ）
+ * @returns リモートブランチが存在する場合true
+ */
+export function remoteBranchExists(branchName: string, remote = "origin", cwd?: string): boolean {
+  if (!isGitRepository(cwd)) {
+    return false
+  }
+
+  try {
+    execGitSafe(["show-ref", "--verify", "--quiet", `refs/remotes/${remote}/${branchName}`], {
+      cwd,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * リポジトリの基本情報を取得
  *
  * @param cwd - 対象ディレクトリ（デフォルト: 現在のディレクトリ）

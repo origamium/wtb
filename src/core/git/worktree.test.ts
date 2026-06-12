@@ -6,8 +6,54 @@
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { describe, expect, it } from "vitest"
-import { isSamePath, parseWorktreeList } from "./worktree.js"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { execGitSafe } from "../../utils/exec.js"
+import { createWorktree, isSamePath, parseWorktreeList } from "./worktree.js"
+
+// createWorktree が組む git 引数を検証するため exec 層だけを mock する。
+// isSamePath / parseWorktreeList は純関数なので影響を受けない。
+vi.mock("../../utils/exec.js")
+
+describe("createWorktree", () => {
+  let logSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {})
+    // isGitRepository → execGitSafe が throw しなければ true
+    vi.mocked(execGitSafe).mockReturnValue("")
+  })
+
+  afterEach(() => {
+    logSpy.mockRestore()
+  })
+
+  it("creates a new branch off the base branch", () => {
+    createWorktree("feature/x", "/wt/feature-x", { baseBranch: "main" })
+    expect(execGitSafe).toHaveBeenCalledWith(
+      ["worktree", "add", "/wt/feature-x", "-b", "feature/x", "main"],
+      { cwd: undefined }
+    )
+  })
+
+  it("checks out an existing branch without -b", () => {
+    createWorktree("feature/x", "/wt/feature-x", { useExistingBranch: true })
+    expect(execGitSafe).toHaveBeenCalledWith(["worktree", "add", "/wt/feature-x", "feature/x"], {
+      cwd: undefined,
+    })
+  })
+
+  it("creates a tracking branch from the remote ref when trackFrom is set", () => {
+    createWorktree("feature/x", "/wt/feature-x", {
+      baseBranch: "main",
+      trackFrom: "origin/feature/x",
+    })
+    expect(execGitSafe).toHaveBeenCalledWith(
+      ["worktree", "add", "/wt/feature-x", "-b", "feature/x", "--track", "origin/feature/x"],
+      { cwd: undefined }
+    )
+  })
+})
 
 describe("isSamePath", () => {
   it("treats identical paths as the same", () => {
@@ -142,12 +188,7 @@ describe("parseWorktreeList", () => {
   })
 
   it("marks detached HEAD with branch label and flag", () => {
-    const input = [
-      "worktree /Users/me/wt-detached",
-      "HEAD abc123",
-      "detached",
-      "",
-    ].join("\n")
+    const input = ["worktree /Users/me/wt-detached", "HEAD abc123", "detached", ""].join("\n")
 
     const result = parseWorktreeList(input)
     expect(result[0].branch).toBe("(detached)")
@@ -155,12 +196,7 @@ describe("parseWorktreeList", () => {
   })
 
   it("does not set flags when their lines are absent", () => {
-    const input = [
-      "worktree /Users/me/proj",
-      "HEAD abc",
-      "branch refs/heads/main",
-      "",
-    ].join("\n")
+    const input = ["worktree /Users/me/proj", "HEAD abc", "branch refs/heads/main", ""].join("\n")
 
     const result = parseWorktreeList(input)
     expect(result[0].locked).toBeUndefined()

@@ -11,6 +11,8 @@ import {
   getGitRoot,
   getRepositoryInfo,
   isGitRepository,
+  remoteBranchExists,
+  revisionExists,
 } from "./repository.js"
 
 // Mock dependencies
@@ -118,6 +120,86 @@ describe("Git Repository Operations (Refactored)", () => {
       const exists = branchExists("nonexistent-branch", testRepoPath)
 
       expect(exists).toBe(false)
+    })
+  })
+
+  describe("remoteBranchExists", () => {
+    it("should return true when the branch exists on origin", () => {
+      vi.mocked(execFileSync)
+        .mockReturnValueOnce("true\n") // isGitRepository check
+        .mockReturnValueOnce("") // git show-ref (success = remote branch exists)
+
+      const exists = remoteBranchExists("feature-branch", "origin", testRepoPath)
+
+      expect(exists).toBe(true)
+      expect(execFileSync).toHaveBeenCalledWith(
+        "git",
+        ["show-ref", "--verify", "--quiet", "refs/remotes/origin/feature-branch"],
+        expect.objectContaining({ cwd: testRepoPath })
+      )
+    })
+
+    it("should return false when the branch does not exist on the remote", () => {
+      vi.mocked(execFileSync)
+        .mockReturnValueOnce("true\n") // isGitRepository check
+        .mockImplementationOnce(() => {
+          throw new Error("Remote branch not found")
+        })
+
+      const exists = remoteBranchExists("nonexistent-branch", "origin", testRepoPath)
+
+      expect(exists).toBe(false)
+    })
+
+    it("defaults the remote to origin", () => {
+      vi.mocked(execFileSync)
+        .mockReturnValueOnce("true\n") // isGitRepository check
+        .mockReturnValueOnce("") // git show-ref
+
+      remoteBranchExists("feature-branch")
+
+      expect(execFileSync).toHaveBeenCalledWith(
+        "git",
+        ["show-ref", "--verify", "--quiet", "refs/remotes/origin/feature-branch"],
+        expect.anything()
+      )
+    })
+  })
+
+  describe("revisionExists", () => {
+    it("verifies the revision via rev-parse --verify <rev>^{commit} (accepts tags/SHAs, not just refs/heads/)", () => {
+      vi.mocked(execFileSync)
+        .mockReturnValueOnce("true\n") // isGitRepository check
+        .mockReturnValueOnce("abc123\n") // git rev-parse --verify
+
+      const exists = revisionExists("v1.0.0", testRepoPath)
+
+      expect(exists).toBe(true)
+      expect(execFileSync).toHaveBeenCalledWith(
+        "git",
+        ["rev-parse", "--verify", "--quiet", "v1.0.0^{commit}"],
+        expect.objectContaining({ cwd: testRepoPath })
+      )
+    })
+
+    it("should return false when the revision does not resolve", () => {
+      vi.mocked(execFileSync)
+        .mockReturnValueOnce("true\n") // isGitRepository check
+        .mockImplementationOnce(() => {
+          throw new Error("fatal: Needed a single revision")
+        })
+
+      const exists = revisionExists("main", testRepoPath)
+
+      expect(exists).toBe(false)
+    })
+
+    it("should return false outside a git repository", () => {
+      vi.mocked(execFileSync).mockImplementation(() => {
+        throw new Error("Not a git repository")
+      })
+
+      expect(revisionExists("main", "/tmp/not-git")).toBe(false)
     })
   })
 

@@ -7,6 +7,7 @@ import { realpathSync } from "node:fs"
 import * as path from "node:path"
 import type { WorktreeInfo } from "../../types/index.js"
 import { execGitSafe } from "../../utils/exec.js"
+import { out } from "../../utils/output.js"
 import { getGitRoot, isGitRepository } from "./repository.js"
 
 /**
@@ -106,16 +107,19 @@ export function parseWorktreeList(output: string): WorktreeInfo[] {
  *   - cwd: 作業ディレクトリ
  *   - useExistingBranch: 既存ブランチを使用（新規作成しない）
  *   - baseBranch: 新規ブランチ作成時のベースブランチ名
+ *   - trackFrom: remote-only ブランチを checkout する際の上流 (例: "origin/feature/x")。
+ *     指定時は baseBranch ではなくこの ref からトラッキングブランチを作る。
  * @throws {Error} 作成に失敗した場合
  */
 export function createWorktree(
   branchName: string,
   worktreePath: string,
-  options?: { cwd?: string; useExistingBranch?: boolean; baseBranch?: string }
+  options?: { cwd?: string; useExistingBranch?: boolean; baseBranch?: string; trackFrom?: string }
 ): void {
   const cwd = options?.cwd
   const useExistingBranch = options?.useExistingBranch ?? false
   const baseBranch = options?.baseBranch
+  const trackFrom = options?.trackFrom
 
   if (!isGitRepository(cwd)) {
     throw new Error("Not in a Git repository")
@@ -123,13 +127,15 @@ export function createWorktree(
 
   const args = useExistingBranch
     ? ["worktree", "add", worktreePath, branchName]
-    : baseBranch
-      ? ["worktree", "add", worktreePath, "-b", branchName, baseBranch]
-      : ["worktree", "add", worktreePath, "-b", branchName]
+    : trackFrom
+      ? ["worktree", "add", worktreePath, "-b", branchName, "--track", trackFrom]
+      : baseBranch
+        ? ["worktree", "add", worktreePath, "-b", branchName, baseBranch]
+        : ["worktree", "add", worktreePath, "-b", branchName]
 
   try {
     execGitSafe(args, { cwd })
-    console.log(`✅ Created worktree: ${branchName} at ${worktreePath}`)
+    out(`✅ Created worktree: ${branchName} at ${worktreePath}`)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new Error(`Failed to create worktree: ${message}`)
@@ -160,7 +166,7 @@ export function removeWorktree(
 
   try {
     execGitSafe(args, { cwd })
-    console.log(`✅ Removed worktree at: ${worktreePath}`)
+    out(`✅ Removed worktree at: ${worktreePath}`)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new Error(`Failed to remove worktree: ${message}`)
