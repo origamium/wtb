@@ -8,6 +8,23 @@
 // =============================================================================
 
 /**
+ * Docker Compose サービス名前分離の設定
+ */
+export interface ComposeIdentityConfig {
+  isolate_name: boolean
+  container_name: "suffix" | "strip" | "keep"
+}
+
+/**
+ * ポート伝播設定
+ */
+export interface PortPropagationConfig {
+  enabled: boolean
+  files: string[]
+  compose: boolean
+}
+
+/**
  * 環境変数設定
  */
 export interface EnvConfig {
@@ -15,6 +32,8 @@ export interface EnvConfig {
   file: string[]
   /** 環境変数の調整設定 */
   adjust: Record<string, string | number | null>
+  /** ポート伝播設定 */
+  port_propagation: PortPropagationConfig
 }
 
 /**
@@ -56,6 +75,8 @@ export interface WtbConfig {
   env: EnvConfig
   /** Volume クローン設定（省略可、未設定でも auto-discovery は ON） */
   volumes?: VolumesConfig
+  /** Docker Compose サービス名前分離設定 */
+  compose?: ComposeIdentityConfig
 }
 
 // =============================================================================
@@ -152,6 +173,16 @@ export interface PortsCommandOptions {
 }
 
 /**
+ * `doctor` コマンドのオプション
+ */
+export interface DoctorCommandOptions {
+  /** JSON出力（機械可読） */
+  json?: boolean
+  /** warning/error がある場合に exit code 1 で終了 */
+  strict?: boolean
+}
+
+/**
  * `init-claude` コマンドのオプション
  */
 export interface InitClaudeOptions {
@@ -210,7 +241,16 @@ export interface ComposeService {
   /** ビルド設定 */
   build?: string | object
   /** ポートマッピング */
-  ports?: string[]
+  ports?: Array<
+    | string
+    | number
+    | {
+        target?: number | string
+        published?: number | string
+        protocol?: string
+        mode?: string
+      }
+  >
   /** ボリュームマウント */
   volumes?: string[]
   /** 環境変数 */

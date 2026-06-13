@@ -5,11 +5,21 @@
 
 import { existsSync } from "node:fs"
 import fs from "fs-extra"
-import { parse, stringify } from "yaml"
-import { COMPOSE_FILE_NAMES, FILE_ENCODING, PORT_RANGE } from "../../constants/index.js"
+import { parse, parseDocument, stringify, visit } from "yaml"
+import {
+  COMPOSE_FILE_NAMES,
+  FILE_ENCODING,
+  MAX_TCP_PORT,
+  PORT_RANGE,
+} from "../../constants/index.js"
 import type { ComposeConfig, FileOperationOptions } from "../../types/index.js"
 import { execDockerSafe } from "../../utils/exec.js"
 import { out } from "../../utils/output.js"
+import {
+  type PortMap,
+  propagateComposeDefaults,
+  propagatePortsInValue,
+} from "../environment/propagate.js"
 
 /**
  * Docker Composeファイルを読み込んでパース
@@ -91,11 +101,47 @@ export function writeComposeFile(
       out(`📋 Created backup: ${backupPath}`)
     }
 
-    const yamlContent = stringify(config, {
-      indent: 2,
-      lineWidth: 120,
-      minContentWidth: 80,
+    // YAML 1.1 danger set: strings that Docker's Go YAML 1.1 parser would
+    // misinterpret as booleans, nulls, sexagesimal integers, or octal numbers.
+    // We parse into a Document, visit all scalar string VALUES (not keys) in
+    // mapping nodes, and force double-quote on any that are in the danger set.
+    const YAML11_DANGEROUS = /^(y|yes|n|no|true|false|on|off|null|~)$/i
+    const SEXAGESIMAL = /^\d+(:\d+)+$/          // e.g. 00:00, 1:30:00
+    const LEADING_ZERO_INT = /^0\d+$/            // e.g. 0755, 0123
+    const PURE_NUMBER = /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/ // numeric strings
+
+    function isDangerous(val: string): boolean {
+      if (val === "") return true
+      if (YAML11_DANGEROUS.test(val)) return true
+      if (SEXAGESIMAL.test(val)) return true
+      if (LEADING_ZERO_INT.test(val)) return true
+      if (PURE_NUMBER.test(val)) return true
+      return false
+    }
+
+    const doc = parseDocument(
+      stringify(config, { indent: 2, lineWidth: 120, minContentWidth: 80 })
+    )
+
+    visit(doc, {
+      Pair(_, pair) {
+        // Only force-quote the VALUE side of mapping pairs, not keys
+        const val = pair.value
+        if (
+          val !== null &&
+          typeof val === "object" &&
+          "type" in val &&
+          (val as { type: unknown }).type === "PLAIN" &&
+          "value" in val &&
+          typeof (val as { value: unknown }).value === "string" &&
+          isDangerous((val as { value: string }).value)
+        ) {
+          ;(val as { type: string }).type = "QUOTE_DOUBLE"
+        }
+      },
     })
+
+    const yamlContent = String(doc)
 
     fs.writeFileSync(filePath, yamlContent, {
       encoding: options?.encoding || FILE_ENCODING,
@@ -134,16 +180,25 @@ export function writeComposeFile(
  *
  * @returns { hostPort, containerPort } または null (解析不能)
  */
-export function parsePortMapping(
-  portMapping: string
-): { hostPort: number; containerPort: number } | null {
+export function parsePortMapping(portMapping: string): {
+  hostPort: number
+  containerPort: number
+  ip?: string
+  proto?: string
+} | null {
   if (typeof portMapping !== "string") return null
-  const match = portMapping.match(/^(?:[\d.]+:)?(\d+):(\d+)(?:\/\w+)?$/)
+  // Capture: optional IP prefix, host port, container port, optional /proto suffix
+  const match = portMapping.match(/^([\d.]+:)?(\d+):(\d+)(\/\w+)?$/)
   if (!match) return null
-  const hostPort = parseInt(match[1], 10)
-  const containerPort = parseInt(match[2], 10)
+  const hostPort = parseInt(match[2], 10)
+  const containerPort = parseInt(match[3], 10)
   if (Number.isNaN(hostPort) || Number.isNaN(containerPort)) return null
-  return { hostPort, containerPort }
+  return {
+    hostPort,
+    containerPort,
+    ip: match[1],      // e.g. "0.0.0.0:" or undefined
+    proto: match[4],   // e.g. "/tcp" or undefined
+  }
 }
 
 export function adjustPortsInCompose(config: ComposeConfig, usedPorts: number[]): ComposeConfig {
@@ -153,7 +208,7 @@ export function adjustPortsInCompose(config: ComposeConfig, usedPorts: number[])
 
   Object.entries(newConfig.services).forEach(([, service]) => {
     if (service.ports && Array.isArray(service.ports)) {
-      service.ports = service.ports.map((portMapping: string) => {
+      service.ports = service.ports.map((portMapping) => {
         if (typeof portMapping !== "string") {
           return portMapping
         }
@@ -168,13 +223,95 @@ export function adjustPortsInCompose(config: ComposeConfig, usedPorts: number[])
         // 新しいポートを使用中リストに追加
         currentlyUsed.push(newHostPort)
 
-        // 元の形式を保持して新しいポートに置換
-        return portMapping.replace(parsed.hostPort.toString(), newHostPort.toString())
+        // Reconstruct from parsed components to avoid corrupting IP octets
+        // that share digits with the host port (H3 fix).
+        // e.g. "192.168.100.100:100:80/tcp" → "192.168.100.100:999:80/tcp"
+        return `${parsed.ip ?? ""}${newHostPort}:${parsed.containerPort}${parsed.proto ?? ""}`
       })
     }
   })
 
   return newConfig
+}
+
+/**
+ * propagatePortsInComposeValues が報告する 1 件の値変更。
+ * location は `<service>.environment.<KEY>` または `<service>.ports[<index>]`。
+ */
+export interface ComposeValueChange {
+  location: string
+  from: string
+  to: string
+}
+
+/**
+ * Compose 設定の文字列値（各サービスの environment と ports）に env→compose の
+ * ポート伝播を適用する純粋関数。元の config は変更せず clone を返す。
+ *
+ * 各文字列に対し propagateComposeDefaults（`${VAR:-default}` を解決）→
+ * propagatePortsInValue（`:54321` 形式の裸ポート）を順に適用する。
+ *
+ * これは adjustPortsInCompose の前に実行することを想定している。
+ * `${KONG_HTTP_PORT:-54321}:8000` のような mapping は parsePortMapping が
+ * 解析できず adjustPortsInCompose では触れないため、ここでのみ修正される。
+ *
+ * @param envChanges - env var 名 → { from, to } のルックアップ（compose default 用）
+ * @param map - original → new のポートマッピング（裸ポート用）
+ * @returns 伝播後の config と、変更内訳の一覧
+ */
+export function propagatePortsInComposeValues(
+  config: ComposeConfig,
+  envChanges: Record<string, { from: string; to: string }>,
+  map: PortMap
+): { config: ComposeConfig; changes: ComposeValueChange[] } {
+  const newConfig = structuredClone(config) as ComposeConfig
+  const changes: ComposeValueChange[] = []
+
+  // 1 つの文字列値に伝播を適用し、変わった場合だけ changes に記録して新値を返す。
+  const rewrite = (raw: string, location: string): string => {
+    const afterDefaults = propagateComposeDefaults(raw, envChanges, map)
+    const afterPorts = propagatePortsInValue(afterDefaults, map).value
+    if (afterPorts !== raw) {
+      changes.push({ location, from: raw, to: afterPorts })
+    }
+    return afterPorts
+  }
+
+  for (const [serviceName, service] of Object.entries(newConfig.services ?? {})) {
+    if (!service) continue
+
+    // environment: map 形式（Record<string,string>）と list 形式（KEY=VALUE[]）の両対応
+    const env = service.environment
+    if (env && !Array.isArray(env) && typeof env === "object") {
+      for (const [key, value] of Object.entries(env)) {
+        if (typeof value !== "string") continue
+        ;(env as Record<string, string>)[key] = rewrite(value, `${serviceName}.environment.${key}`)
+      }
+    } else if (Array.isArray(env)) {
+      service.environment = env.map((item, index) => {
+        if (typeof item !== "string") return item
+        // KEY=VALUE 形式なら VALUE 部分だけ伝播対象にする（KEY は維持）
+        const eq = item.indexOf("=")
+        if (eq === -1) {
+          return rewrite(item, `${serviceName}.environment[${index}]`)
+        }
+        const key = item.slice(0, eq)
+        const value = item.slice(eq + 1)
+        const next = rewrite(value, `${serviceName}.environment.${key}`)
+        return `${key}=${next}`
+      })
+    }
+
+    // ports: 文字列エントリのみ対象（`${VAR:-54321}:8000` 形式を修正）
+    if (Array.isArray(service.ports)) {
+      service.ports = service.ports.map((portMapping, index) => {
+        if (typeof portMapping !== "string") return portMapping
+        return rewrite(portMapping, `${serviceName}.ports[${index}]`)
+      })
+    }
+  }
+
+  return { config: newConfig, changes }
 }
 
 /**
@@ -191,9 +328,6 @@ export function adjustPortsInCompose(config: ComposeConfig, usedPorts: number[])
  * console.log(availablePort) // 3003
  * ```
  */
-/** 有効な TCP ポートの上限（host port の妥当性判定用）。 */
-const MAX_TCP_PORT = 65535
-
 export function findAvailablePort(basePort: number, usedPorts: number[]): number {
   const used = new Set(usedPorts)
 
@@ -205,20 +339,21 @@ export function findAvailablePort(basePort: number, usedPorts: number[]): number
   }
 
   // 使用中の場合のみ空きを探索する。特権ポートを避けるため、探索開始は
-  // max(basePort + 1, MIN) に寄せ、MAX まで上方向に探したのちレンジ内を巻き戻す。
-  // 旧実装は基準から 100 個しか走査せず、その後は「使用中かもしれない basePort」を
-  // 無検証で返していた（= 衝突するポートを返し得た）。
+  // max(basePort + 1, PORT_RANGE.MIN) に寄せ、MAX_TCP_PORT まで上方向に探索し
+  // その後 PORT_RANGE.MIN からの巻き戻しループを走る。
+  // 旧実装は PORT_RANGE.MAX (9999) で打ち切っていたため、54321 のような高ポートでは
+  // ループ本体が一切実行されず、使用中かもしれない basePort+1 を無検証で返していた。
   const start = Math.max(basePort + 1, PORT_RANGE.MIN)
-  for (let p = start; p <= PORT_RANGE.MAX; p++) {
+  for (let p = start; p <= MAX_TCP_PORT; p++) {
     if (!used.has(p)) return p
   }
-  for (let p = PORT_RANGE.MIN; p < start && p <= PORT_RANGE.MAX; p++) {
+  for (let p = PORT_RANGE.MIN; p < start; p++) {
     if (!used.has(p)) return p
   }
 
-  // wtb のレンジ全体が埋まっている場合のみ警告して basePort を返す（事実上到達しない）。
+  // 全ポートが埋まっている場合のみ警告して basePort を返す（事実上到達しない）。
   console.warn(
-    `⚠️  No free port available in range ${PORT_RANGE.MIN}-${PORT_RANGE.MAX}; keeping original port ${basePort}`
+    `⚠️  No free port available in range ${PORT_RANGE.MIN}-${MAX_TCP_PORT}; keeping original port ${basePort}`
   )
   return basePort
 }
@@ -376,6 +511,127 @@ export function validateComposeConfig(config: ComposeConfig): {
 }
 
 /**
+ * branch 名を Compose v2 が許容するプロジェクト slug に正規化する。
+ *
+ * Compose v2 の project name は `[a-z0-9][a-z0-9_-]*` (lowercase 始まり) でなければ
+ * ならない。規則:
+ * - lowercase 化
+ * - `[a-z0-9_-]` 以外を `-` に置換
+ * - 連続する `-` を 1 つに畳む
+ * - 先頭が `[a-z0-9]` でなければ先頭の不正文字を除去し、なお空/不正なら `wtb` を prepend
+ * - 末尾の `-` は除去
+ * - 結果が空なら "wtb" にフォールバック
+ *
+ * 例: `feature/Foo_Bar!` → `feature-foo_bar`
+ */
+export function sanitizeProjectSlug(branch: string): string {
+  let s = branch.toLowerCase().replace(/[^a-z0-9_-]/g, "-")
+  // 連続するダッシュを畳む
+  s = s.replace(/-+/g, "-")
+  // 先頭の非英数 (-, _) を除去
+  s = s.replace(/^[^a-z0-9]+/, "")
+  // 末尾のダッシュを除去
+  s = s.replace(/-+$/, "")
+  if (s.length === 0) {
+    return "wtb"
+  }
+  if (!/^[a-z0-9]/.test(s)) {
+    return `wtb${s}`
+  }
+  return s
+}
+
+/**
+ * container_name の正規化。
+ *
+ * Docker container 名は `[a-zA-Z0-9][a-zA-Z0-9_.-]*` を許容する (project slug と違い
+ * 大文字・ドットも可)。規則:
+ * - `[a-zA-Z0-9_.-]` 以外を `-` に置換
+ * - 先頭が許容文字でなければ除去し、なお空なら `wtb` を prepend
+ * - 結果が空なら "wtb" にフォールバック
+ *
+ * project slug と分離しているのは、container 名はケースとドットを保持できるため。
+ */
+export function sanitizeContainerName(name: string): string {
+  let s = name.replace(/[^a-zA-Z0-9_.-]/g, "-")
+  s = s.replace(/^[^a-zA-Z0-9]+/, "")
+  if (s.length === 0) {
+    return "wtb"
+  }
+  if (!/^[a-zA-Z0-9]/.test(s)) {
+    return `wtb${s}`
+  }
+  return s
+}
+
+/**
+ * {@link rewriteComposeIdentity} が報告する identity 書き換えの内訳。
+ */
+export interface ComposeIdentityRewrite {
+  /** top-level `name:` の書き換え (発生時のみ) */
+  projectName?: { from: string; to: string }
+  /** service ごとの container_name 書き換え。`to` が undefined なら strip (key 削除) */
+  containerNames: Array<{ service: string; from: string; to?: string }>
+}
+
+/**
+ * Compose 設定の per-worktree identity (project name / container_name) を書き換える純粋関数。
+ *
+ * structuredClone 上で動作し、元の config は変更しない。新しい config と、何を変えたかの
+ * 内訳 ({@link ComposeIdentityRewrite}) を返す。
+ *
+ * 規則:
+ * - top-level `name:` あり AND isolateName=true → `sanitizeProjectSlug(`${name}-${slug}`)`
+ *   (結合後を再 sanitize して常に valid にする)。`name:` 無し → そのまま (worktree dir
+ *   basename が既に一意な project を生むので、注入は port/down 挙動を無駄に変える)。
+ *   isolateName=false → `name:` 不変。
+ * - service ごとの `container_name:`:
+ *   - suffix (default): `sanitizeContainerName(`${original}-${slug}`)`
+ *   - strip: `container_name` key を削除 (compose が `<project>-<service>-N` を自動生成)
+ *   - keep: 不変
+ */
+export function rewriteComposeIdentity(
+  config: ComposeConfig,
+  opts: { slug: string; isolateName: boolean; containerNameMode: "suffix" | "strip" | "keep" }
+): { config: ComposeConfig; rewrite: ComposeIdentityRewrite } {
+  const newConfig = structuredClone(config) as ComposeConfig
+  const rewrite: ComposeIdentityRewrite = { containerNames: [] }
+
+  // top-level project name (`name:`)
+  const originalName = (newConfig as { name?: unknown }).name
+  if (opts.isolateName && typeof originalName === "string" && originalName.length > 0) {
+    const next = sanitizeProjectSlug(`${originalName}-${opts.slug}`)
+    if (next !== originalName) {
+      ;(newConfig as { name?: string }).name = next
+      rewrite.projectName = { from: originalName, to: next }
+    }
+  }
+
+  // per-service container_name
+  if (opts.containerNameMode !== "keep" && newConfig.services) {
+    for (const [serviceName, service] of Object.entries(newConfig.services)) {
+      if (!service || typeof service !== "object") continue
+      const current = (service as { container_name?: unknown }).container_name
+      if (typeof current !== "string" || current.length === 0) continue
+
+      if (opts.containerNameMode === "strip") {
+        delete (service as { container_name?: unknown }).container_name
+        rewrite.containerNames.push({ service: serviceName, from: current, to: undefined })
+      } else {
+        // suffix
+        const next = sanitizeContainerName(`${current}-${opts.slug}`)
+        if (next !== current) {
+          ;(service as { container_name?: string }).container_name = next
+          rewrite.containerNames.push({ service: serviceName, from: current, to: next })
+        }
+      }
+    }
+  }
+
+  return { config: newConfig, rewrite }
+}
+
+/**
  * source の Docker Compose スタックを停止する (`docker compose stop`)。
  *
  * volume を安全にクローンするための一時停止に使う。`down` と違い、`stop` は
@@ -402,4 +658,20 @@ export function composeStop(composeFilePath: string, projectName: string, cwd: s
  */
 export function composeStart(composeFilePath: string, projectName: string, cwd: string): void {
   execDockerSafe(["compose", "-f", composeFilePath, "-p", projectName, "start"], { cwd })
+}
+
+/**
+ * source スタックを `docker compose up -d` で復帰させる ({@link composeStart} のより堅牢な代替)。
+ *
+ * `start` は「停止済みコンテナの再開」しかできず、コンテナが削除/欠損していると失敗する。
+ * `up -d` は依存解決しつつ欠損コンテナを再作成するため、`composeStart` が失敗した後の
+ * フォールバックとして使う。
+ *
+ * @param composeFilePath - Compose ファイルの絶対パス
+ * @param projectName - Compose プロジェクト名
+ * @param cwd - 実行ディレクトリ (通常は source の gitRoot)
+ * @throws {Error} docker 呼び出しが失敗した場合 (呼び出し側で握りつぶす想定)
+ */
+export function composeUp(composeFilePath: string, projectName: string, cwd: string): void {
+  execDockerSafe(["compose", "-f", composeFilePath, "-p", projectName, "up", "-d"], { cwd })
 }

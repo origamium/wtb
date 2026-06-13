@@ -121,7 +121,13 @@ async function executeRecloneCommand(
   const config = loadConfig(gitRoot)
 
   // --json: stdout には JSON オブジェクトを 1 つだけ出力する (人間向け出力は stderr 済み)。
-  const writeJsonResult = (volumes: VolumeCopyResult, ok: boolean): void => {
+  // create の payload と揃えるため top-level に sourceRestartFailed を出す。これにより
+  // 消費側は「volume の clone 失敗」と「source スタックが DOWN (再開失敗)」を区別できる。
+  const writeJsonResult = (
+    volumes: VolumeCopyResult,
+    ok: boolean,
+    sourceRestartFailed = false
+  ): void => {
     process.stdout.write(
       `${JSON.stringify(
         {
@@ -129,6 +135,7 @@ async function executeRecloneCommand(
           path: worktreePath,
           dryRun: options.dryRun === true,
           volumes,
+          sourceRestartFailed,
           ok,
         },
         null,
@@ -163,6 +170,11 @@ async function executeRecloneCommand(
     stop: options.stop,
   })
 
+  // source スタックを停止したまま再開に失敗した = ユーザの稼働中環境が壊れた状態。
+  // --strict の有無に関わらず非ゼロ終了 (DOCKER_ERROR) する (create.ts と同じ contract)。
+  const sourceRestartFailed =
+    result.sourceStack?.stopped === true && result.sourceStack?.restarted === false
+
   out("")
   if (result.failed.length > 0) {
     // 既定では create と同じ contract: コマンドは exit 0 だが、データ未達成を明示する。
@@ -170,24 +182,35 @@ async function executeRecloneCommand(
       `⚠️  Reclone finished, but ${result.failed.length} volume(s) FAILED — this worktree's data is NOT fully isolated. See the errors above; resolve them and re-run \`wtb reclone\`.`
     )
     if (json) {
-      writeJsonResult(result, false)
-    }
-    // --strict のときだけ非ゼロ終了して CI/エージェントに失敗を伝える。
-    // JSON モードでは payload を書き切ってから exitCode のみ設定する (即 process.exit
-    // すると stdout の flush 前に落ちて JSON が壊れる恐れがある)。
-    if (options.strict === true) {
-      if (json) {
-        process.exitCode = EXIT_CODES.GENERAL_ERROR
-      } else {
-        process.exit(EXIT_CODES.GENERAL_ERROR)
-      }
+      writeJsonResult(result, false, sourceRestartFailed)
     }
   } else {
     out(
       `✅ Reclone complete — ${result.cloned.length} cloned, ${result.skipped.length} skipped, 0 failed.`
     )
     if (json) {
-      writeJsonResult(result, true)
+      writeJsonResult(result, !sourceRestartFailed, sourceRestartFailed)
+    }
+  }
+
+  // 再開失敗時は recovery コマンドを stderr に出す (human モード)。
+  if (sourceRestartFailed && result.sourceStack?.recoverCommand) {
+    out(
+      "  ❌ The source Compose stack was stopped to clone volumes but FAILED to restart — your source environment is DOWN. Bring it back up manually:"
+    )
+    out(`     ${result.sourceStack.recoverCommand}`)
+  }
+
+  // exit code 解決 (即 process.exit せず process.exitCode を設定して JSON flush を保証):
+  // - source 再開失敗は --strict 無関係に DOCKER_ERROR (5)
+  // - --strict 時の clone 失敗は GENERAL_ERROR (1)
+  if (sourceRestartFailed) {
+    process.exitCode = EXIT_CODES.DOCKER_ERROR
+  } else if (result.failed.length > 0 && options.strict === true) {
+    if (json) {
+      process.exitCode = EXIT_CODES.GENERAL_ERROR
+    } else {
+      process.exit(EXIT_CODES.GENERAL_ERROR)
     }
   }
 }

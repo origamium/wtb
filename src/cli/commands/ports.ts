@@ -3,13 +3,14 @@
  * 各worktreeの adjusted 済ポート値・compose サービスポート・推定エンドポイントを出力する
  */
 
-import { accessSync, constants as fsConstants } from "node:fs"
 import * as path from "node:path"
 import { Command, Option } from "commander"
 import { EXIT_CODES } from "../../constants/index.js"
 import { loadConfig } from "../../core/config/loader.js"
-import { findComposeFile, parsePortMapping, readComposeFile } from "../../core/docker/compose.js"
-import { parseEnvFile } from "../../core/environment/processor.js"
+import { interpolateComposeValue } from "../../core/docker/interpolation.js"
+import { parsePortMapping, readComposeFile } from "../../core/docker/compose.js"
+import { resolveComposePath } from "../../core/docker/locate.js"
+import { buildWorktreeEnvMap } from "../../core/environment/env-map.js"
 import { getGitRootOrThrow } from "../../core/git/repository.js"
 import { listWorktrees } from "../../core/git/worktree.js"
 import type {
@@ -133,8 +134,9 @@ export function gatherPortsForWorktree(
 ): WorktreePorts {
   const worktreePath = path.resolve(wt.path)
 
-  const env = collectEnvValues(worktreePath, config)
-  const compose = collectComposeServices(worktreePath, gitRoot, config)
+  const envMap = buildWorktreeEnvMap(worktreePath, config)
+  const env = collectEnvValues(envMap, config)
+  const compose = collectComposeServices(worktreePath, gitRoot, config, envMap)
   const endpoints = buildEndpoints(compose.services)
 
   return {
@@ -146,23 +148,14 @@ export function gatherPortsForWorktree(
   }
 }
 
-function collectEnvValues(worktreePath: string, config: WtbConfig): Record<string, string> {
+function collectEnvValues(
+  envMap: Record<string, string>,
+  config: WtbConfig
+): Record<string, string> {
   const adjustKeys = new Set(Object.keys(config.env.adjust ?? {}))
   const out: Record<string, string> = {}
-  if (adjustKeys.size === 0) return out
-
-  for (const relPath of config.env.file) {
-    const envPath = path.resolve(worktreePath, relPath)
-    try {
-      const parsed = parseEnvFile(envPath)
-      for (const entry of parsed.entries) {
-        if (adjustKeys.has(entry.key)) {
-          out[entry.key] = entry.value
-        }
-      }
-    } catch {
-      // env ファイル未存在などは無視（別 worktree に存在するケース含む）
-    }
+  for (const [key, value] of Object.entries(envMap)) {
+    if (adjustKeys.has(key)) out[key] = value
   }
   return out
 }
@@ -170,7 +163,8 @@ function collectEnvValues(worktreePath: string, config: WtbConfig): Record<strin
 function collectComposeServices(
   worktreePath: string,
   gitRoot: string,
-  config: WtbConfig
+  config: WtbConfig,
+  envMap: Record<string, string>
 ): WorktreePorts["compose"] {
   const composePath = resolveComposePath(worktreePath, gitRoot, config)
   if (!composePath) {
@@ -180,15 +174,73 @@ function collectComposeServices(
   try {
     const parsed = readComposeFile(composePath)
     const services: Record<string, ComposeServicePorts> = {}
+    const warnedVars = new Set<string>()
+
     for (const [name, svc] of Object.entries(parsed.services ?? {})) {
       const hostPorts: number[] = []
       const containerPorts: number[] = []
       if (svc.ports && Array.isArray(svc.ports)) {
         for (const entry of svc.ports) {
-          const mapping = typeof entry === "string" ? parsePortMapping(entry) : null
-          if (mapping) {
+          if (typeof entry === "string" || typeof entry === "number") {
+            const raw = String(entry)
+            const r = interpolateComposeValue(raw, envMap)
+            if (r.unresolved.length > 0) {
+              for (const varName of r.unresolved) {
+                const warnKey = `${name}:${varName}`
+                if (!warnedVars.has(warnKey)) {
+                  warnedVars.add(warnKey)
+                  process.stderr.write(
+                    `⚠️  ports: skipping port for service '${name}' — unresolved variable(s): ${varName} (no env value, no compose default)\n`
+                  )
+                }
+              }
+              continue
+            }
+            const mapping = parsePortMapping(r.value)
+            if (!mapping) {
+              if (r.value !== raw) {
+                process.stderr.write(
+                  `⚠️  ports: service '${name}' — resolved to non-port value '${r.value}'\n`
+                )
+              }
+              continue
+            }
             hostPorts.push(mapping.hostPort)
             containerPorts.push(mapping.containerPort)
+          } else if (entry !== null && typeof entry === "object") {
+            const { target, published } = entry as {
+              target?: number | string
+              published?: number | string
+              protocol?: string
+              mode?: string
+            }
+            if (published === undefined || published === null) continue
+            const pubStr = String(published)
+            if (pubStr.includes("-") && !pubStr.startsWith("${")) continue
+            const pubR = interpolateComposeValue(pubStr, envMap)
+            if (pubR.unresolved.length > 0) {
+              for (const varName of pubR.unresolved) {
+                const warnKey = `${name}:${varName}`
+                if (!warnedVars.has(warnKey)) {
+                  warnedVars.add(warnKey)
+                  process.stderr.write(
+                    `⚠️  ports: skipping port for service '${name}' — unresolved variable(s): ${varName} (no env value, no compose default)\n`
+                  )
+                }
+              }
+              continue
+            }
+            const hostPort = Number.parseInt(pubR.value, 10)
+            if (!Number.isFinite(hostPort) || hostPort < 1 || hostPort > 65535) continue
+            const tgtStr = target !== undefined ? String(target) : ""
+            const tgtR = tgtStr
+              ? interpolateComposeValue(tgtStr, envMap)
+              : { value: "", unresolved: [] }
+            const containerPort = tgtStr ? Number.parseInt(tgtR.value, 10) : hostPort
+            if (!Number.isFinite(containerPort) || containerPort < 1 || containerPort > 65535)
+              continue
+            hostPorts.push(hostPort)
+            containerPorts.push(containerPort)
           }
         }
       }
@@ -203,33 +255,6 @@ function collectComposeServices(
       `⚠️  Failed to read compose file at ${composePath}: ${getErrorMessage(error)}\n`
     )
     return { file: null, services: {} }
-  }
-}
-
-function resolveComposePath(
-  worktreePath: string,
-  gitRoot: string,
-  config: WtbConfig
-): string | null {
-  if (config.docker_compose_file) {
-    // docker_compose_file は config(=gitRoot)基準の相対パス。
-    // worktree 内の同じ相対位置を優先、無ければ gitRoot 側を試す。
-    const inWorktree = path.resolve(worktreePath, config.docker_compose_file)
-    if (fileIsReadable(inWorktree)) return inWorktree
-    const inRoot = path.resolve(gitRoot, config.docker_compose_file)
-    if (fileIsReadable(inRoot)) return inRoot
-    return null
-  }
-  // docker_compose_file 未設定でも worktree に compose がある場合は拾う
-  return findComposeFile(worktreePath)
-}
-
-function fileIsReadable(p: string): boolean {
-  try {
-    accessSync(p, fsConstants.R_OK)
-    return true
-  } catch {
-    return false
   }
 }
 

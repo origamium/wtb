@@ -180,6 +180,125 @@ env:
         expect((error as InstanceType<typeof CLIError>).exitCode).toBe(EXIT_CODES.CONFIG_ERROR)
       }
     })
+
+    // H4: validateRawConfig runs BEFORE mergeWithDefaults — invalid raw values must be rejected
+    it("rejects port_propagation with an invalid scalar (string) before normalization (H4)", async () => {
+      const { CLIError } = await import("../../utils/error.js")
+      const { EXIT_CODES } = await import("../../constants/index.js")
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue("env:\n  port_propagation: yes")
+      vi.mocked(parse).mockReturnValue({
+        env: { port_propagation: "yes" } as unknown as WtbConfig["env"],
+      })
+
+      try {
+        loadConfig(testRepoPath)
+        expect.unreachable("loadConfig should have thrown")
+      } catch (error) {
+        expect(error).toBeInstanceOf(CLIError)
+        expect((error as InstanceType<typeof CLIError>).exitCode).toBe(EXIT_CODES.CONFIG_ERROR)
+        expect((error as Error).message).toContain("port_propagation")
+      }
+    })
+
+    it("rejects port_propagation with an invalid scalar (number) before normalization (H4)", async () => {
+      const { CLIError } = await import("../../utils/error.js")
+      const { EXIT_CODES } = await import("../../constants/index.js")
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue("env:\n  port_propagation: 42")
+      vi.mocked(parse).mockReturnValue({
+        env: { port_propagation: 42 } as unknown as WtbConfig["env"],
+      })
+
+      try {
+        loadConfig(testRepoPath)
+        expect.unreachable("loadConfig should have thrown")
+      } catch (error) {
+        expect(error).toBeInstanceOf(CLIError)
+        expect((error as InstanceType<typeof CLIError>).exitCode).toBe(EXIT_CODES.CONFIG_ERROR)
+        expect((error as Error).message).toContain("port_propagation")
+      }
+    })
+
+    it("accepts port_propagation: true (boolean shorthand) (H4)", () => {
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue("env:\n  port_propagation: true")
+      vi.mocked(parse).mockReturnValue({
+        base_branch: "main",
+        env: { port_propagation: true } as unknown as WtbConfig["env"],
+      })
+      expect(() => loadConfig(testRepoPath)).not.toThrow()
+    })
+
+    it("accepts port_propagation: false (boolean shorthand) (H4)", () => {
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue("env:\n  port_propagation: false")
+      vi.mocked(parse).mockReturnValue({
+        base_branch: "main",
+        env: { port_propagation: false } as unknown as WtbConfig["env"],
+      })
+      expect(() => loadConfig(testRepoPath)).not.toThrow()
+    })
+
+    it("accepts port_propagation as a full object (H4)", () => {
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue("env:\n  port_propagation:\n    enabled: true")
+      vi.mocked(parse).mockReturnValue({
+        base_branch: "main",
+        env: {
+          port_propagation: { enabled: true, files: [], compose: true },
+        } as unknown as WtbConfig["env"],
+      })
+      expect(() => loadConfig(testRepoPath)).not.toThrow()
+    })
+
+    it("rejects compose with an invalid container_name value before normalization (H4)", async () => {
+      const { CLIError } = await import("../../utils/error.js")
+      const { EXIT_CODES } = await import("../../constants/index.js")
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue("compose:\n  container_name: invalid")
+      vi.mocked(parse).mockReturnValue({
+        base_branch: "main",
+        compose: { container_name: "invalid" } as unknown as WtbConfig["compose"],
+      })
+
+      try {
+        loadConfig(testRepoPath)
+        expect.unreachable("loadConfig should have thrown")
+      } catch (error) {
+        expect(error).toBeInstanceOf(CLIError)
+        expect((error as InstanceType<typeof CLIError>).exitCode).toBe(EXIT_CODES.CONFIG_ERROR)
+        expect((error as Error).message).toContain("container_name")
+      }
+    })
+
+    it("rejects compose with isolate_name: non-boolean before normalization (H4)", async () => {
+      const { CLIError } = await import("../../utils/error.js")
+      const { EXIT_CODES } = await import("../../constants/index.js")
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue("compose:\n  isolate_name: yes")
+      vi.mocked(parse).mockReturnValue({
+        base_branch: "main",
+        compose: { isolate_name: "yes" } as unknown as WtbConfig["compose"],
+      })
+
+      try {
+        loadConfig(testRepoPath)
+        expect.unreachable("loadConfig should have thrown")
+      } catch (error) {
+        expect(error).toBeInstanceOf(CLIError)
+        expect((error as InstanceType<typeof CLIError>).exitCode).toBe(EXIT_CODES.CONFIG_ERROR)
+        expect((error as Error).message).toContain("isolate_name")
+      }
+    })
+
+    it("accepts absent port_propagation — defaults with no error (H4 back-compat)", () => {
+      vi.mocked(existsSync).mockReturnValue(true)
+      vi.mocked(fs.readFileSync).mockReturnValue("base_branch: main")
+      vi.mocked(parse).mockReturnValue({ base_branch: "main" })
+      const config = loadConfig(testRepoPath)
+      expect(config.env.port_propagation.enabled).toBe(true)
+    })
   })
 
   describe("findConfigFile", () => {

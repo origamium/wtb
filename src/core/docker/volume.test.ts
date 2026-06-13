@@ -10,6 +10,7 @@ import {
   discoverCloneableVolumes,
   formatBytes,
   formatEta,
+  getContainersUsingVolumeWithProject,
   parseRsyncProgress,
   resolveVolumeName,
 } from "./volume"
@@ -467,5 +468,51 @@ describe("copyVolume rsync robustness", () => {
     )
     expect(clearIdx).toBeGreaterThanOrEqual(0)
     expect(cpIdx).toBeGreaterThan(clearIdx)
+  })
+})
+
+describe("getContainersUsingVolumeWithProject", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it("parses tab-separated name + compose project label", () => {
+    vi.mocked(execDockerSafe).mockReturnValue("api-1\tmyproj\ndb-1\tmyproj")
+    expect(getContainersUsingVolumeWithProject("vol")).toEqual([
+      { name: "api-1", project: "myproj" },
+      { name: "db-1", project: "myproj" },
+    ])
+  })
+
+  it("maps a missing label (no tab) to project: null", () => {
+    vi.mocked(execDockerSafe).mockReturnValue("standalone-container")
+    expect(getContainersUsingVolumeWithProject("vol")).toEqual([
+      { name: "standalone-container", project: null },
+    ])
+  })
+
+  it("maps an empty label (trailing tab) to project: null", () => {
+    vi.mocked(execDockerSafe).mockReturnValue("c1\t")
+    expect(getContainersUsingVolumeWithProject("vol")).toEqual([{ name: "c1", project: null }])
+  })
+
+  it("returns [] for empty output", () => {
+    vi.mocked(execDockerSafe).mockReturnValue("")
+    expect(getContainersUsingVolumeWithProject("vol")).toEqual([])
+  })
+
+  it("ignores blank lines", () => {
+    vi.mocked(execDockerSafe).mockReturnValue("a\tp1\n\n\nb\tp2\n")
+    expect(getContainersUsingVolumeWithProject("vol")).toEqual([
+      { name: "a", project: "p1" },
+      { name: "b", project: "p2" },
+    ])
+  })
+
+  it("returns [] when execDockerSafe throws (error-swallowing like getContainersUsingVolume)", () => {
+    vi.mocked(execDockerSafe).mockImplementation(() => {
+      throw new Error("docker down")
+    })
+    expect(getContainersUsingVolumeWithProject("vol")).toEqual([])
   })
 })

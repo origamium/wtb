@@ -446,3 +446,111 @@ describe("restoreEnvFile", () => {
     expect(() => restoreEnvFile(filePath)).toThrow("Backup file not found")
   })
 })
+
+// =============================================================================
+// findNextFreePort (via copyAndAdjustEnvFile) — F3 high-port bug regression
+// =============================================================================
+
+describe("findNextFreePort via copyAndAdjustEnvFile — high-port regression (F3)", () => {
+  it("original port 54321 with {54322} used → returns 54323", () => {
+    const sourcePath = path.join(tmpDir, ".env")
+    const targetPath = path.join(tmpDir, ".env.out")
+    fs.writeFileSync(sourcePath, "DB_PORT=54321\n")
+
+    // 54322 is in use — should skip to 54323
+    copyAndAdjustEnvFile(sourcePath, targetPath, { DB_PORT: 1 }, undefined, [54322])
+
+    const result = fs.readFileSync(targetPath, "utf-8")
+    expect(result).toContain("DB_PORT=54323")
+  })
+
+  it("a port above 9999 finds the next free port above it (not clamped to 3000 range)", () => {
+    const sourcePath = path.join(tmpDir, ".env")
+    const targetPath = path.join(tmpDir, ".env.out")
+    fs.writeFileSync(sourcePath, "SUPA_PORT=54321\n")
+
+    // Nothing is in use — should bump to 54322 (originalPort + 1)
+    copyAndAdjustEnvFile(sourcePath, targetPath, { SUPA_PORT: 1 }, undefined, [])
+
+    const result = fs.readFileSync(targetPath, "utf-8")
+    expect(result).toContain("SUPA_PORT=54322")
+    // Must NOT fall back into the 3000-9999 range
+    expect(result).not.toMatch(/SUPA_PORT=3\d\d\d/)
+  })
+
+  it("never returns an in-use port — wraparound case with high original port", () => {
+    const sourcePath = path.join(tmpDir, ".env")
+    const targetPath = path.join(tmpDir, ".env.out")
+    fs.writeFileSync(sourcePath, "HIGH_PORT=65534\n")
+
+    // 65535 is in use — should wraparound to PORT_RANGE.MIN (3000) since that's free
+    copyAndAdjustEnvFile(sourcePath, targetPath, { HIGH_PORT: 1 }, undefined, [65535])
+
+    const result = fs.readFileSync(targetPath, "utf-8")
+    // The assigned port must not be 65535 (in use)
+    expect(result).not.toContain("HIGH_PORT=65535")
+    // Should have wrapped around to 3000
+    expect(result).toContain("HIGH_PORT=3000")
+  })
+
+  it("does not return originalPort+1 when that port is in usedPorts (regression: old fallback)", () => {
+    const sourcePath = path.join(tmpDir, ".env")
+    const targetPath = path.join(tmpDir, ".env.out")
+    fs.writeFileSync(sourcePath, "APP_PORT=54320\n")
+
+    // 54321 is in use — old code returned originalPort+1 unconditionally; new code must skip it
+    copyAndAdjustEnvFile(sourcePath, targetPath, { APP_PORT: 1 }, undefined, [54321])
+
+    const result = fs.readFileSync(targetPath, "utf-8")
+    expect(result).not.toContain("APP_PORT=54321")
+    expect(result).toContain("APP_PORT=54322")
+  })
+})
+
+// =============================================================================
+// H2 — findNextFreePort wraparound never returns originalPort itself
+// =============================================================================
+
+describe("findNextFreePort wraparound — never returns originalPort as its own bump (H2)", () => {
+  it("when everything above originalPort is used and originalPort is free, finds a lower port", () => {
+    // Scenario: originalPort=3001, all of 3002..65535 are in use.
+    // Old code: the wraparound loop `c <= originalPort` would return 3001 itself
+    //   (it's never in usedPorts) → a no-op bump (from === to), silently sharing the port.
+    // Fixed code: `c < originalPort` excludes 3001 → returns 3000 (first free below).
+    const sourcePath = path.join(tmpDir, ".env")
+    const targetPath = path.join(tmpDir, ".env.out")
+    fs.writeFileSync(sourcePath, "MY_PORT=3001\n")
+
+    const usedAbove = Array.from({ length: 65535 - 3002 + 1 }, (_, i) => 3002 + i)
+    copyAndAdjustEnvFile(sourcePath, targetPath, { MY_PORT: 1 }, undefined, usedAbove)
+
+    const result = fs.readFileSync(targetPath, "utf-8")
+    // Must NOT return 3001 (the originalPort — that's a no-op bump)
+    expect(result).not.toContain("MY_PORT=3001")
+    // Must return 3000 (the only free port in the range below originalPort)
+    expect(result).toContain("MY_PORT=3000")
+  })
+
+  it("wraparound result is never equal to originalPort", () => {
+    // PORT=3005, fill all of 3006..65535 and also 3000..3004.
+    // The only free slot below 3005 is none → should throw, not return 3005.
+    const sourcePath = path.join(tmpDir, ".env")
+    const targetPath = path.join(tmpDir, ".env.out")
+    fs.writeFileSync(sourcePath, "MY_PORT=3005\n")
+
+    // Fill everything above 3005 and everything in [3000, 3004]
+    const usedAll = [
+      ...Array.from({ length: 65535 - 3006 + 1 }, (_, i) => 3006 + i),
+      3000,
+      3001,
+      3002,
+      3003,
+      3004,
+    ]
+    // Should throw (all candidates exhausted) — the important thing is it must NOT
+    // silently return 3005 (the originalPort itself).
+    expect(() =>
+      copyAndAdjustEnvFile(sourcePath, targetPath, { MY_PORT: 1 }, undefined, usedAll)
+    ).toThrow()
+  })
+})

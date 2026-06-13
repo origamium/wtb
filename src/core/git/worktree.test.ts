@@ -8,7 +8,15 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { execGitSafe } from "../../utils/exec.js"
-import { createWorktree, isSamePath, parseWorktreeList } from "./worktree.js"
+import {
+  clearSkipWorktree,
+  createWorktree,
+  gitHashObject,
+  isSamePath,
+  loadWtbManagedManifest,
+  markWtbManagedFile,
+  parseWorktreeList,
+} from "./worktree.js"
 
 // createWorktree が組む git 引数を検証するため exec 層だけを mock する。
 // isSamePath / parseWorktreeList は純関数なので影響を受けない。
@@ -51,6 +59,117 @@ describe("createWorktree", () => {
     expect(execGitSafe).toHaveBeenCalledWith(
       ["worktree", "add", "/wt/feature-x", "-b", "feature/x", "--track", "origin/feature/x"],
       { cwd: undefined }
+    )
+  })
+})
+
+describe("wtb-managed manifest (B1)", () => {
+  let dir: string
+  let manifestPath: string
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.spyOn(console, "log").mockImplementation(() => {})
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "wtb-manifest-"))
+    manifestPath = path.join(dir, "wtb-managed.json")
+  })
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  /**
+   * execGitSafe を期待引数に応じて返り値を切り替える helper。
+   * - ls-files --error-unmatch: tracked かどうか (throw で untracked)
+   * - hash-object: その path の blob sha
+   * - rev-parse --git-path wtb-managed.json: manifest のパス (real temp file)
+   * - update-index: no-op
+   */
+  const wireGit = (opts: {
+    tracked?: boolean
+    shaByPath?: Record<string, string>
+  }): ReturnType<typeof vi.fn> => {
+    const fn = vi.fn((args: string[]) => {
+      if (args[0] === "ls-files") {
+        if (opts.tracked === false) throw new Error("not tracked")
+        return ""
+      }
+      if (args[0] === "hash-object") {
+        const p = args[args.length - 1]
+        const sha = opts.shaByPath?.[p]
+        if (sha === undefined) throw new Error("no sha")
+        return sha
+      }
+      if (args[0] === "rev-parse") return manifestPath
+      if (args[0] === "update-index") return ""
+      return ""
+    })
+    vi.mocked(execGitSafe).mockImplementation(fn as never)
+    return fn
+  }
+
+  it("markWtbManagedFile sets skip-worktree AND records the blob sha into the manifest", () => {
+    const git = wireGit({ tracked: true, shaByPath: { "docker-compose.yml": "abc123" } })
+
+    markWtbManagedFile(dir, "docker-compose.yml")
+
+    // skip-worktree が立つこと
+    expect(git).toHaveBeenCalledWith(
+      ["update-index", "--skip-worktree", "--", "docker-compose.yml"],
+      { cwd: dir }
+    )
+    // manifest に sha が記録されること
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"))
+    expect(manifest).toEqual({ "docker-compose.yml": "abc123" })
+  })
+
+  it("markWtbManagedFile is a no-op for an untracked file (no skip-worktree, no manifest)", () => {
+    const git = wireGit({ tracked: false })
+
+    markWtbManagedFile(dir, "untracked.yml")
+
+    expect(git).not.toHaveBeenCalledWith(
+      ["update-index", "--skip-worktree", "--", "untracked.yml"],
+      { cwd: dir }
+    )
+    expect(fs.existsSync(manifestPath)).toBe(false)
+  })
+
+  it("recording a second managed file merges into the existing manifest", () => {
+    wireGit({
+      tracked: true,
+      shaByPath: { "docker-compose.yml": "aaa", ".env": "bbb" },
+    })
+
+    markWtbManagedFile(dir, "docker-compose.yml")
+    markWtbManagedFile(dir, ".env")
+
+    expect(loadWtbManagedManifest(dir)).toEqual({
+      "docker-compose.yml": "aaa",
+      ".env": "bbb",
+    })
+  })
+
+  it("loadWtbManagedManifest returns {} when the manifest is absent or unreadable", () => {
+    wireGit({ tracked: true })
+    expect(loadWtbManagedManifest(dir)).toEqual({})
+    // 壊れた JSON も {} に落とす
+    fs.writeFileSync(manifestPath, "{ not json")
+    expect(loadWtbManagedManifest(dir)).toEqual({})
+  })
+
+  it("gitHashObject returns the trimmed sha, or null on error", () => {
+    wireGit({ tracked: true, shaByPath: { "a.txt": "deadbeef" } })
+    expect(gitHashObject(dir, "a.txt")).toBe("deadbeef")
+    expect(gitHashObject(dir, "missing.txt")).toBeNull()
+  })
+
+  it("clearSkipWorktree issues --no-skip-worktree (best-effort)", () => {
+    const git = wireGit({ tracked: true })
+    clearSkipWorktree(dir, "docker-compose.yml")
+    expect(git).toHaveBeenCalledWith(
+      ["update-index", "--no-skip-worktree", "--", "docker-compose.yml"],
+      { cwd: dir }
     )
   })
 })

@@ -47,9 +47,18 @@ export const DEFAULT_CONFIG = {
   env: {
     file: ["./.env"],
     adjust: {},
+    port_propagation: {
+      enabled: true,
+      files: [] as string[],
+      compose: true,
+    },
   },
   volumes: {
     exclude: [] as string[],
+  },
+  compose: {
+    isolate_name: true,
+    container_name: "suffix" as "suffix" | "strip" | "keep",
   },
 } as const
 
@@ -87,6 +96,9 @@ export const PORT_RANGE = {
   MAX: 9999,
   SEARCH_LIMIT: 100,
 } as const
+
+/** TCP ポートの絶対上限 */
+export const MAX_TCP_PORT = 65535
 
 // =============================================================================
 // File System Constants

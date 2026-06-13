@@ -12,18 +12,26 @@ import { loadConfig } from "../../core/config/loader.js"
 import { getUsedPorts } from "../../core/docker/client.js"
 import {
   adjustPortsInCompose,
+  type ComposeIdentityRewrite,
+  type ComposeValueChange,
   composeStart,
   composeStop,
+  composeUp,
   parsePortMapping,
+  propagatePortsInComposeValues,
   readComposeFile,
   resolveComposeProjectName,
+  rewriteComposeIdentity,
+  sanitizeProjectSlug,
   writeComposeFile,
 } from "../../core/docker/compose.js"
 import {
   copyVolume,
   discoverCloneableVolumes,
   getContainersUsingVolume,
+  getContainersUsingVolumeWithProject,
   getVolumeSize,
+  type ResolvedVolume,
   resolveVolumeName,
   volumeExists,
 } from "../../core/docker/volume.js"
@@ -31,20 +39,28 @@ import {
   copyAndAdjustEnvFile,
   type EnvAdjustmentChange,
   parseEnvFile,
+  writeEnvFile,
 } from "../../core/environment/processor.js"
+import { buildPortMap, propagatePortsInValue } from "../../core/environment/propagate.js"
 import {
   branchExists,
   getGitRootOrThrow,
   remoteBranchExists,
   revisionExists,
 } from "../../core/git/repository.js"
-import { createWorktree, getWorktreePath, listWorktrees } from "../../core/git/worktree.js"
-import type { WtbConfig } from "../../types/index.js"
+import {
+  createWorktree,
+  getWorktreePath,
+  listWorktrees,
+  markWtbManagedFile,
+} from "../../core/git/worktree.js"
+import type { ComposeConfig, WtbConfig } from "../../types/index.js"
 import { CLIError, getErrorMessage } from "../../utils/error.js"
 import { executeLifecycleCommand } from "../../utils/exec.js"
 import { out, setJsonOutputMode } from "../../utils/output.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
 import { createVolumeCopyProgressHandler } from "../utils/progress.js"
+import { runRelocatabilityPreflight } from "./doctor.js"
 
 interface CreateOptions {
   path?: string
@@ -81,6 +97,16 @@ export interface VolumeCopyResult {
   cloned: string[]
   skipped: Array<{ name: string; reason: string }>
   failed: Array<{ name: string; error: string }>
+  /**
+   * source スタックを停止した場合のみ設定する。restarted=false なら、ユーザの稼働中
+   * 環境が壊れたまま (再開失敗) なので、呼び出し側は非ゼロ終了し recoverCommand を出す。
+   */
+  sourceStack?: {
+    stopped: boolean
+    restarted: boolean
+    restartError?: string
+    recoverCommand?: string
+  }
 }
 
 /** 空の VolumeCopyResult を生成する (共有 mutable 定数を避けるためのファクトリ)。 */
@@ -226,6 +252,9 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
   // 設定ファイルを先に読み込み（base_branch を worktree 作成前に取得するため）
   const config = loadConfig(gitRoot)
 
+  // relocatability preflight (warnings only, never throws)
+  runRelocatabilityPreflight(gitRoot, config)
+
   // --seed の前提条件チェック (worktree を作る前に弾く)。
   const seedCommand = config.volumes?.seed_command
   if (useSeed) {
@@ -269,6 +298,8 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
   // --json 用の各 phase の結果トラッカー
   let envChanges: Record<string, { from: string; to: string }> = {}
   let composePorts: ComposePortChanges = {}
+  let composeIdentity: ComposeIdentityRewrite = { containerNames: [] }
+  let composeValueChanges: ComposeValueChange[] = []
   let volumeResult: VolumeCopyResult = emptyVolumeCopyResult()
   let startCommandFailed = false
 
@@ -333,7 +364,16 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
         out(`⚠️  Docker Compose source not found: ${config.docker_compose_file} (would skip)`)
       }
     } else {
-      composePorts = await setupDockerCompose(gitRoot, worktreePath, config)
+      const composeResult = await setupDockerCompose(
+        gitRoot,
+        worktreePath,
+        config,
+        branch,
+        envChanges
+      )
+      composePorts = composeResult.portChanges
+      composeIdentity = composeResult.identity
+      composeValueChanges = composeResult.composeValueChanges
     }
   }
 
@@ -379,12 +419,24 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
     }
   }
 
+  // source スタックを停止したまま再開に失敗した = ユーザの稼働中環境が壊れた状態。
+  // --strict の有無に関わらず非ゼロ終了 (DOCKER_ERROR) する。バナーの分岐にも使うので
+  // ここで先に計算する。
+  const sourceRestartFailed =
+    volumeResult.sourceStack?.stopped === true && volumeResult.sourceStack?.restarted === false
+
   // 成功メッセージ
   out("")
   if (dryRun) {
     out("🔍 Dry run complete — no changes were made")
   } else {
-    if (volumeFailures > 0) {
+    if (sourceRestartFailed) {
+      // source 環境が DOWN のまま = "成功" バナーを出してはいけない。詳細な recovery
+      // 行は下の sourceRestartFailed ブロックで出す。
+      out(
+        "❌ Worktree created, but the SOURCE Compose stack failed to restart — your source environment is DOWN. See below to recover it."
+      )
+    } else if (volumeFailures > 0) {
       // worktree itself is created, but its data isolation is incomplete. Make this
       // loud and machine-parsable so an autonomous agent doesn't treat it as clean.
       out(
@@ -431,21 +483,32 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
       dryRun,
       env: envChanges,
       composePorts,
+      composeIdentity,
+      composeValueChanges,
       volumes: volumeResult,
+      sourceRestartFailed,
       seed: useSeed ? { ran: !dryRun, failed: seedFailed } : null,
       startCommand: config.start_command
         ? { ran: !dryRun && !skipStart, failed: startCommandFailed }
         : null,
-      ok: volumeFailures === 0 && !seedFailed,
+      ok: volumeFailures === 0 && !seedFailed && !sourceRestartFailed,
     })
   }
 
-  // --strict: worktree は作成済みでも、データ分離が未達成 (volume クローン失敗 / seed 失敗)
-  // なら非ゼロ終了する。既定 (exit 0) は「worktree は存在する」契約を維持しつつ、CI や
-  // コーディングエージェントが失敗を確実に検知できるオプトインの経路を提供する。
-  // JSON モードでは payload を書き切ってから exitCode のみ設定する (prune と同じ理由:
-  // 即 process.exit すると stdout の flush 前に落ちて JSON が壊れる恐れがある)。
-  if (!dryRun && options.strict === true && (volumeFailures > 0 || seedFailed)) {
+  // 再開失敗時は recovery コマンドを stderr に出す (human モード)。
+  if (sourceRestartFailed && volumeResult.sourceStack?.recoverCommand) {
+    out(
+      `  ❌ The source Compose stack was stopped to clone volumes but FAILED to restart — your source environment is DOWN. Bring it back up manually:`
+    )
+    out(`     ${volumeResult.sourceStack.recoverCommand}`)
+  }
+
+  // exit code 解決 (即 process.exit せず process.exitCode を設定して JSON flush を保証):
+  // - source 再開失敗は --strict 無関係に DOCKER_ERROR (5)
+  // - --strict 時のデータ分離未達成 (volume/seed 失敗) は GENERAL_ERROR (1)
+  if (!dryRun && sourceRestartFailed) {
+    process.exitCode = EXIT_CODES.DOCKER_ERROR
+  } else if (!dryRun && options.strict === true && (volumeFailures > 0 || seedFailed)) {
     if (json) {
       process.exitCode = EXIT_CODES.GENERAL_ERROR
     } else {
@@ -599,36 +662,127 @@ async function executeSeedCommand(command: string, worktreePath: string): Promis
   }
 }
 
+/** setupDockerCompose の結果 (ポート remap + identity 書き換え)。 */
+export interface SetupComposeResult {
+  /** サービスごとの host ポート remap (original → adjusted) */
+  portChanges: ComposePortChanges
+  /** project name / container_name の書き換え内訳 (--json / ロギング用) */
+  identity: ComposeIdentityRewrite
+  /** env→compose ポート伝播による文字列値の書き換え内訳 (--json / ロギング用) */
+  composeValueChanges: ComposeValueChange[]
+}
+
 /**
- * Docker Compose ファイルをworktreeにコピーし、ポートを調整する
- * Docker が利用できない場合は無調整でコピーする
+ * Docker Compose ファイルをworktreeにコピーし、identity (project/container 名) と
+ * ポートを調整する。Docker が利用できない場合はポート調整なしで書き込む。
  *
- * @returns サービスごとの host ポート remap (original → adjusted)。調整なし/スキップ時は空。
+ * source の compose を一度だけ読み、in-memory な config に対して
+ * (1) identity 書き換え → (2) [F2 ポート伝播 挿入点] → (3) ポート調整 を適用し、
+ * 最後に一度だけ worktree へ書き出す。
+ *
+ * @returns ポート remap と identity 書き換え内訳。調整なし/スキップ時は空。
  */
 async function setupDockerCompose(
   gitRoot: string,
   worktreePath: string,
-  config: WtbConfig
-): Promise<ComposePortChanges> {
+  config: WtbConfig,
+  branch: string,
+  envChanges: Record<string, { from: string; to: string }> = {}
+): Promise<SetupComposeResult> {
   const portChanges: ComposePortChanges = {}
-  if (!config.docker_compose_file) return portChanges
+  const emptyIdentity: ComposeIdentityRewrite = { containerNames: [] }
+  const composeValueChanges: ComposeValueChange[] = []
+  if (!config.docker_compose_file) {
+    return { portChanges, identity: emptyIdentity, composeValueChanges }
+  }
 
   const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
   if (!existsSync(sourceComposePath)) {
     out(`⚠️  Docker Compose source not found: ${config.docker_compose_file} (skipped)`)
-    return portChanges
+    return { portChanges, identity: emptyIdentity, composeValueChanges }
   }
 
   const targetComposePath = path.resolve(worktreePath, config.docker_compose_file)
 
-  // ターゲットに既にファイルが存在する場合はスキップ（start_command 等でコピー済みの場合）
-  if (existsSync(targetComposePath)) return portChanges
+  // ターゲットに compose が既に存在しても (git 追跡ファイルは `git worktree add` で必ず
+  // checkout される / copy_files でコピーされる) スキップしない。worktree ごとの
+  // identity 分離・ポート伝播・ポート調整は、まさにその checkout 済みコピーを書き換えて
+  // 初めて効く。canonical な source を読んで transform し、target を上書きする
+  // (source は不変なので --exists-ok の再実行でも二重変換にならない)。
 
+  let identity: ComposeIdentityRewrite = emptyIdentity
   try {
     out("🐳 Configuring Docker Compose...")
 
-    const composeConfig = readComposeFile(sourceComposePath)
+    // source の compose を 1 度だけ読み、in-memory に transform を重ねて 1 度だけ書き出す。
+    const sourceConfig = readComposeFile(sourceComposePath)
 
+    // ── (1) identity 書き換え (per-worktree な project/container 名分離) ────────────
+    const composeIdentity = config.compose ?? { isolate_name: true, container_name: "suffix" }
+    let workingConfig = sourceConfig
+    if (composeIdentity.isolate_name || composeIdentity.container_name !== "keep") {
+      const slug = sanitizeProjectSlug(branch)
+      const rewritten = rewriteComposeIdentity(workingConfig, {
+        slug,
+        isolateName: composeIdentity.isolate_name,
+        containerNameMode: composeIdentity.container_name,
+      })
+      workingConfig = rewritten.config
+      identity = rewritten.rewrite
+
+      if (identity.projectName) {
+        out(`  🏷️  Compose project: ${identity.projectName.from} → ${identity.projectName.to}`)
+      }
+      for (const cn of identity.containerNames) {
+        if (cn.to === undefined) {
+          out(
+            `  🏷️  container_name stripped for service '${cn.service}' (was '${cn.from}'; compose will auto-generate)`
+          )
+        } else {
+          out(`  🏷️  container_name (${cn.service}): ${cn.from} → ${cn.to}`)
+        }
+      }
+    }
+
+    // container_name: keep で固定名が残っている場合、2 つ目の worktree の `up` が衝突する。
+    if (composeIdentity.container_name === "keep") {
+      const fixedNamed = Object.entries(sourceConfig.services ?? {})
+        .filter(
+          ([, svc]) => typeof (svc as { container_name?: unknown }).container_name === "string"
+        )
+        .map(([name]) => name)
+      if (fixedNamed.length > 0) {
+        out(
+          `  ⚠️  container_name: keep — services [${fixedNamed.join(", ")}] keep a FIXED container_name. A 2nd worktree's 'docker compose up' WILL collide on these names. Use container_name: suffix or strip to isolate.`
+        )
+      }
+    }
+
+    // ── (2) [F2 INSERTION POINT] ────────────────────────────────────────────────
+    // env→compose のポート伝播を PRISTINE な (ポート未調整の) workingConfig に適用する。
+    // workingConfig は既に identity 書き換え済みで、まだ書き出されていない (下の単一 write
+    // が最終形を 1 度だけ書く)。adjustPortsInCompose の前に適用することで、両者が同じ
+    // 文字列を奪い合わないようにする。
+    const propagationEnabled = config.env.port_propagation?.compose === true
+    const envChangeKeys = Object.keys(envChanges)
+    if (propagationEnabled && envChangeKeys.length > 0) {
+      // EnvAdjustmentChange[] 相当を再構築して PortMap を作る
+      const portMap = buildPortMap(
+        envChangeKeys.map((key) => ({
+          key,
+          from: envChanges[key].from,
+          to: envChanges[key].to,
+        }))
+      )
+      const propagated = propagatePortsInComposeValues(workingConfig, envChanges, portMap)
+      workingConfig = propagated.config
+      composeValueChanges.push(...propagated.changes)
+      for (const change of propagated.changes) {
+        out(`  🔁 compose ${change.location}: ${change.from} → ${change.to}`)
+      }
+    }
+
+    // ── (3) ポート調整 (使用中ポートを避けて host ポートを bump) ──────────────────
     // 実行中のコンテナのポートを取得してポート衝突を避ける
     // Docker が利用できない場合は空配列になる（エラーは無視）
     let usedPorts: number[] = []
@@ -638,14 +792,13 @@ async function setupDockerCompose(
       // Docker が利用できない場合はポート調整なし
     }
 
-    const adjustedConfig = adjustPortsInCompose(composeConfig, usedPorts)
-    await fs.ensureDir(path.dirname(targetComposePath))
-    writeComposeFile(targetComposePath, adjustedConfig)
-    out(`  ✅ Docker Compose file configured: ${config.docker_compose_file}`)
+    const adjustedConfig = adjustPortsInCompose(workingConfig, usedPorts)
 
     // どの host ポートがどこへ remap されたかをサービス単位で表示・収集する。
     // adjustPortsInCompose は ports 配列の順序を保つので index で突き合わせる。
-    for (const [serviceName, service] of Object.entries(composeConfig.services ?? {})) {
+    // identity 書き換えは ports を触らないので、比較は workingConfig (=identity後) と
+    // adjustedConfig の間で行う。
+    for (const [serviceName, service] of Object.entries(workingConfig.services ?? {})) {
       const originalPorts = service.ports
       const adjustedPorts = adjustedConfig.services?.[serviceName]?.ports
       if (!Array.isArray(originalPorts) || !Array.isArray(adjustedPorts)) continue
@@ -663,8 +816,35 @@ async function setupDockerCompose(
           from: originalParsed.hostPort,
           to: adjustedParsed.hostPort,
         })
-        out(`     ${serviceName}: ${originalParsed.hostPort} → ${adjustedParsed.hostPort}`)
       }
+    }
+
+    // M2: identity 書き換え・伝播・ポート調整のいずれも変化を生まなかった場合は、
+    // 追跡ファイルを無意味に reformat / skip-worktree しない (checkout 済みのまま残す)。
+    const changed =
+      identity.projectName !== undefined ||
+      identity.containerNames.length > 0 ||
+      composeValueChanges.length > 0 ||
+      Object.keys(portChanges).length > 0
+
+    if (changed) {
+      // ── 単一 write: 全 transform を適用し終えた最終形を 1 度だけ書き出す ──────────
+      await fs.ensureDir(path.dirname(targetComposePath))
+      writeComposeFile(targetComposePath, adjustedConfig)
+      // compose が git 追跡ファイルの場合、worktree ごとの書き換えで dirty にならないよう
+      // skip-worktree を立て、wtb の出力 sha を manifest に記録する (remove の dirty
+      // チェック / git status 汚染 / 誤コミット防止 + ユーザー手編集の保護)。
+      markWtbManagedFile(worktreePath, config.docker_compose_file)
+      out(`  ✅ Docker Compose file configured: ${config.docker_compose_file}`)
+      for (const [serviceName, changes] of Object.entries(portChanges)) {
+        for (const { from, to } of changes) {
+          out(`     ${serviceName}: ${from} → ${to}`)
+        }
+      }
+    } else {
+      out(
+        `  ℹ️  Docker Compose unchanged (no identity/port/propagation rewrite needed): ${config.docker_compose_file}`
+      )
     }
 
     // start_command がない場合は使い方を提案
@@ -674,7 +854,7 @@ async function setupDockerCompose(
   } catch (error) {
     out(`  ⚠️  Docker Compose setup skipped: ${getErrorMessage(error)}`)
   }
-  return portChanges
+  return { portChanges, identity, composeValueChanges }
 }
 
 /**
@@ -729,6 +909,9 @@ export async function setupVolumeCopy(
   const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
   if (!existsSync(sourceComposePath)) return emptyVolumeCopyResult()
 
+  // source の compose を読む。target project / target volume の解決には worktree の
+  // identity-rewrite 済みコピーを使う (compose phase が volume phase より前に走るので
+  // 既に存在する)。読めなければ source config にフォールバック。
   let composeConfig: ReturnType<typeof readComposeFile>
   try {
     composeConfig = readComposeFile(sourceComposePath)
@@ -744,147 +927,158 @@ export async function setupVolumeCopy(
   }
 
   // Compose の実際のプロジェクト名 (compose-spec 準拠) を解決する。
-  // `name:` が compose.yml に書かれていればそれを採用、なければディレクトリ名を
-  // Compose の正規化規則で整形する。`generateProjectName` は仕様より厳しい
-  // (underscore や dot をダッシュに置換) ため、ここでは使えない。
+  // source は source config + gitRoot、target は worktree の identity-rewrite 済み
+  // コピー + worktreePath から解決する (project 名が分離されているので別物になる)。
   const sourceProject = resolveComposeProjectName(composeConfig, gitRoot)
-  const targetProject = resolveComposeProjectName(composeConfig, worktreePath)
+  const targetComposePath = path.resolve(worktreePath, config.docker_compose_file)
+  let targetComposeConfig = composeConfig
+  try {
+    if (existsSync(targetComposePath)) {
+      targetComposeConfig = readComposeFile(targetComposePath)
+    }
+  } catch {
+    // worktree コピーが読めなければ source config にフォールバック
+  }
+  const targetProject = resolveComposeProjectName(targetComposeConfig, worktreePath)
   out("📦 Cloning Docker volumes...")
 
-  // stop-then-copy: source volume を使う稼働中コンテナがあり、--no-stop でも
-  // --force-volume-copy でもなければ、source スタックを停止してから安全にコピーし、
-  // finally で必ず再開する。これで「DB が起動中だと clone が skip される」という
-  // データ自律性のギャップ (README Roadmap) を解消する。
+  const result = emptyVolumeCopyResult()
+
+  // ── 防御ガード #1 (project レベル): source project === target project ──────────
+  // 固定 `name:` や COMPOSE_PROJECT_NAME により両 project 名が一致すると、clone は
+  // source volume を自分自身に上書きしてデータを破壊する (--force-volume-copy 経路)。
+  // stop ロジックの前に全 cloneable を failed にして即 return する。
+  if (sourceProject === targetProject) {
+    out(
+      `  ❌ Source and target Compose projects are identical ('${sourceProject}'). This usually means a fixed 'name:' in the compose file or a COMPOSE_PROJECT_NAME env var. Cloning would overwrite the source volume WITH ITSELF and destroy data — refusing.`
+    )
+    for (const key of cloneable) {
+      result.failed.push({
+        name: key,
+        error: `source and target Compose project are identical ('${sourceProject}') — cloning would overwrite the source volume`,
+      })
+    }
+    return result
+  }
+
+  // ── plan-before-stop: stop する前に全 cloneable volume を分類する ──────────────
   const stopEnabled = options.stop !== false
-  let stoppedStack = false
-  // process.exit() (e.g. the SIGINT/SIGTERM handlers in cli/index.ts) bypasses the
-  // finally below, so a Ctrl-C or kill mid-copy would leave the source stack down.
-  // Restart it from prepended signal handlers too — they run before the index
-  // handler exits. Both SIGINT (Ctrl-C) and SIGTERM (kill) are covered.
+  const force = options.force === true
+  const plan = planVolumeClones(
+    cloneable,
+    composeConfig,
+    targetComposeConfig,
+    sourceProject,
+    targetProject,
+    { force, stopEnabled }
+  )
+
+  // plan の skip を結果へ反映 (理由付き)。
+  for (const entry of plan) {
+    if (entry.action === "skip") {
+      out(`  ⏭️  ${entry.key}: ${entry.reason ?? "skipped"}`)
+      result.skipped.push({ name: entry.key, reason: entry.reason ?? "skipped" })
+    }
+  }
+
+  const needsStop = plan.some((e) => e.action === "clone-after-stop")
+
+  // SIGINT/SIGTERM (cli/index.ts の handler) は process.exit() で下の finally を
+  // バイパスするため、prepend した signal handler でも source を復帰させる。
   let restartOnAbort: (() => void) | undefined
   const abortSignals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"]
-  if (stopEnabled && !options.force) {
-    const anyInUse = cloneable.some((key) => {
-      const source = resolveVolumeName(composeConfig, key, sourceProject)
-      return (
-        !!source &&
-        !source.external &&
-        volumeExists(source.name) &&
-        getContainersUsingVolume(source.name).length > 0
-      )
-    })
-    if (anyInUse) {
-      out(
-        "  ⏸️  Source Compose stack is running — stopping it to clone volumes safely (will restart after)..."
-      )
+  let stoppedStack = false
+
+  // 停止した source スタックを堅牢に復帰する: composeStart → (失敗時) composeUp →
+  // (両方失敗時) error と recover コマンドを記録する。
+  const recoverCommand = `docker compose -f ${sourceComposePath} -p ${sourceProject} up -d`
+  const restartSourceStack = (): { restarted: boolean; error?: string } => {
+    try {
+      composeStart(sourceComposePath, sourceProject, gitRoot)
+      return { restarted: true }
+    } catch {
       try {
-        composeStop(sourceComposePath, sourceProject, gitRoot)
-        stoppedStack = true
-        restartOnAbort = () => {
-          try {
-            composeStart(sourceComposePath, sourceProject, gitRoot)
-          } catch {
-            // best-effort restart on abort; nothing else we can do mid-signal
-          }
-        }
-        for (const sig of abortSignals) {
-          process.prependListener(sig, restartOnAbort)
-        }
+        composeUp(sourceComposePath, sourceProject, gitRoot)
+        return { restarted: true }
       } catch (error) {
-        out(
-          `  ⚠️  Could not stop source stack (${getErrorMessage(error)}) — falling back to per-volume skip`
-        )
+        return { restarted: false, error: getErrorMessage(error) }
       }
     }
   }
 
-  const result = emptyVolumeCopyResult()
+  // ── stop は clone-after-stop が 1 件以上ある時だけ ─────────────────────────────
+  if (needsStop) {
+    out(
+      "  ⏸️  Source Compose stack is running — stopping it to clone volumes safely (will restart after)..."
+    )
+    try {
+      composeStop(sourceComposePath, sourceProject, gitRoot)
+      stoppedStack = true
+      restartOnAbort = () => {
+        // mid-signal は best-effort で堅牢復帰を試みる
+        restartSourceStack()
+      }
+      for (const sig of abortSignals) {
+        process.prependListener(sig, restartOnAbort)
+      }
+    } catch (error) {
+      out(
+        `  ⚠️  Could not stop source stack (${getErrorMessage(error)}) — clone-after-stop volumes will be skipped`
+      )
+      // 停止できなかったので、clone-after-stop だった entry を skip に降格する。
+      for (const entry of plan) {
+        if (entry.action === "clone-after-stop") {
+          entry.action = "skip"
+          entry.reason = "could not stop source stack to clone a live source volume"
+          result.skipped.push({ name: entry.key, reason: entry.reason })
+        }
+      }
+    }
+  }
 
   try {
-    for (const key of cloneable) {
-      const source = resolveVolumeName(composeConfig, key, sourceProject)
-      const target = resolveVolumeName(composeConfig, key, targetProject)
-      if (!source || !target) {
-        // discoverCloneableVolumes が external を弾いているのでここには来ない想定
-        continue
-      }
-      if (source.external) {
-        // 念のためのガード
-        continue
-      }
+    for (const entry of plan) {
+      if (entry.action === "skip") continue // 既に上で記録済み
 
-      // source 存在チェック
-      if (!volumeExists(source.name)) {
-        out(`  ℹ️  ${key}: source volume '${source.name}' does not exist yet — skipping`)
-        result.skipped.push({ name: key, reason: "source volume does not exist yet" })
-        continue
-      }
+      const { source, target } = entry
 
-      // 稼働中コンテナチェック (Postgres などのライブコピーは破損リスク)。force でない
-      // 限り、stoppedStack の有無に関わらず copy 直前に必ず再チェックする。これにより
-      // (a) --no-stop 時のライブ source skip、(b) スタックを停止したのに別 Compose
-      // project が共有名前付き volume を掴んでいて依然 in-use なケース、の両方を弾く。
-      if (!options.force) {
+      // 停止後の in-use 再チェック (安全網): force でなく、まだ掴まれているなら skip。
+      if (!force) {
         const usingContainers = getContainersUsingVolume(source.name)
         if (usingContainers.length > 0) {
           out(
-            `  ⚠️  ${key}: source volume '${source.name}' is in use by ${usingContainers.join(", ")}`
-          )
-          out(
-            stoppedStack
-              ? "      → skipping: still in use after stopping the source stack (likely held by another Compose project sharing this named volume) — stop that side or pass --force-volume-copy"
-              : "      → skipping (--no-stop set; stop the source stack manually, drop --no-stop to auto stop-then-copy, or pass --force-volume-copy to clone live with data-corruption risk)"
+            `  ⚠️  ${entry.key}: source volume '${source.name}' is still in use by ${usingContainers.join(", ")} after stopping — skipping`
           )
           result.skipped.push({
-            name: key,
-            reason: stoppedStack
-              ? "still in use after stopping the source stack"
-              : "source volume is in use by a running container (--no-stop)",
+            name: entry.key,
+            reason: "still in use after stopping the source stack",
           })
           continue
         }
       }
 
-      // target に既にデータが入っているかチェック (空の volume ならコピーで上書き OK)。
-      // getVolumeSize は確定できないと null を返す。null を「空」と誤認して上書き
-      // しないよう、null は「データがあるかもしれない」として扱う。
+      // target データ判定 (空なら上書き OK)。getVolumeSize は確定できないと null。
+      // null は「データがあるかも」として扱い、誤って上書きしない。
       let targetHadData = false
       if (volumeExists(target.name)) {
         const targetSize = getVolumeSize(target.name)
         const targetMayHaveData = targetSize === null || targetSize > 0
         if (targetMayHaveData) {
-          if (!options.force) {
-            const reason =
-              targetSize === null
-                ? "size could not be determined — skipping (use --force-volume-copy to overwrite anyway)"
-                : "already has data — skipping (use --force-volume-copy to overwrite)"
-            out(`  ⚠️  ${key}: target volume '${target.name}' ${reason}`)
-            result.skipped.push({
-              name: key,
-              reason:
-                targetSize === null
-                  ? "target volume size could not be determined"
-                  : "target volume already has data",
-            })
-            continue
-          }
-          // force=true: 既存データを上書きする。clearTarget=true を渡すと copyVolume が
-          // atomic 経路 (一時 volume にステージング→検証→target を置換) を使うので、
-          // コピーが途中で失敗しても target の既存データが空になることはない。
+          // force でないケースは plan 段階で skip 済みなので、ここに来るのは force のみ。
           targetHadData = true
         }
       }
 
       try {
         await copyVolume(source.name, target.name, {
-          onProgress: createVolumeCopyProgressHandler(`  📦 ${key}`),
+          onProgress: createVolumeCopyProgressHandler(`  📦 ${entry.key}`),
           clearTarget: targetHadData,
         })
         out(`  ✅ Cloned ${source.name} → ${target.name}`)
-        result.cloned.push(key)
+        result.cloned.push(entry.key)
       } catch (error) {
-        out(`  ❌ Failed to clone ${key}: ${getErrorMessage(error)}`)
-        result.failed.push({ name: key, error: getErrorMessage(error) })
+        out(`  ❌ Failed to clone ${entry.key}: ${getErrorMessage(error)}`)
+        result.failed.push({ name: entry.key, error: getErrorMessage(error) })
       }
     }
 
@@ -899,19 +1093,155 @@ export async function setupVolumeCopy(
     }
     if (stoppedStack) {
       out("  ▶️  Restarting source Compose stack...")
-      try {
-        composeStart(sourceComposePath, sourceProject, gitRoot)
+      const restart = restartSourceStack()
+      if (restart.restarted) {
         out("  ✅ Source stack restarted")
-      } catch (error) {
-        out(`  ⚠️  Failed to restart source stack: ${getErrorMessage(error)}`)
-        out(
-          "     Bring it back up manually: 'docker compose start' (or 'up -d') in the source repo."
-        )
+        result.sourceStack = { stopped: true, restarted: true }
+      } else {
+        out(`  ⚠️  Failed to restart source stack: ${restart.error}`)
+        out(`     Bring it back up manually: ${recoverCommand}`)
+        result.sourceStack = {
+          stopped: true,
+          restarted: false,
+          restartError: restart.error,
+          recoverCommand,
+        }
       }
     }
   }
 
   return result
+}
+
+/** plan-before-stop が分類する各 volume の処理。 */
+type CloneAction = "clone" | "clone-after-stop" | "skip"
+
+/** plan-before-stop の 1 volume 分の判定結果。 */
+interface VolumeClonePlanEntry {
+  key: string
+  action: CloneAction
+  reason?: string
+  source: ResolvedVolume
+  target: ResolvedVolume
+}
+
+/**
+ * source スタックを停止する前に、各 cloneable volume を分類する純粋な計画ステップ。
+ *
+ * これにより「全 volume が skip されるのに source スタックだけ無駄に停止される」という
+ * リグレッションを防ぎ、別 Compose project が掴む volume を検出して source を止めずに
+ * skip できる。
+ *
+ * 判定順 (全て stop 前に評価):
+ * 1. source volume 不在 → skip
+ * 2. source.name === target.name (固定共有名) → skip (external 相当)
+ * 3. target にデータあり (size null or >0) AND !force → skip
+ * 4. 稼働中コンテナ (project 付き):
+ *    - 全 holder が sourceProject → clone-after-stop (stopEnabled && !force) else skip
+ *    - foreign holder (project !== sourceProject, null 含む) あり → 停止せず skip
+ * 5. それ以外 → clone
+ *
+ * @internal exported for unit testing
+ */
+export function planVolumeClones(
+  cloneable: string[],
+  composeConfig: ComposeConfig,
+  targetComposeConfig: ComposeConfig,
+  sourceProject: string,
+  targetProject: string,
+  opts: { force: boolean; stopEnabled: boolean }
+): VolumeClonePlanEntry[] {
+  const plan: VolumeClonePlanEntry[] = []
+
+  for (const key of cloneable) {
+    const source = resolveVolumeName(composeConfig, key, sourceProject)
+    const target = resolveVolumeName(targetComposeConfig, key, targetProject)
+    if (!source || !target) continue // external は discover で弾かれている想定
+    if (source.external) continue
+
+    // 1. source 不在
+    if (!volumeExists(source.name)) {
+      plan.push({
+        key,
+        action: "skip",
+        reason: "source volume does not exist yet",
+        source,
+        target,
+      })
+      continue
+    }
+
+    // 2. 固定共有名 (source.name === target.name) → skip (external 同様 clone しない)
+    if (source.name === target.name) {
+      plan.push({
+        key,
+        action: "skip",
+        reason: "volume has a fixed name shared across projects — not cloned",
+        source,
+        target,
+      })
+      continue
+    }
+
+    // 3. target にデータあり AND !force → skip
+    if (!opts.force && volumeExists(target.name)) {
+      const targetSize = getVolumeSize(target.name)
+      if (targetSize === null || targetSize > 0) {
+        plan.push({
+          key,
+          action: "skip",
+          reason:
+            targetSize === null
+              ? "target volume size could not be determined"
+              : "target volume already has data",
+          source,
+          target,
+        })
+        continue
+      }
+    }
+
+    // 4. 稼働中コンテナ (project 付き)
+    const holders = getContainersUsingVolumeWithProject(source.name)
+    if (holders.length > 0) {
+      const foreign = holders.filter((h) => h.project !== sourceProject)
+      if (foreign.length > 0) {
+        // foreign holder あり → source を止めても解放されないので停止せず skip
+        const proj = foreign[0].project ?? "unknown"
+        plan.push({
+          key,
+          action: "skip",
+          reason: `held by another Compose project '${proj}' — stopping the source stack won't free it`,
+          source,
+          target,
+        })
+        continue
+      }
+      // 全 holder が sourceProject
+      if (opts.force) {
+        // force は live-copy する (停止不要)
+        plan.push({ key, action: "clone", source, target })
+        continue
+      }
+      if (opts.stopEnabled) {
+        plan.push({ key, action: "clone-after-stop", source, target })
+      } else {
+        plan.push({
+          key,
+          action: "skip",
+          reason: "source volume is in use by a running container (--no-stop)",
+          source,
+          target,
+        })
+      }
+      continue
+    }
+
+    // 5. それ以外 → clone
+    plan.push({ key, action: "clone", source, target })
+  }
+
+  return plan
 }
 
 /**
@@ -974,15 +1304,35 @@ function collectWorktreeEnvPorts(targetRoot: string, config: WtbConfig): number[
  *
  * @returns 変更されたキーごとの from/to (例: APP_PORT: 3000 → 3001)。--json の env フィールドにも使う。
  */
-async function applyEnvAdjustments(
+export async function applyEnvAdjustments(
   sourceRoot: string,
   targetRoot: string,
   config: WtbConfig
 ): Promise<Record<string, { from: string; to: string }>> {
   // 他の全 worktree (main 含む) で使用中のポートを収集（衝突防止）
   const usedPorts = collectWorktreeEnvPorts(targetRoot, config)
+  // Docker が publish しているポートも除外する（docker ps から取得、失敗時は無視）
+  try {
+    for (const p of getUsedPorts()) usedPorts.push(p)
+  } catch {
+    // docker unavailable — degrade silently
+  }
   const allChanges: Record<string, { from: string; to: string }> = {}
+  // pass 1 で env.adjust により直接書き換えられたキー。pass 2 はこれらの値を
+  // 伝播で上書きしてはいけない（自分自身を二重に書き換えてしまう）。
+  const directlyAdjustedKeys = new Set<string>()
+  // pass 1 の累積 changes（propagation-only ファイル用の union map に使う）。
+  const allEnvAdjustmentChanges: EnvAdjustmentChange[] = []
+  // M7: pass 1 で各 env.file ごとに実際に適用した bump を記録する。pass 2 の伝播は
+  // 「そのファイル自身の bump から作った port map」を使う。同じキー (例 APP_PORT) が
+  // 2 つの env.file に現れて独立に bump されても (file A は 3001、file B は 3002)、
+  // flat な last-write-wins map で file A の埋め込みポートが file B の値に伝播する
+  // バグを防ぐ (各ファイルは自分の bump に従う)。
+  const changesByTarget = new Map<string, EnvAdjustmentChange[]>()
+  // pass 1 でコピー済みの target ファイル（pass 2 で再コピーを避ける）。
+  const copiedTargets = new Set<string>()
 
+  // ── Pass 1: 既存挙動（env.file ごとに copyAndAdjustEnvFile） ──────────────────
   for (const relativePath of config.env.file) {
     const sourcePath = path.resolve(sourceRoot, relativePath)
     const targetPath = path.resolve(targetRoot, relativePath)
@@ -1003,13 +1353,108 @@ async function applyEnvAdjustments(
         usedPorts,
         changes
       )
+      copiedTargets.add(path.resolve(targetPath))
+      changesByTarget.set(path.resolve(targetPath), changes)
       out(`  ✅ Applied ${adjustedCount} adjustment(s): ${relativePath}`)
       for (const change of changes) {
         out(`     ${change.key}: ${change.from} → ${change.to}`)
         allChanges[change.key] = { from: change.from, to: change.to }
+        allEnvAdjustmentChanges.push(change)
+        directlyAdjustedKeys.add(change.key)
       }
     } catch (error) {
       out(`  ❌ Failed to adjust ${relativePath}: ${getErrorMessage(error)}`)
+    }
+  }
+
+  // ── Pass 2: ポート伝播（enabled かつ map が非空のときのみ） ───────────────────
+  // env.adjust で変更されたポートを、直接調整されなかったキーの値（URL 等）に
+  // 伝播させる。CRITICAL: 新値は常に SOURCE テキストから 1 パスの map で導出し、
+  // 既に書き換え済みの target テキストからは導出しない（A→B の二重マップ防止）。
+  const propagation = config.env.port_propagation
+  if (propagation?.enabled) {
+    // propagation-only ファイル (env.file ではないが propagation.files に載るファイル)
+    // は自分自身の bump を持たないので、全 env.file の bump を集めた union map に従う。
+    const unionMap = buildPortMap(allEnvAdjustmentChanges)
+    const envFileSet = new Set(config.env.file)
+    if (unionMap.size > 0) {
+      const filesToPropagate = Array.from(new Set([...config.env.file, ...propagation.files]))
+
+      for (const relativePath of filesToPropagate) {
+        const sourcePath = path.resolve(sourceRoot, relativePath)
+        const targetPath = path.resolve(targetRoot, relativePath)
+        const resolvedTarget = path.resolve(targetPath)
+
+        // M7: env.file は「そのファイル自身の pass-1 bump」から作った map を使う。
+        // propagation-only ファイルは union map を使う (自分の bump を持たないため)。
+        const portMap = envFileSet.has(relativePath)
+          ? buildPortMap(changesByTarget.get(resolvedTarget) ?? [])
+          : unionMap
+
+        if (!existsSync(sourcePath)) {
+          // propagation.files のみに載っていて source が無いケースは静かにスキップ。
+          if (!config.env.file.includes(relativePath)) {
+            out(`  ⚠️  Skip propagation (source not found): ${relativePath}`)
+          }
+          continue
+        }
+
+        // このファイル固有の map が空なら伝播対象が無いのでスキップ。
+        if (portMap.size === 0) continue
+
+        try {
+          // propagation 専用ファイル（pass 1 でコピーされていない）は先に source→target
+          // をそのままコピーする。env.adjust の bump は適用しない（伝播のみ受ける）。
+          if (!copiedTargets.has(resolvedTarget)) {
+            await fs.ensureDir(path.dirname(targetPath))
+            await fs.copy(sourcePath, targetPath)
+            copiedTargets.add(resolvedTarget)
+          }
+
+          const source = parseEnvFile(sourcePath)
+          const target = parseEnvFile(targetPath)
+          // source の key→value ルックアップ（target の値は SOURCE から導出するため）。
+          const sourceValueByKey = new Map(source.entries.map((e) => [e.key, e.value]))
+
+          let propagated = 0
+          for (const line of target.lines) {
+            if (line.type !== "entry") continue
+            // pass 1 で直接調整されたキーは伝播対象外（自己二重書き換え防止）。
+            if (directlyAdjustedKeys.has(line.key)) continue
+            const sourceValue = sourceValueByKey.get(line.key)
+            if (sourceValue === undefined) continue
+            const { value: newValue, hits } = propagatePortsInValue(sourceValue, portMap)
+            if (hits.length === 0 || newValue === line.value) continue
+            out(`     ${line.key}: ${line.value} → ${newValue}`)
+            line.value = newValue
+            // entries 配列も同期
+            const entry = target.entries.find((e) => e.key === line.key)
+            if (entry) entry.value = newValue
+            // --json の env フィールドへ追加（additive）。
+            allChanges[line.key] = { from: sourceValue, to: newValue }
+            propagated++
+          }
+
+          if (propagated > 0) {
+            writeEnvFile(targetPath, target)
+            out(`  🔁 Propagated ${propagated} port reference(s): ${relativePath}`)
+          }
+        } catch (error) {
+          out(`  ❌ Failed to propagate ${relativePath}: ${getErrorMessage(error)}`)
+        }
+      }
+    }
+  }
+
+  // wtb が worktree に書き出した env ファイルが git 追跡なら skip-worktree を立てる。
+  // 追跡ファイルへの調整は worktree を dirty にし、remove の dirty チェックや
+  // `git worktree remove` を誤発火させ、ユーザーの git status を汚す。
+  for (const relativePath of new Set([
+    ...config.env.file,
+    ...(config.env.port_propagation?.files ?? []),
+  ])) {
+    if (copiedTargets.has(path.resolve(targetRoot, relativePath))) {
+      markWtbManagedFile(targetRoot, relativePath)
     }
   }
 

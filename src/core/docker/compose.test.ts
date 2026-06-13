@@ -1,11 +1,31 @@
-import { describe, expect, it } from "vitest"
+import * as os from "node:os"
+import * as path from "node:path"
+import fs from "fs-extra"
+import { parse } from "yaml"
+import { afterEach, beforeEach, describe, expect, it } from "vitest"
 import type { ComposeConfig } from "../../types/index.js"
+import { buildPortMap } from "../environment/propagate.js"
 import {
   adjustPortsInCompose,
   findAvailablePort,
   parsePortMapping,
+  propagatePortsInComposeValues,
   resolveComposeProjectName,
+  rewriteComposeIdentity,
+  sanitizeContainerName,
+  sanitizeProjectSlug,
+  writeComposeFile,
 } from "./compose"
+
+let tmpDir: string
+
+beforeEach(() => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "wtb-compose-test-"))
+})
+
+afterEach(() => {
+  fs.removeSync(tmpDir)
+})
 
 const empty = (extra: Partial<ComposeConfig> = {}): ComposeConfig => ({
   services: {},
@@ -105,13 +125,16 @@ describe("parsePortMapping", () => {
   })
 
   it("parses IP:HOST:CONTAINER", () => {
-    expect(parsePortMapping("0.0.0.0:3000:80")).toEqual({ hostPort: 3000, containerPort: 80 })
-    expect(parsePortMapping("127.0.0.1:5432:5432")).toEqual({ hostPort: 5432, containerPort: 5432 })
+    expect(parsePortMapping("0.0.0.0:3000:80")).toMatchObject({ hostPort: 3000, containerPort: 80 })
+    expect(parsePortMapping("127.0.0.1:5432:5432")).toMatchObject({
+      hostPort: 5432,
+      containerPort: 5432,
+    })
   })
 
   it("parses an optional /tcp or /udp protocol suffix", () => {
-    expect(parsePortMapping("3000:80/tcp")).toEqual({ hostPort: 3000, containerPort: 80 })
-    expect(parsePortMapping("6379:6379/udp")).toEqual({ hostPort: 6379, containerPort: 6379 })
+    expect(parsePortMapping("3000:80/tcp")).toMatchObject({ hostPort: 3000, containerPort: 80 })
+    expect(parsePortMapping("6379:6379/udp")).toMatchObject({ hostPort: 6379, containerPort: 6379 })
   })
 
   it("returns null for non-string input", () => {
@@ -168,6 +191,21 @@ describe("findAvailablePort", () => {
     expect(used).not.toContain(got)
     expect(got).toBe(3100)
   })
+
+  it("findAvailablePort(54321, [54321, 54322]) returns 54323 — not a 3000-range port (F3 regression)", () => {
+    // Old code capped the search at PORT_RANGE.MAX (9999); the loop body never ran for
+    // a 54321 base, so it fell back to returning the in-use basePort.
+    expect(findAvailablePort(54321, [54321, 54322])).toBe(54323)
+  })
+
+  it("findAvailablePort(54321, [54321]) returns 54322 — first free above the high port", () => {
+    expect(findAvailablePort(54321, [54321])).toBe(54322)
+  })
+
+  it("findAvailablePort(54321, []) returns 54321 — free port is kept as-is", () => {
+    // Fast-path: original is free, return it unchanged.
+    expect(findAvailablePort(54321, [])).toBe(54321)
+  })
 })
 
 describe("adjustPortsInCompose", () => {
@@ -206,5 +244,385 @@ describe("adjustPortsInCompose", () => {
   it("leaves unparseable mappings (e.g. ranges) untouched rather than corrupting them", () => {
     const out = adjustPortsInCompose(cfg(["5000-6000:5000-6000"]), [5000])
     expect(out.services.web.ports).toEqual(["5000-6000:5000-6000"])
+  })
+})
+
+describe("propagatePortsInComposeValues", () => {
+  // KONG_HTTP_PORT bumped 54321 → 54322 by env.adjust.
+  const envChanges = { KONG_HTTP_PORT: { from: "54321", to: "54322" } }
+  const map = buildPortMap([{ key: "KONG_HTTP_PORT", from: "54321", to: "54322" }])
+
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: testing compose ${VAR:-default} syntax
+  it("rewrites both a bare-port URL in environment and the ${VAR:-default} in ports", () => {
+    const cfg: ComposeConfig = {
+      services: {
+        kong: {
+          image: "kong",
+          environment: { API_EXTERNAL_URL: "http://127.0.0.1:54321" },
+          // biome-ignore lint/suspicious/noTemplateCurlyInString: literal compose syntax
+          ports: ["${KONG_HTTP_PORT:-54321}:8000"],
+        },
+      },
+    }
+    const { config, changes } = propagatePortsInComposeValues(cfg, envChanges, map)
+
+    expect((config.services.kong.environment as Record<string, string>).API_EXTERNAL_URL).toBe(
+      "http://127.0.0.1:54322"
+    )
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal compose syntax
+    expect(config.services.kong.ports).toEqual(["${KONG_HTTP_PORT:-54322}:8000"])
+    // input untouched (structuredClone)
+    expect((cfg.services.kong.environment as Record<string, string>).API_EXTERNAL_URL).toBe(
+      "http://127.0.0.1:54321"
+    )
+
+    const locations = changes.map((c) => c.location).sort()
+    expect(locations).toEqual(["kong.environment.API_EXTERNAL_URL", "kong.ports[0]"])
+  })
+
+  it("handles list-form environment (KEY=VALUE) keeping the KEY intact", () => {
+    const cfg: ComposeConfig = {
+      services: {
+        kong: {
+          image: "kong",
+          environment: ["API_EXTERNAL_URL=http://127.0.0.1:54321", "FOO=bar"],
+        },
+      },
+    }
+    const { config } = propagatePortsInComposeValues(cfg, envChanges, map)
+    expect(config.services.kong.environment).toEqual([
+      "API_EXTERNAL_URL=http://127.0.0.1:54322",
+      "FOO=bar",
+    ])
+  })
+
+  it("does NOT touch a 5432 substring when only 54321 is mapped (boundary safety)", () => {
+    const cfg: ComposeConfig = {
+      services: {
+        db: {
+          image: "postgres",
+          environment: { DATABASE_URL: "postgres://user@127.0.0.1:5432/db" },
+        },
+      },
+    }
+    const { config, changes } = propagatePortsInComposeValues(cfg, envChanges, map)
+    expect((config.services.db.environment as Record<string, string>).DATABASE_URL).toBe(
+      "postgres://user@127.0.0.1:5432/db"
+    )
+    expect(changes).toHaveLength(0)
+  })
+
+  it("with an empty port map leaves everything unchanged (propagation effectively off)", () => {
+    const cfg: ComposeConfig = {
+      services: {
+        kong: {
+          image: "kong",
+          environment: { API_EXTERNAL_URL: "http://127.0.0.1:54321" },
+          // biome-ignore lint/suspicious/noTemplateCurlyInString: literal compose syntax
+          ports: ["${KONG_HTTP_PORT:-54321}:8000"],
+        },
+      },
+    }
+    const { config, changes } = propagatePortsInComposeValues(cfg, {}, new Map())
+    expect((config.services.kong.environment as Record<string, string>).API_EXTERNAL_URL).toBe(
+      "http://127.0.0.1:54321"
+    )
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal compose syntax
+    expect(config.services.kong.ports).toEqual(["${KONG_HTTP_PORT:-54321}:8000"])
+    expect(changes).toHaveLength(0)
+  })
+})
+
+describe("sanitizeProjectSlug", () => {
+  it("lowercases, replaces invalid chars with '-', and keeps underscores", () => {
+    expect(sanitizeProjectSlug("feature/Foo_Bar!")).toBe("feature-foo_bar")
+  })
+
+  it("collapses repeated dashes", () => {
+    expect(sanitizeProjectSlug("a//__b")).toBe("a-__b")
+    expect(sanitizeProjectSlug("a   b")).toBe("a-b")
+  })
+
+  it("strips a leading underscore (not a valid compose-v2 first char)", () => {
+    expect(sanitizeProjectSlug("_leading")).toBe("leading")
+  })
+
+  it("strips leading dashes produced by leading invalid chars", () => {
+    expect(sanitizeProjectSlug("!!!abc")).toBe("abc")
+  })
+
+  it("keeps a leading digit (valid first char in compose v2)", () => {
+    expect(sanitizeProjectSlug("1-branch")).toBe("1-branch")
+  })
+
+  it("trims trailing dashes", () => {
+    expect(sanitizeProjectSlug("branch/")).toBe("branch")
+  })
+
+  it("falls back to 'wtb' when the input sanitizes to empty", () => {
+    expect(sanitizeProjectSlug("///")).toBe("wtb")
+    expect(sanitizeProjectSlug("")).toBe("wtb")
+  })
+})
+
+describe("sanitizeContainerName", () => {
+  it("preserves uppercase and dots (unlike project slug)", () => {
+    expect(sanitizeContainerName("My.App-db")).toBe("My.App-db")
+  })
+
+  it("replaces invalid chars with '-'", () => {
+    expect(sanitizeContainerName("api/server!")).toBe("api-server-")
+  })
+
+  it("strips leading invalid chars (., -) until a valid first char remains", () => {
+    expect(sanitizeContainerName("-leading")).toBe("leading")
+    expect(sanitizeContainerName(".dotfirst")).toBe("dotfirst")
+  })
+
+  it("falls back to 'wtb' when empty", () => {
+    expect(sanitizeContainerName("")).toBe("wtb")
+  })
+})
+
+describe("rewriteComposeIdentity", () => {
+  const cfg = (extra: Partial<ComposeConfig> = {}): ComposeConfig => ({
+    services: { web: { image: "nginx" }, db: { image: "postgres" } },
+    ...extra,
+  })
+
+  it("rewrites top-level name when present and isolateName=true (re-sanitizing the join)", () => {
+    const input = cfg({ name: "myapp" } as ComposeConfig)
+    const { config, rewrite } = rewriteComposeIdentity(input, {
+      slug: "feature-x",
+      isolateName: true,
+      containerNameMode: "keep",
+    })
+    expect((config as { name?: string }).name).toBe("myapp-feature-x")
+    expect(rewrite.projectName).toEqual({ from: "myapp", to: "myapp-feature-x" })
+    // original untouched (structuredClone)
+    expect((input as { name?: string }).name).toBe("myapp")
+  })
+
+  it("leaves name absent when the source has no name:", () => {
+    const { config, rewrite } = rewriteComposeIdentity(cfg(), {
+      slug: "feature-x",
+      isolateName: true,
+      containerNameMode: "keep",
+    })
+    expect((config as { name?: string }).name).toBeUndefined()
+    expect(rewrite.projectName).toBeUndefined()
+  })
+
+  it("leaves name untouched when isolateName=false", () => {
+    const { config, rewrite } = rewriteComposeIdentity(cfg({ name: "myapp" } as ComposeConfig), {
+      slug: "feature-x",
+      isolateName: false,
+      containerNameMode: "keep",
+    })
+    expect((config as { name?: string }).name).toBe("myapp")
+    expect(rewrite.projectName).toBeUndefined()
+  })
+
+  it("suffix mode: appends the slug to each container_name", () => {
+    const input = cfg({
+      services: {
+        web: { image: "nginx", container_name: "web" },
+        db: { image: "postgres", container_name: "db" },
+      },
+    })
+    const { config, rewrite } = rewriteComposeIdentity(input, {
+      slug: "feat-1",
+      isolateName: false,
+      containerNameMode: "suffix",
+    })
+    expect(config.services.web.container_name).toBe("web-feat-1")
+    expect(config.services.db.container_name).toBe("db-feat-1")
+    expect(rewrite.containerNames).toEqual([
+      { service: "web", from: "web", to: "web-feat-1" },
+      { service: "db", from: "db", to: "db-feat-1" },
+    ])
+  })
+
+  it("strip mode: removes the container_name key entirely", () => {
+    const input = cfg({
+      services: { web: { image: "nginx", container_name: "web" } },
+    })
+    const { config, rewrite } = rewriteComposeIdentity(input, {
+      slug: "feat-1",
+      isolateName: false,
+      containerNameMode: "strip",
+    })
+    expect("container_name" in config.services.web).toBe(false)
+    expect(rewrite.containerNames).toEqual([{ service: "web", from: "web", to: undefined }])
+  })
+
+  it("keep mode: leaves container_name untouched and records nothing", () => {
+    const input = cfg({
+      services: { web: { image: "nginx", container_name: "web" } },
+    })
+    const { config, rewrite } = rewriteComposeIdentity(input, {
+      slug: "feat-1",
+      isolateName: true,
+      containerNameMode: "keep",
+    })
+    expect(config.services.web.container_name).toBe("web")
+    expect(rewrite.containerNames).toEqual([])
+  })
+
+  it("ignores services without a container_name in suffix mode", () => {
+    const { rewrite } = rewriteComposeIdentity(cfg(), {
+      slug: "feat-1",
+      isolateName: false,
+      containerNameMode: "suffix",
+    })
+    expect(rewrite.containerNames).toEqual([])
+  })
+
+  it("Supabase-like fixture: fixed name + several container_name services", () => {
+    const input: ComposeConfig = {
+      name: "supabase",
+      services: {
+        db: { image: "supabase/postgres", container_name: "supabase-db" },
+        auth: { image: "supabase/gotrue", container_name: "supabase-auth" },
+        rest: { image: "postgrest/postgrest", container_name: "supabase-rest" },
+        studio: { image: "supabase/studio" }, // no container_name
+      },
+    } as ComposeConfig
+    const { config, rewrite } = rewriteComposeIdentity(input, {
+      slug: "pr-42",
+      isolateName: true,
+      containerNameMode: "suffix",
+    })
+    expect((config as { name?: string }).name).toBe("supabase-pr-42")
+    expect(config.services.db.container_name).toBe("supabase-db-pr-42")
+    expect(config.services.auth.container_name).toBe("supabase-auth-pr-42")
+    expect(config.services.rest.container_name).toBe("supabase-rest-pr-42")
+    expect("container_name" in config.services.studio).toBe(false)
+    expect(rewrite.projectName).toEqual({ from: "supabase", to: "supabase-pr-42" })
+    expect(rewrite.containerNames).toHaveLength(3)
+  })
+})
+
+// =============================================================================
+// H1 — writeComposeFile YAML 1.1 type-coercion safety
+// =============================================================================
+
+describe("writeComposeFile — YAML 1.1 dangerous-value quoting (H1)", () => {
+  function roundTrip(env: Record<string, string>): Record<string, string> {
+    const config: ComposeConfig = {
+      services: { svc: { image: "x", environment: env } },
+    }
+    const filePath = path.join(tmpDir, "docker-compose.yml")
+    writeComposeFile(filePath, config)
+    const raw = fs.readFileSync(filePath, "utf-8")
+    // Parse under YAML 1.2 (what the yaml lib does) to confirm strings survive
+    const parsed = parse(raw) as ComposeConfig
+    return (parsed.services.svc.environment as Record<string, string>) ?? {}
+  }
+
+  it('TZ: "00:00" stays a string (not sexagesimal 0)', () => {
+    const result = roundTrip({ TZ: "00:00" })
+    expect(result.TZ).toBe("00:00")
+    expect(typeof result.TZ).toBe("string")
+  })
+
+  it('ENABLE: "yes" stays a string (not boolean true)', () => {
+    const result = roundTrip({ ENABLE: "yes" })
+    expect(result.ENABLE).toBe("yes")
+    expect(typeof result.ENABLE).toBe("string")
+  })
+
+  it('DISABLE: "no" stays a string (not boolean false)', () => {
+    const result = roundTrip({ DISABLE: "no" })
+    expect(result.DISABLE).toBe("no")
+  })
+
+  it('FLAG: "true" stays a string', () => {
+    const result = roundTrip({ FLAG: "true" })
+    expect(result.FLAG).toBe("true")
+    expect(typeof result.FLAG).toBe("string")
+  })
+
+  it('NULL_VAL: "null" stays a string (not null)', () => {
+    const result = roundTrip({ NULL_VAL: "null" })
+    expect(result.NULL_VAL).toBe("null")
+  })
+
+  it('TILDE: "~" stays a string (not null)', () => {
+    const result = roundTrip({ TILDE: "~" })
+    expect(result.TILDE).toBe("~")
+  })
+
+  it('"5432" stays a string (pure number)', () => {
+    const result = roundTrip({ DB_PORT: "5432" })
+    expect(result.DB_PORT).toBe("5432")
+    expect(typeof result.DB_PORT).toBe("string")
+  })
+
+  it('"on" stays a string (YAML 1.1 boolean)', () => {
+    const result = roundTrip({ FEATURE: "on" })
+    expect(result.FEATURE).toBe("on")
+  })
+
+  it("normal non-dangerous strings are NOT quoted (readability preserved)", () => {
+    const filePath = path.join(tmpDir, "docker-compose.yml")
+    const config: ComposeConfig = {
+      services: { svc: { image: "x", environment: { HOST: "localhost", PATH_VAR: "/usr/bin" } } },
+    }
+    writeComposeFile(filePath, config)
+    const raw = fs.readFileSync(filePath, "utf-8")
+    // Normal strings should appear unquoted
+    expect(raw).toContain("localhost")
+    expect(raw).toContain("/usr/bin")
+  })
+})
+
+// =============================================================================
+// H3 — adjustPortsInCompose does NOT corrupt IP octets
+// =============================================================================
+
+describe("adjustPortsInCompose — IP prefix not corrupted when port digits appear in IP (H3)", () => {
+  it("host port 100 with IP 192.168.100.100 is reconstructed correctly", () => {
+    const cfg: ComposeConfig = {
+      services: { db: { image: "postgres", ports: ["192.168.100.100:100:80"] } },
+    }
+    const out = adjustPortsInCompose(cfg, [100])
+    // Old string-replace: "192.168.100.100:100:80".replace("100", <newPort>)
+    //   would match the FIRST occurrence of "100" in the string → "192.168.<newPort>.100:100:80"
+    //   corrupting the IP octet instead of the port.
+    // New reconstruct: IP preserved, only the host port slot changes.
+    // Port 100 is below PORT_RANGE.MIN (3000) so findAvailablePort bumps it to 3000.
+    const result = out.services.db.ports[0] as string
+    expect(result).toMatch(/^192\.168\.100\.100:\d+:80$/) // IP always intact
+    expect(result).not.toMatch(/^192\.168\.\d+\.\d+:\d+:\d+$/.source.replace("192\\.168\\.", ""))
+    // Confirm the actual value: 192.168.100.100:3000:80
+    expect(result).toBe("192.168.100.100:3000:80")
+  })
+
+  it("host port 192 with IP 192.168.1.1 is reconstructed correctly", () => {
+    const cfg: ComposeConfig = {
+      services: { web: { image: "nginx", ports: ["192.168.1.1:192:80"] } },
+    }
+    const out = adjustPortsInCompose(cfg, [192])
+    // new host port will be 3000 (bump from 192 to PORT_RANGE.MIN since 193 < MIN)
+    // Important: IP must be preserved
+    expect(out.services.web.ports[0]).toMatch(/^192\.168\.1\.1:\d+:80$/)
+    expect(out.services.web.ports[0]).not.toMatch(/^\d+\.\d+\.\d+\.3000:\d+:80$/)
+  })
+
+  it("no-IP simple mapping is still handled correctly after reconstruction", () => {
+    const cfg: ComposeConfig = {
+      services: { web: { image: "nginx", ports: ["3000:80"] } },
+    }
+    const out = adjustPortsInCompose(cfg, [3000])
+    expect(out.services.web.ports[0]).toBe("3001:80")
+  })
+
+  it("IP + proto suffix is fully preserved in reconstruction", () => {
+    const cfg: ComposeConfig = {
+      services: { web: { image: "nginx", ports: ["127.0.0.1:8080:80/tcp"] } },
+    }
+    const out = adjustPortsInCompose(cfg, [8080])
+    expect(out.services.web.ports[0]).toBe("127.0.0.1:8081:80/tcp")
   })
 })

@@ -1,0 +1,6 @@
+Supabase-like fixture: tracked compose with a fixed top-level name:, fixed
+container_name: per service, ${VAR:-default} ports above 9999, and a URL-embedded
+port in env. Exercises identity rewrite (F1), port propagation (F2), high-port
+allocation (F3), ports ${VAR} interpolation (F5), the doctor preflight (F6), and
+the skip-worktree handling that keeps the rewritten tracked files from dirtying
+the worktree.

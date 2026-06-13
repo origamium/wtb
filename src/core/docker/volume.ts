@@ -624,6 +624,51 @@ export function getContainersUsingVolume(volumeName: string): string[] {
 }
 
 /**
+ * 指定 volume を使用している稼働中コンテナを、所属 Compose project 付きで取得する。
+ *
+ * `docker ps --filter volume=X --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}'`
+ * を解析する。compose 管理外のコンテナや label が無い場合は `project: null`。
+ * これにより「source スタックを停止しても解放されない別 project が掴んでいる volume」を
+ * 検出して、無駄に source を止めずに skip できる。
+ *
+ * @param volumeName - 検査対象の Docker volume 名
+ * @returns 該当コンテナの { name, project } 一覧 (取得失敗時は空配列)
+ */
+export function getContainersUsingVolumeWithProject(
+  volumeName: string
+): Array<{ name: string; project: string | null }> {
+  try {
+    const output = execDockerSafe(
+      [
+        "ps",
+        "--filter",
+        `volume=${volumeName}`,
+        "--format",
+        '{{.Names}}\t{{.Label "com.docker.compose.project"}}',
+      ],
+      {}
+    )
+    if (!output) return []
+    return output
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map((line) => {
+        const tabIdx = line.indexOf("\t")
+        if (tabIdx === -1) {
+          return { name: line, project: null }
+        }
+        const name = line.slice(0, tabIdx).trim()
+        const projectRaw = line.slice(tabIdx + 1).trim()
+        return { name, project: projectRaw.length > 0 ? projectRaw : null }
+      })
+      .filter((entry) => entry.name.length > 0)
+  } catch {
+    return []
+  }
+}
+
+/**
  * Docker volume が存在するかをチェック
  */
 export function volumeExists(volumeName: string): boolean {

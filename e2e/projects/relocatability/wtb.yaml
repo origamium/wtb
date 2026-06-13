@@ -1,0 +1,9 @@
+base_branch: "main"
+docker_compose_file: "./docker-compose.yml"
+copy_files: []
+env:
+  file:
+    - ./.env
+  adjust:
+    KONG_HTTP_PORT: 1
+    DB_PORT: 1

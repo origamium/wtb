@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { EXIT_CODES } from "../../constants/index.js"
 import * as loaderModule from "../../core/config/loader.js"
 import * as composeModule from "../../core/docker/compose.js"
+import * as envMapModule from "../../core/environment/env-map.js"
 import * as envModule from "../../core/environment/processor.js"
 import * as repositoryModule from "../../core/git/repository.js"
 import * as worktreeModule from "../../core/git/worktree.js"
@@ -22,6 +23,7 @@ vi.mock("node:fs", () => ({
   constants: { R_OK: 4 },
 }))
 vi.mock("../../core/environment/processor.js", () => ({ parseEnvFile: vi.fn() }))
+vi.mock("../../core/environment/env-map.js", () => ({ buildWorktreeEnvMap: vi.fn() }))
 vi.mock("../../core/docker/compose.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../core/docker/compose.js")>()
   return { ...actual, readComposeFile: vi.fn(), findComposeFile: vi.fn() }
@@ -50,6 +52,11 @@ const compose = (services: Record<string, unknown>): ComposeConfig =>
 beforeEach(() => {
   vi.clearAllMocks()
   // default: env has an adjust key plus a secret; compose readable in the worktree
+  vi.mocked(envMapModule.buildWorktreeEnvMap).mockReturnValue({
+    APP_PORT: "3001",
+    DB_PORT: "5433",
+    SECRET_KEY: "do-not-leak",
+  })
   vi.mocked(envModule.parseEnvFile).mockReturnValue({
     lines: [],
     entries: [
@@ -205,5 +212,112 @@ describe("gatherPortsForWorktree", () => {
     expect(r.endpoints).toEqual([])
     // env still works without Docker
     expect(r.env.APP_PORT).toBe("3001")
+  })
+})
+
+describe("gatherPortsForWorktree — interpolation", () => {
+  let stderrSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
+  })
+
+  afterEach(() => {
+    stderrSpy.mockRestore()
+  })
+
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: intentional — describes compose interpolation syntax in test name
+  it("resolves ${VAR:-default} using env value when set", () => {
+    vi.mocked(envMapModule.buildWorktreeEnvMap).mockReturnValue({ APP_PORT: "3001" })
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: testing compose interpolation syntax
+      compose({ web: { ports: ["${APP_PORT:-8080}:80"] } })
+    )
+    const r = gatherPortsForWorktree(WT, "/repo", cfg())
+    expect(r.compose.services.web.host_ports).toEqual([3001])
+    expect(r.compose.services.web.container_ports).toEqual([80])
+  })
+
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: intentional — describes compose interpolation syntax in test name
+  it("resolves ${VAR:-default} using the default when env value is absent", () => {
+    vi.mocked(envMapModule.buildWorktreeEnvMap).mockReturnValue({})
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: testing compose interpolation syntax
+      compose({ web: { ports: ["${APP_PORT:-8080}:80"] } })
+    )
+    const r = gatherPortsForWorktree(WT, "/repo", cfg())
+    expect(r.compose.services.web.host_ports).toEqual([8080])
+  })
+
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: intentional — describes compose interpolation syntax in test name
+  it("skips unresolved ${MISSING} and writes warning to stderr, keeping stdout clean", () => {
+    vi.mocked(envMapModule.buildWorktreeEnvMap).mockReturnValue({})
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: testing compose interpolation syntax
+      compose({ web: { ports: ["${MISSING_PORT}:80"] } })
+    )
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
+    const r = gatherPortsForWorktree(WT, "/repo", cfg())
+    expect(r.compose.services.web.host_ports).toEqual([])
+    // stderr should have the warning
+    const stderrOutput = stderrSpy.mock.calls.map((c) => c[0]).join("")
+    expect(stderrOutput).toContain("MISSING_PORT")
+    expect(stderrOutput).toContain("unresolved")
+    // stdout was not written to by gatherPortsForWorktree
+    expect(stdoutSpy).not.toHaveBeenCalled()
+    stdoutSpy.mockRestore()
+  })
+
+  it("handles host-ip prefix in port string (127.0.0.1:3001:80)", () => {
+    vi.mocked(envMapModule.buildWorktreeEnvMap).mockReturnValue({ APP_PORT: "3001" })
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      compose({ web: { ports: ["127.0.0.1:3001:80"] } })
+    )
+    const r = gatherPortsForWorktree(WT, "/repo", cfg())
+    expect(r.compose.services.web.host_ports).toEqual([3001])
+    expect(r.compose.services.web.container_ports).toEqual([80])
+  })
+
+  it("handles /udp suffix in port string (3001:53/udp)", () => {
+    vi.mocked(envMapModule.buildWorktreeEnvMap).mockReturnValue({ APP_PORT: "3001" })
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      compose({ web: { ports: ["3001:53/udp"] } })
+    )
+    const r = gatherPortsForWorktree(WT, "/repo", cfg())
+    expect(r.compose.services.web.host_ports).toEqual([3001])
+    expect(r.compose.services.web.container_ports).toEqual([53])
+  })
+
+  it("handles long-syntax object port entries", () => {
+    vi.mocked(envMapModule.buildWorktreeEnvMap).mockReturnValue({ APP_PORT: "3001" })
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      compose({
+        web: {
+          ports: [
+            { target: 80, published: 3001, protocol: "tcp", mode: "host" },
+          ],
+        },
+      })
+    )
+    const r = gatherPortsForWorktree(WT, "/repo", cfg())
+    expect(r.compose.services.web.host_ports).toEqual([3001])
+    expect(r.compose.services.web.container_ports).toEqual([80])
+  })
+
+  it("dedupes warning stderr messages for the same variable across multiple ports", () => {
+    vi.mocked(envMapModule.buildWorktreeEnvMap).mockReturnValue({})
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      compose({
+        web: {
+          // biome-ignore lint/suspicious/noTemplateCurlyInString: testing compose interpolation syntax
+          ports: ["${MISSING_PORT}:80", "${MISSING_PORT}:443"],
+        },
+      })
+    )
+    gatherPortsForWorktree(WT, "/repo", cfg())
+    const stderrOutput = stderrSpy.mock.calls.map((c) => c[0]).join("")
+    // Should appear only once
+    const count = (stderrOutput.match(/MISSING_PORT/g) ?? []).length
+    expect(count).toBe(1)
   })
 })

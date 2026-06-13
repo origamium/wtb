@@ -10,9 +10,12 @@ import { EXIT_CODES } from "../../constants/index.js"
 import { loadConfig } from "../../core/config/loader.js"
 import { getGitRootOrThrow } from "../../core/git/repository.js"
 import {
+  clearSkipWorktree,
   getWorktreePath,
+  gitHashObject,
   isSamePath,
   listWorktrees,
+  loadWtbManagedManifest,
   removeWorktree,
 } from "../../core/git/worktree.js"
 import { CLIError, getErrorMessage } from "../../utils/error.js"
@@ -72,14 +75,67 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
   console.log(`🗑️  Removing worktree for branch: ${branch}`)
   console.log(`📂 Worktree path: ${worktreePath}`)
 
+  // wtb-managed ファイルの per-worktree 書き換えは (skip-worktree を解除すると)
+  // `git worktree remove` を modified ファイル扱いで拒否させる。dirty チェックで
+  // 「真のユーザー変更は無い」と確認できた場合に限り、最終的な git 削除を force する。
+  // (ユーザー編集や未追跡ファイルがあれば下のチェックが先に throw する。)
+  let forceGitRemoval = options.force === true
+
   if (options.force) {
     console.log("⚠️  Force removal enabled")
   } else {
     // 破壊的処理 (volume 削除 / end_command) より前に dirty チェックで fail fast する。
     // 最後の `git worktree remove` は未コミット変更があると拒否するため、先に volume を
     // 消してから失敗すると「worktree は残るがデータ基盤だけ破壊済み」になってしまう。
+    //
+    // wtb は per-worktree compose / env を書き換えて skip-worktree を立てているので、
+    // 素の `git status --porcelain` だけだと (1) skip-worktree により wtb の出力が
+    // hidden になり、ユーザーが managed ファイルを手編集してもそれを見逃して worktree
+    // ごと削除する (データ損失) / (2) 逆に解除すると wtb 自身の書き換えで常に dirty に
+    // 見える、という両方の問題が起きる。
+    //
+    // そこで manifest (wtb が書いた直後の blob sha) を使う: managed ファイルの
+    // skip-worktree を一旦解除して真の状態を status に surface させ、現在の blob sha が
+    // manifest の sha と一致するもの (= wtb の出力そのまま) だけを dirty 判定から除外する。
+    // ユーザーが手編集した managed ファイルや、その他の dirty ファイルは保護される。
+    const managed = loadWtbManagedManifest(worktreePath)
+    // manifest のキーは config 由来で "./.env" のような ./ prefix を含みうるが、git の
+    // status / hash-object は正規化したパス (".env") を返す。両者を normalize して突き合わせる。
+    const normalizeRel = (p: string): string => {
+      const n = path.normalize(p)
+      return n.startsWith(`.${path.sep}`) ? n.slice(2) : n
+    }
+    const managedByNormalized = new Map<string, string>()
+    for (const [relativePath, sha] of Object.entries(managed)) {
+      clearSkipWorktree(worktreePath, relativePath)
+      managedByNormalized.set(normalizeRel(relativePath), sha)
+    }
+    // managed な書き換えが 1 件でもあれば、それらは working tree 上 modified のままなので
+    // 最終 `git worktree remove` を force する必要がある (このブロックを抜ける =
+    // 真のユーザー変更は無いと確認済み)。
+    if (managedByNormalized.size > 0) {
+      forceGitRemoval = true
+    }
+
     const status = execGitSafe(["status", "--porcelain"], { cwd: worktreePath })
-    if (status.length > 0) {
+    const reallyDirty = status
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .filter((line) => {
+        // porcelain v1: 先頭 2 文字が status (XY)、その後にパス。staged/unstaged で
+        // 区切り空白の数が揺れる (例 "M .env" vs " M docker-compose.yml") ので、固定
+        // オフセットではなく「先頭 2 文字を落として残りを trim」でパスを取り出す。
+        // rename ("R  a -> b") 等の複雑系はパスに " -> " が残り、下の managed 一致が
+        // 外れるため保守的に dirty 判定になる。
+        const filePath = normalizeRel(line.slice(2).trim())
+        const recordedSha = managedByNormalized.get(filePath)
+        if (recordedSha === undefined) return true // managed でなければ常に dirty
+        const currentSha = gitHashObject(worktreePath, filePath)
+        // wtb の出力そのまま (sha 一致) なら user 編集ではない → dirty に数えない。
+        return currentSha === null || currentSha !== recordedSha
+      })
+
+    if (reallyDirty.length > 0) {
       throw new CLIError(
         `Worktree for '${branch}' has uncommitted or untracked changes; commit/stash them or pass -f to force removal`,
         EXIT_CODES.GENERAL_ERROR
@@ -154,8 +210,9 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
     }
   }
 
-  // worktreeを削除
-  removeWorktree(worktreePath, { force: options.force })
+  // worktreeを削除。wtb-managed な書き換えが残っていると非 force では git が拒否する
+  // ため、dirty チェックを通過した場合は forceGitRemoval で最終削除を force する。
+  removeWorktree(worktreePath, { force: forceGitRemoval })
 
   // 成功メッセージ
   console.log("")

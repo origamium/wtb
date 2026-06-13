@@ -41,6 +41,9 @@ describe("remove command", () => {
     vi.mocked(worktreeModule.getWorktreePath).mockReturnValue(WORKTREE_PATH)
     vi.mocked(worktreeModule.isSamePath).mockReturnValue(false)
     vi.mocked(worktreeModule.listWorktrees).mockReturnValue([])
+    // B1: manifest 既定は空 (managed ファイルなし)。dirty チェックは素の git status に従う。
+    vi.mocked(worktreeModule.loadWtbManagedManifest).mockReturnValue({})
+    vi.mocked(worktreeModule.gitHashObject).mockReturnValue(null)
     vi.mocked(loaderModule.loadConfig).mockReturnValue({
       base_branch: "main",
       docker_compose_file: "compose.dev.yml",
@@ -93,8 +96,9 @@ describe("remove command", () => {
       ["compose", "-f", path.resolve(WORKTREE_PATH, "compose.dev.yml"), "down"],
       { cwd: WORKTREE_PATH }
     )
+    // manifest が空 (managed ファイルなし) かつ clean なので force は不要 (false)。
     expect(worktreeModule.removeWorktree).toHaveBeenCalledWith(WORKTREE_PATH, {
-      force: undefined,
+      force: false,
     })
   })
 
@@ -105,6 +109,42 @@ describe("remove command", () => {
       ["compose", "-f", path.resolve(WORKTREE_PATH, "compose.dev.yml"), "down", "-v"],
       { cwd: WORKTREE_PATH }
     )
+  })
+
+  it("B1: ignores a managed file that still equals wtb's output and force-removes the worktree", async () => {
+    // manifest に compose.dev.yml: "sha-wtb" を記録。git status はその 1 ファイルだけ
+    // modified を返すが、hash-object が同じ sha を返す = wtb の出力そのまま → not dirty。
+    vi.mocked(worktreeModule.loadWtbManagedManifest).mockReturnValue({
+      "compose.dev.yml": "sha-wtb",
+    })
+    vi.mocked(worktreeModule.gitHashObject).mockReturnValue("sha-wtb")
+    vi.mocked(execModule.execGitSafe).mockReturnValue(" M compose.dev.yml")
+
+    await command.parseAsync(["feature/x"], { from: "user" })
+
+    // managed ファイルの skip-worktree を一旦解除して真の状態を surface させる。
+    expect(worktreeModule.clearSkipWorktree).toHaveBeenCalledWith(WORKTREE_PATH, "compose.dev.yml")
+    // dirty 判定を通過し、managed 書き換えが残るため最終削除は force される。
+    expect(worktreeModule.removeWorktree).toHaveBeenCalledWith(WORKTREE_PATH, { force: true })
+  })
+
+  it("B1: BLOCKS when a managed file diverges from wtb's recorded output (user edit)", async () => {
+    vi.mocked(worktreeModule.loadWtbManagedManifest).mockReturnValue({
+      "compose.dev.yml": "sha-wtb",
+    })
+    // 現在の sha が manifest と異なる = ユーザーが手編集した → really dirty。
+    vi.mocked(worktreeModule.gitHashObject).mockReturnValue("sha-user-edited")
+    vi.mocked(execModule.execGitSafe).mockReturnValue(" M compose.dev.yml")
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exit")
+    })
+
+    await expect(command.parseAsync(["feature/x"], { from: "user" })).rejects.toThrow("exit")
+
+    expect(exit).toHaveBeenCalledWith(EXIT_CODES.GENERAL_ERROR)
+    expect(worktreeModule.removeWorktree).not.toHaveBeenCalled()
+    expect(execModule.execDockerSafe).not.toHaveBeenCalled()
+    exit.mockRestore()
   })
 
   it("prints the worktree listing to stderr (not stdout) for an unknown branch", async () => {

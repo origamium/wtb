@@ -6,7 +6,7 @@
 import { existsSync } from "node:fs"
 import * as path from "node:path"
 import fs from "fs-extra"
-import { BACKUP_EXTENSION, FILE_ENCODING, PORT_RANGE } from "../../constants/index.js"
+import { BACKUP_EXTENSION, FILE_ENCODING, MAX_TCP_PORT, PORT_RANGE } from "../../constants/index.js"
 import type { FileOperationOptions } from "../../types/index.js"
 import { out } from "../../utils/output.js"
 
@@ -53,18 +53,17 @@ interface ParsedEnvFile {
  * originalPort + 1 から順に空きを探す
  */
 function findNextFreePort(originalPort: number, usedPorts: Set<number>): number {
-  // README どおり常に originalPort + 1 から上方向に探索する。
-  // 旧実装は 100 個までしか走査せず、その後は使用中かもしれない originalPort + 1 を
-  // 無検証で返していた。レンジ上限まで走査してから初めてフォールバックする。
-  for (let candidate = originalPort + 1; candidate <= PORT_RANGE.MAX; candidate++) {
-    if (!usedPorts.has(candidate)) {
-      return candidate
-    }
+  // Scan originalPort+1 .. MAX_TCP_PORT first.
+  for (let c = originalPort + 1; c <= MAX_TCP_PORT; c++) {
+    if (!usedPorts.has(c)) return c
   }
-  console.warn(
-    `⚠️  Could not find a free port above ${originalPort} within range; using ${originalPort + 1}`
-  )
-  return originalPort + 1
+  // Wraparound: scan PORT_RANGE.MIN .. originalPort-1 for a free lower port.
+  // We deliberately exclude originalPort itself — returning it would be a no-op
+  // bump (from === to) and silently allow a shared port.
+  for (let c = PORT_RANGE.MIN; c < originalPort; c++) {
+    if (!usedPorts.has(c)) return c
+  }
+  throw new Error(`No free TCP port found for ${originalPort} (all candidate ports are in use)`)
 }
 
 // =============================================================================

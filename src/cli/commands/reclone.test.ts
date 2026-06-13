@@ -203,6 +203,7 @@ describe("reclone command", () => {
       path: "/project-feature",
       dryRun: false,
       volumes: { cloned: ["postgres_data"], skipped: [], failed: [] },
+      sourceRestartFailed: false,
       ok: true,
     })
     // stdout purity: 人間向け出力は stderr に逃がす
@@ -250,5 +251,55 @@ describe("reclone command", () => {
     await command.parseAsync(["feature/x", "--strict"], { from: "user" })
     expect(exit).not.toHaveBeenCalled()
     exit.mockRestore()
+  })
+
+  // ── H5: source スタックが停止後に再開失敗 → DOCKER_ERROR (5) ─────────────────
+  describe("source-restart-failure exit code (H5)", () => {
+    const restartFailed = {
+      cloned: ["postgres_data"],
+      skipped: [],
+      failed: [],
+      sourceStack: {
+        stopped: true,
+        restarted: false,
+        restartError: "boom",
+        recoverCommand: "docker compose -f x -p y up -d",
+      },
+    }
+
+    afterEach(() => {
+      process.exitCode = undefined
+    })
+
+    it("sets process.exitCode=5 (DOCKER_ERROR) in human mode when the source stack fails to restart", async () => {
+      vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
+      vi.mocked(createModule.setupVolumeCopy).mockResolvedValue(restartFailed)
+      const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+        throw new Error("exit")
+      })
+
+      await command.parseAsync(["feature/x"], { from: "user" })
+
+      // process.exit ではなく exitCode を設定する (JSON flush 保護と同じ流儀)。
+      expect(exit).not.toHaveBeenCalled()
+      expect(process.exitCode).toBe(EXIT_CODES.DOCKER_ERROR)
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("source environment is DOWN"))
+      exit.mockRestore()
+    })
+
+    it("--json still flushes its payload and sets exitCode=5", async () => {
+      vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
+      vi.mocked(createModule.setupVolumeCopy).mockResolvedValue(restartFailed)
+      const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
+
+      await command.parseAsync(["feature/x", "--json"], { from: "user" })
+
+      expect(process.exitCode).toBe(EXIT_CODES.DOCKER_ERROR)
+      expect(writeSpy).toHaveBeenCalledTimes(1)
+      const payload = JSON.parse(writeSpy.mock.calls[0][0] as string)
+      expect(payload.sourceRestartFailed).toBe(true)
+      expect(payload.ok).toBe(false)
+      writeSpy.mockRestore()
+    })
   })
 })

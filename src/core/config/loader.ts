@@ -13,6 +13,60 @@ import { CLIError } from "../../utils/error.js"
 import { validateConfig } from "./validator.js"
 
 /**
+ * RAW パース済みオブジェクトの型安全を検証する（mergeWithDefaults 前に実行）。
+ * normalizeが走る前に不正な型をCONFIG_ERRORとして拒否することで、
+ * validatorのboolean分岐やcomposeチェックが到達不能になるのを防ぐ。
+ */
+function validateRawConfig(parsed: Partial<WtbConfig>, configPath: string): void {
+  const errors: string[] = []
+
+  // env.port_propagation: boolean | object | absent のみ許可
+  const rawEnv = parsed.env as (typeof parsed.env & { port_propagation?: unknown }) | undefined
+  if (rawEnv !== undefined && rawEnv !== null) {
+    const pp = rawEnv.port_propagation
+    if (pp !== undefined && pp !== null) {
+      if (typeof pp !== "boolean" && (typeof pp !== "object" || Array.isArray(pp))) {
+        errors.push(
+          `env.port_propagation must be a boolean or an object (got ${Array.isArray(pp) ? "array" : typeof pp})`
+        )
+      }
+    }
+  }
+
+  // compose: object | absent のみ許可
+  const rawCompose = parsed.compose as unknown
+  if (rawCompose !== undefined && rawCompose !== null) {
+    if (typeof rawCompose !== "object" || Array.isArray(rawCompose)) {
+      errors.push(
+        `compose must be an object (got ${Array.isArray(rawCompose) ? "array" : typeof rawCompose})`
+      )
+    } else {
+      const c = rawCompose as Record<string, unknown>
+      if (c.isolate_name !== undefined && typeof c.isolate_name !== "boolean") {
+        errors.push(`compose.isolate_name must be a boolean (got ${typeof c.isolate_name})`)
+      }
+      const validContainerName = ["suffix", "strip", "keep"]
+      if (
+        c.container_name !== undefined &&
+        !validContainerName.includes(c.container_name as string)
+      ) {
+        errors.push(
+          `compose.container_name must be one of: ${validContainerName.join(", ")} (got ${JSON.stringify(c.container_name)})`
+        )
+      }
+    }
+  }
+
+  if (errors.length > 0) {
+    const errorMessages = errors.map((e) => `  - ${e}`).join("\n")
+    throw new CLIError(
+      `Configuration validation failed in ${configPath}:\n${errorMessages}`,
+      EXIT_CODES.CONFIG_ERROR
+    )
+  }
+}
+
+/**
  * 設定ファイルの検索結果
  */
 interface ConfigFileResult {
@@ -53,6 +107,27 @@ export function hasConfigFile(startDir: string = process.cwd()): boolean {
  * `||` ではなく `??` を使用して falsy 値（空配列・空文字等）を正しく扱う
  */
 export function mergeWithDefaults(partial: Partial<WtbConfig>): WtbConfig {
+  // Normalize env.port_propagation: boolean shorthand → full object
+  const rawPP = (
+    partial.env as
+      | (typeof partial.env & {
+          port_propagation?: boolean | { enabled?: boolean; files?: string[]; compose?: boolean }
+        })
+      | undefined
+  )?.port_propagation
+  let portPropagation: import("../../types/index.js").PortPropagationConfig
+  if (rawPP === undefined || rawPP === null) {
+    portPropagation = { enabled: true, files: [], compose: true }
+  } else if (typeof rawPP === "boolean") {
+    portPropagation = { enabled: rawPP, files: [], compose: rawPP }
+  } else {
+    portPropagation = {
+      enabled: rawPP.enabled ?? true,
+      files: rawPP.files ?? [],
+      compose: rawPP.compose ?? true,
+    }
+  }
+
   return {
     base_branch: partial.base_branch ?? DEFAULT_CONFIG.base_branch,
     docker_compose_file: partial.docker_compose_file ?? DEFAULT_CONFIG.docker_compose_file,
@@ -63,6 +138,7 @@ export function mergeWithDefaults(partial: Partial<WtbConfig>): WtbConfig {
     env: {
       file: partial.env?.file ?? [...DEFAULT_CONFIG.env.file],
       adjust: partial.env?.adjust ?? { ...DEFAULT_CONFIG.env.adjust },
+      port_propagation: portPropagation,
     },
     volumes: {
       exclude: partial.volumes?.exclude ?? [...DEFAULT_CONFIG.volumes.exclude],
@@ -70,6 +146,11 @@ export function mergeWithDefaults(partial: Partial<WtbConfig>): WtbConfig {
       ...(partial.volumes?.seed_command !== undefined
         ? { seed_command: partial.volumes.seed_command }
         : {}),
+    },
+    // compose: merge partial.compose over defaults
+    compose: {
+      isolate_name: partial.compose?.isolate_name ?? DEFAULT_CONFIG.compose.isolate_name,
+      container_name: partial.compose?.container_name ?? DEFAULT_CONFIG.compose.container_name,
     },
   }
 }
@@ -144,6 +225,23 @@ env:
 #     - cache_data
 #   # Run instead of cloning when 'wtb create --seed' is used (fresh DB per worktree):
 #   seed_command: docker compose up -d db && npm run db:migrate && npm run db:seed
+
+# Docker Compose identity isolation
+# compose:
+#   isolate_name: true        # prefix compose project name with worktree branch slug
+#   container_name: suffix    # how to handle container_name: in services
+#                             #   suffix  — append branch slug (default)
+#                             #   strip   — remove container_name entirely
+#                             #   keep    — leave container_name unchanged
+
+# Port propagation control (shorthand: port_propagation: true|false)
+# env:
+#   port_propagation: true    # shorthand: enable all propagation
+#   # Full object form:
+#   # port_propagation:
+#   #   enabled: true         # master switch
+#   #   files: []             # extra env files to propagate ports into
+#   #   compose: true         # also rewrite host ports in compose file
 `
 
   fs.writeFileSync(targetPath, yamlContent, "utf-8")
@@ -174,6 +272,9 @@ export function loadConfig(configDir: string = process.cwd()): WtbConfig {
     process.stderr.write(`📋 Loading configuration from: ${path.basename(configPath)}\n`)
     const content = fs.readFileSync(configPath, "utf-8")
     const parsed = parse(content) as Partial<WtbConfig>
+
+    // RAWパース値の型チェック（mergeWithDefaults前）
+    validateRawConfig(parsed, configPath)
 
     const config = mergeWithDefaults(parsed)
 

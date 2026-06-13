@@ -230,6 +230,89 @@ export function validateConfig(config: WtbConfig, configFile: string): void {
     }
   }
 
+  // compose の検証
+  if (config.compose !== undefined) {
+    if (typeof config.compose !== "object" || Array.isArray(config.compose)) {
+      errors.push({
+        message: "compose must be an object",
+        field: "compose",
+        severity: "error",
+      })
+    } else {
+      if (
+        config.compose.isolate_name !== undefined &&
+        typeof config.compose.isolate_name !== "boolean"
+      ) {
+        errors.push({
+          message: "compose.isolate_name must be a boolean",
+          field: "compose.isolate_name",
+          severity: "error",
+        })
+      }
+      if (config.compose.container_name !== undefined) {
+        const validValues = ["suffix", "strip", "keep"]
+        if (!validValues.includes(config.compose.container_name as string)) {
+          errors.push({
+            message: `compose.container_name must be one of: ${validValues.join(", ")}`,
+            field: "compose.container_name",
+            severity: "error",
+          })
+        }
+      }
+    }
+  }
+
+  // env.port_propagation の検証
+  if (config.env && typeof config.env === "object") {
+    const pp = (config.env as unknown as Record<string, unknown>).port_propagation
+    if (pp !== undefined) {
+      if (typeof pp === "boolean") {
+        // boolean shorthand — valid (raw validation in loader already ran before mergeWithDefaults)
+      } else if (typeof pp === "object" && pp !== null && !Array.isArray(pp)) {
+        const ppObj = pp as Record<string, unknown>
+        if (ppObj.enabled !== undefined && typeof ppObj.enabled !== "boolean") {
+          errors.push({
+            message: "env.port_propagation.enabled must be a boolean",
+            field: "env.port_propagation.enabled",
+            severity: "error",
+          })
+        }
+        if (ppObj.compose !== undefined && typeof ppObj.compose !== "boolean") {
+          errors.push({
+            message: "env.port_propagation.compose must be a boolean",
+            field: "env.port_propagation.compose",
+            severity: "error",
+          })
+        }
+        if (ppObj.files !== undefined) {
+          if (!Array.isArray(ppObj.files)) {
+            errors.push({
+              message: "env.port_propagation.files must be an array of strings",
+              field: "env.port_propagation.files",
+              severity: "error",
+            })
+          } else {
+            ;(ppObj.files as unknown[]).forEach((f, index) => {
+              if (typeof f !== "string") {
+                errors.push({
+                  message: `env.port_propagation.files[${index}] must be a string`,
+                  field: `env.port_propagation.files[${index}]`,
+                  severity: "error",
+                })
+              }
+            })
+          }
+        }
+      } else {
+        errors.push({
+          message: "env.port_propagation must be a boolean or an object",
+          field: "env.port_propagation",
+          severity: "error",
+        })
+      }
+    }
+  }
+
   // 警告を stderr に出力
   const warnings = errors.filter((e) => e.severity === "warning")
   for (const w of warnings) {

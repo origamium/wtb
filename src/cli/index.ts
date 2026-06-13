@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url"
 import { Command, type CommanderError } from "commander"
 import { APP_DESCRIPTION, APP_NAME, APP_VERSION, EXIT_CODES } from "../constants/index.js"
 import { createCommand } from "./commands/create.js"
+import { doctorCommand } from "./commands/doctor.js"
 import { initCommand } from "./commands/init.js"
 import { initClaudeCommand } from "./commands/init-claude.js"
 import { lsCommand } from "./commands/ls.js"
@@ -66,6 +67,7 @@ function createMainProgram(): Command {
   program.addCommand(pruneCommand())
   program.addCommand(initCommand())
   program.addCommand(initClaudeCommand())
+  program.addCommand(doctorCommand())
 
   // 使い方エラー (引数不足など) を commander 既定の exit 1 ではなく INVALID_USAGE (2)
   // で終了させる。exitOverride は addCommand したサブコマンドへ自動伝播しないため、

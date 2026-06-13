@@ -3,6 +3,7 @@
  * Tests all CLI commands against multiple test projects
  */
 
+import { execSync } from "node:child_process"
 import { existsSync, lstatSync } from "node:fs"
 import * as path from "node:path"
 import fs from "fs-extra"
@@ -572,6 +573,93 @@ describe("Remove Command - Basic Project", () => {
 
       expect(result.combined).toContain("Available worktrees")
     })
+  })
+})
+
+// =============================================================================
+// REMOVE COMMAND - WTB-MANAGED FILE PROTECTION (B1)
+// =============================================================================
+// wtb rewrites git-TRACKED files per worktree (compose identity/ports + adjusted
+// env) and skip-worktrees them. A manifest records wtb's exact output sha so that
+// `remove` can tell wtb's own rewrite (safe to delete) apart from a genuine user
+// edit (must block without -f). These real-git e2e tests are the most faithful
+// check of that data-loss protection.
+describe("Remove Command - wtb-managed file protection (B1)", () => {
+  let testRepo: TestRepo
+  const BRANCH = "mng/protect"
+
+  beforeEach(() => {
+    testRepo = createTestRepo("relocatability", "managed-protect")
+    // create rewrites the tracked compose (identity) + .env (port adjust) → both
+    // become wtb-managed. Skip volume clone / start so the test needs no Docker.
+    testRepo.runCLI(`create ${BRANCH} --no-volume-copy --no-start`)
+  })
+
+  afterEach(() => {
+    testRepo.cleanup()
+  })
+
+  it("writes a wtb-managed manifest into the worktree's private git dir", () => {
+    const wtPath = testRepo.getWorktreePath(BRANCH)
+    const manifestPath = execSync("git rev-parse --git-path wtb-managed.json", {
+      cwd: wtPath,
+      encoding: "utf-8",
+    }).trim()
+    const abs = path.isAbsolute(manifestPath) ? manifestPath : path.join(wtPath, manifestPath)
+    expect(existsSync(abs)).toBe(true)
+    const manifest = JSON.parse(fs.readFileSync(abs, "utf-8"))
+    // Both rewritten tracked files are recorded with a blob sha.
+    const keys = Object.keys(manifest)
+    expect(keys.some((k) => k.includes("docker-compose.yml"))).toBe(true)
+    expect(keys.some((k) => k.includes(".env"))).toBe(true)
+  })
+
+  it("(b) removes cleanly when managed files are exactly wtb's output (no user edit)", () => {
+    const wtPath = testRepo.getWorktreePath(BRANCH)
+    expect(existsSync(wtPath)).toBe(true)
+
+    // No user edit → the only "changes" are wtb's own rewrites, which the manifest
+    // recognises and excludes from the dirty check. Remove must succeed without -f.
+    const result = testRepo.runCLI(`remove ${BRANCH}`)
+
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("Worktree removed successfully")
+    expect(existsSync(wtPath)).toBe(false)
+  })
+
+  it("(c) BLOCKS removal (without -f) when the user hand-edits a managed file", () => {
+    const wtPath = testRepo.getWorktreePath(BRANCH)
+    // Simulate a genuine user edit on top of wtb's rewritten .env.
+    fs.appendFileSync(path.join(wtPath, ".env"), "\nUSER_SECRET=do-not-lose-me\n")
+
+    const result = testRepo.runCLI(`remove ${BRANCH}`)
+
+    // The edit diverges from the recorded sha → really dirty → blocked, worktree kept.
+    expect(result.exitCode).toBe(1)
+    expect(result.combined).toContain("uncommitted or untracked changes")
+    expect(existsSync(wtPath)).toBe(true)
+  })
+
+  it("(d) still removes a user-edited managed file with -f", () => {
+    const wtPath = testRepo.getWorktreePath(BRANCH)
+    fs.appendFileSync(path.join(wtPath, ".env"), "\nUSER_SECRET=do-not-lose-me\n")
+
+    const result = testRepo.runCLI(`remove ${BRANCH} -f`)
+
+    expect(result.exitCode).toBe(0)
+    expect(result.combined).toContain("Worktree removed successfully")
+    expect(existsSync(wtPath)).toBe(false)
+  })
+
+  it("(c') BLOCKS removal when there is an unrelated untracked file", () => {
+    const wtPath = testRepo.getWorktreePath(BRANCH)
+    fs.writeFileSync(path.join(wtPath, "scratch.txt"), "untracked work")
+
+    const result = testRepo.runCLI(`remove ${BRANCH}`)
+
+    expect(result.exitCode).toBe(1)
+    expect(result.combined).toContain("uncommitted or untracked changes")
+    expect(existsSync(wtPath)).toBe(true)
   })
 })
 
@@ -1735,5 +1823,65 @@ describe("Create — skip flags actually skip their phase", () => {
     } finally {
       repo.cleanup()
     }
+  })
+})
+
+describe("Relocatability scenario (Supabase-like tracked compose)", () => {
+  let repo: TestRepo
+
+  beforeEach(() => {
+    repo = createTestRepo("relocatability", "reloc")
+  })
+
+  afterEach(() => {
+    repo.cleanup()
+  })
+
+  it("rewrites the tracked compose per-worktree, propagates ports, and keeps the worktree clean", () => {
+    const create = repo.runCLI("create feat/iso --no-volume-copy")
+    expect(create.exitCode).toBe(0)
+
+    const compose = repo.readWorktreeFile("feat/iso", "docker-compose.yml")
+    // F1: top-level name: and each container_name: rewritten per worktree
+    expect(compose).toContain("supabase_demo-feat-iso")
+    expect(compose).toContain("supabase_kong_demo-feat-iso")
+    expect(compose).toContain("supabase_db_demo-feat-iso")
+
+    // F3: KONG_HTTP_PORT bumped off its original (above the old 3000-9999 ceiling)
+    const env = repo.readWorktreeFile("feat/iso", ".env")
+    const kong = env.match(/KONG_HTTP_PORT=(\d+)/)?.[1]
+    expect(kong).toBeDefined()
+    expect(kong).not.toBe("54321")
+
+    // F2: the bump propagates into the URL-embedded port in env AND into the
+    // compose ${VAR:-default} default and the GOTRUE/API URLs — all consistent.
+    expect(env).toContain(`http://127.0.0.1:${kong}`)
+    expect(compose).toContain(`KONG_HTTP_PORT:-${kong}`)
+    expect(compose).toContain(`http://127.0.0.1:${kong}`)
+
+    // skip-worktree: the rewritten tracked files do NOT dirty the worktree
+    const wt = repo.getWorktreePath("feat/iso")
+    const status = execSync("git status --porcelain", { cwd: wt, encoding: "utf-8" })
+    expect(status.trim()).toBe("")
+
+    // F5: `wtb ports` resolves ${VAR} mappings statically (stack not running)
+    const ports = repo.runCLI("ports feat/iso --pretty")
+    expect(ports.exitCode).toBe(0)
+    expect(ports.combined).toContain("localhost:")
+
+    // removal is not blocked by the rewrite (skip-worktree → clean status)
+    const rm = repo.runCLI("remove feat/iso")
+    expect(rm.exitCode).toBe(0)
+  })
+
+  it("doctor reports relocatability findings (info, since identity rewrite + propagation are on by default)", () => {
+    const res = repo.runCLI("doctor --json")
+    expect(res.exitCode).toBe(0)
+    const report = JSON.parse(res.stdout)
+    const ids = report.findings.map((f: { id: string }) => f.id)
+    expect(ids).toContain("fixed-project-name")
+    expect(ids).toContain("container-name")
+    // defaults handle these, so no warning/error findings → ok
+    expect(report.ok).toBe(true)
   })
 })

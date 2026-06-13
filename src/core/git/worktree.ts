@@ -3,12 +3,157 @@
  * Git worktreeの作成、削除、一覧表示等の操作を担当
  */
 
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { realpathSync } from "node:fs"
 import * as path from "node:path"
 import type { WorktreeInfo } from "../../types/index.js"
 import { execGitSafe } from "../../utils/exec.js"
 import { out } from "../../utils/output.js"
 import { getGitRoot, isGitRepository } from "./repository.js"
+
+/**
+ * worktree 内の追跡ファイルを git の skip-worktree に設定する (best-effort)。
+ *
+ * wtb は worktree ごとに docker-compose.yml や調整済み env ファイルを書き換える。
+ * これらが git 追跡ファイル (`git worktree add` で checkout 済み) の場合、書き換えは
+ * worktree を "dirty" にしてしまい、(1) `wtb remove` の `git status --porcelain`
+ * dirty チェックを誤発火させ、(2) `git worktree remove` を拒否させ、(3) ユーザーの
+ * `git status` を汚し、worktree 固有の書き換え (例: project 名サフィックス) を誤って
+ * ブランチへコミットさせる危険がある。skip-worktree を立てると git はその追跡ファイルの
+ * ローカル変更を無視する。
+ *
+ * 未追跡ファイル / 非 git / 失敗時は何もしない (best-effort)。
+ *
+ * @param relativePath - worktree ルートからの相対パス (例: config.docker_compose_file)
+ * @param cwd - worktree のパス
+ */
+export function markSkipWorktreeIfTracked(relativePath: string, cwd: string): void {
+  try {
+    // 追跡されているファイルのみ対象。未追跡だと ls-files が非ゼロ終了して catch される。
+    execGitSafe(["ls-files", "--error-unmatch", "--", relativePath], { cwd })
+  } catch {
+    return // 未追跡 → skip-worktree 不要
+  }
+  try {
+    execGitSafe(["update-index", "--skip-worktree", "--", relativePath], { cwd })
+  } catch {
+    // best-effort: 設定できなくても worktree 作成自体は続行する
+  }
+}
+
+/**
+ * worktree ごとの "wtb が書き換えた追跡ファイル" を記録するマニフェストの内容型。
+ * key は worktree ルートからの相対パス、value は wtb が書き込んだ直後の git blob sha。
+ */
+export type WtbManagedManifest = Record<string, string>
+
+/**
+ * worktree の追跡ファイルが git にどう見えるかの blob sha を返す (`git hash-object`)。
+ * 未追跡 / 失敗時は null。
+ */
+export function gitHashObject(cwd: string, relativePath: string): string | null {
+  try {
+    return execGitSafe(["hash-object", "--", relativePath], { cwd }).trim()
+  } catch {
+    return null
+  }
+}
+
+/**
+ * worktree の PRIVATE git ディレクトリ内 (`.git/worktrees/<name>/`) のマニフェストパスを
+ * 解決する。`git worktree remove` がこのディレクトリごと自動削除するので、wtb 側で
+ * クリーンアップする必要はない。`rev-parse --git-path` の結果が相対パスなら cwd 起点で
+ * 絶対化する。解決できなければ null。
+ */
+function resolveManifestPath(cwd: string): string | null {
+  try {
+    const raw = execGitSafe(["rev-parse", "--git-path", "wtb-managed.json"], { cwd }).trim()
+    if (!raw) return null
+    return path.isAbsolute(raw) ? raw : path.resolve(cwd, raw)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 追跡ファイルに skip-worktree を立て、書き込んだ直後の blob sha をマニフェストへ記録する。
+ *
+ * skip-worktree だけだとユーザーの実編集も隠れてしまい、`wtb remove` の dirty チェックが
+ * 誤って通過してユーザー編集ごと worktree を消す (データ損失) 危険がある。そこで wtb の
+ * 出力 sha を記録しておき、remove 側は「マニフェストの sha と一致する managed ファイル」
+ * だけを dirty 判定から除外し、ユーザーが手編集したファイルは dirty として保護する。
+ *
+ * 未追跡 / 非 git / 失敗は best-effort で握りつぶす (worktree 作成自体は続行)。
+ *
+ * @param cwd - worktree のパス
+ * @param relativePath - worktree ルートからの相対パス
+ */
+export function markWtbManagedFile(cwd: string, relativePath: string): void {
+  let tracked = true
+  try {
+    execGitSafe(["ls-files", "--error-unmatch", "--", relativePath], { cwd })
+  } catch {
+    tracked = false
+  }
+  if (!tracked) return // 未追跡 → skip-worktree も manifest 記録も不要
+
+  try {
+    execGitSafe(["update-index", "--skip-worktree", "--", relativePath], { cwd })
+  } catch {
+    // best-effort
+  }
+  recordWtbManagedFile(cwd, relativePath)
+}
+
+/**
+ * wtb が書き換えた追跡ファイルの現在の blob sha をマニフェストへ read-merge-write する。
+ * 追跡ファイルでない / 解決失敗時は何もしない (best-effort)。
+ */
+export function recordWtbManagedFile(cwd: string, relativePath: string): void {
+  const sha = gitHashObject(cwd, relativePath)
+  if (sha === null) return
+
+  const manifestPath = resolveManifestPath(cwd)
+  if (!manifestPath) return
+
+  try {
+    const manifest = loadWtbManagedManifest(cwd)
+    manifest[relativePath] = sha
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+  } catch {
+    // best-effort: 記録できなくても worktree は使える
+  }
+}
+
+/**
+ * worktree のマニフェストを読み出す。存在しない / 読めない / 壊れている場合は空オブジェクト。
+ */
+export function loadWtbManagedManifest(cwd: string): WtbManagedManifest {
+  const manifestPath = resolveManifestPath(cwd)
+  if (!manifestPath || !existsSync(manifestPath)) return {}
+  try {
+    const parsed = JSON.parse(readFileSync(manifestPath, "utf8"))
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as WtbManagedManifest
+    }
+    return {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * 追跡ファイルの skip-worktree を解除する (`git update-index --no-skip-worktree`)。
+ * remove 側で managed ファイルの真の状態を `git status` に surface させるために使う。
+ * best-effort (失敗は無視)。
+ */
+export function clearSkipWorktree(cwd: string, relativePath: string): void {
+  try {
+    execGitSafe(["update-index", "--no-skip-worktree", "--", relativePath], { cwd })
+  } catch {
+    // best-effort
+  }
+}
 
 /**
  * 2 つのパスが同じ場所を指すかを canonical 比較で判定する。

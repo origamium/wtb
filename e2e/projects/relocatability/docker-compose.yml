@@ -1,0 +1,17 @@
+name: supabase_demo
+services:
+  kong:
+    image: alpine
+    container_name: supabase_kong_demo
+    ports:
+      - '${KONG_HTTP_PORT:-54321}:8000/tcp'
+    environment:
+      API_EXTERNAL_URL: ${API_EXTERNAL_URL:-http://127.0.0.1:54321}
+      GOTRUE_JWT_ISSUER: http://127.0.0.1:54321/auth/v1
+  db:
+    image: alpine
+    container_name: supabase_db_demo
+    ports:
+      - '${DB_PORT:-54322}:5432'
+volumes:
+  db-data:
