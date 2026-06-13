@@ -28,6 +28,7 @@ A CLI tool built on Git worktrees that gives every branch its own isolated worki
   - [`path`](#wtb-path-branch)
   - [`ports`](#wtb-ports-branch)
   - [`status`](#wtb-status)
+  - [`doctor`](#wtb-doctor)
   - [`init-claude`](#wtb-init-claude)
 - [Configuration](#configuration)
 - [Environment variable adjustment](#environment-variable-adjustment)
@@ -221,6 +222,7 @@ In human mode, `create` echoes every adjustment it applied — per-key env bumps
   "env": { "APP_PORT": { "from": "3000", "to": "3001" } },
   "composePorts": { "web": [{ "from": 3000, "to": 3001 }] },
   "volumes": { "cloned": ["db_data"], "skipped": [], "failed": [] },
+  "sourceStack": { "stopped": true, "restarted": true },
   "seed": null,
   "startCommand": { "ran": true, "failed": false },
   "ok": true
@@ -228,6 +230,7 @@ In human mode, `create` echoes every adjustment it applied — per-key env bumps
 ```
 
 - `volumes.skipped` entries are `{ name, reason }`; `volumes.failed` entries are `{ name, error }`. `seed` is `{ ran, failed }` when `--seed` was used, else `null`; same shape for `startCommand` when `start_command` is configured.
+- `sourceStack` is `{ stopped, restarted, restartError?, recoverCommand? }` — present when wtb stopped the source stack to clone. If `restarted` is `false`, `restartError`/`recoverCommand` explain how to bring the source stack back up, and the command exits `5` (Docker error) regardless of `--strict`.
 - `ok` is `false` when a volume clone or the seed command failed. `--strict --json` still exits `1` on such failures — the JSON is written first, then the exit code is set.
 - With `--exists-ok` on an already-existing worktree the object is reduced to `{ branch, path, created: false, existing: true, createdBranch: false, dryRun, ok: true }`.
 
@@ -374,6 +377,8 @@ wtb ports -a               # every worktree, as a JSON array
 
 An unknown branch prints an `Available worktrees:` listing to stderr and exits `1`.
 
+`wtb ports` **resolves `${VAR}` / `${VAR:-default}` references in Compose port mappings** statically — against the worktree's env files, with no Docker and no running stack. A mapping like `'${KONG_HTTP_PORT:-54321}:8000'` (previously yielding an empty endpoint) now resolves to a concrete host port. Precedence: **worktree env-file value > Compose default > unresolved**. An unresolved variable is skipped (no endpoint) with a stderr warning naming it. Known limits: nested defaults (`${A:-${B}}`), port ranges, and IPv6 are not resolved.
+
 Designed to be called from Claude Code (via the [shipped skill](#claude-code-integration)) or from shell scripts. See [Claude Code integration](#claude-code-integration) for the full output schema.
 
 ### `wtb status`
@@ -402,6 +407,27 @@ Richer inspection: worktrees + Docker Compose services + running containers + vo
 wtb status --json | jq '.docker.containers[] | select(.isWtb) | .name'   # this project's containers
 wtb status -a --json | jq '.worktrees[] | {branch, services: .compose.services}'
 ```
+
+### `wtb doctor`
+
+Static preflight — **no Docker needed**. Inspects the repo's Compose and env files for worktree-relocatability problems *before* you create a worktree: a fixed Compose project name or `container_name:` that would collide across worktrees, a literally-published port that won't follow an `env.adjust` bump, an unresolved `${VAR}` in a port mapping, an env value that embeds an adjusted port, and a `COMPOSE_PROJECT_NAME` in your shell that would defeat per-worktree isolation.
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Print exactly one machine-readable JSON object to stdout |
+| `--strict` | Exit `1` if any `warning`-or-`error` finding exists (default: exit `0` even with warnings) |
+
+```bash
+wtb doctor                 # human-readable report
+wtb doctor --json | jq .   # machine-readable
+wtb doctor --strict        # gate a CI step on a clean report
+```
+
+Each finding is `{ id, severity, message, suggestion }`, where `severity` is `info`, `warning`, or `error`. Finding ids: `fixed-project-name`, `container-name`, `literal-env-port`, `literal-compose-port`, `unresolved-port-variable`, `compose-project-name-env`, `no-compose-file`. A finding is **downgraded to `info` when the relevant auto-handling is enabled** — identity rewrite (`compose.isolate_name`) for the project-name/container-name checks, port propagation (`env.port_propagation`) for the literal-port check — both of which are on by default; it's a `warning` when you've disabled them.
+
+**Exit codes:** the default **exits `0` even when warnings exist** (agent/CI friendly — the JSON `ok` and `summary` carry the result, so a wrapper can decide what to do). Pass `--strict` to exit `1` when any warning or error is present. `--json` prints exactly one JSON object to stdout (`{ composeFile, findings, summary: { info, warning, error }, ok }`).
+
+The same checks also run automatically during [`wtb create`](#wtb-create-branch) (including `--dry-run`): warning/error findings are printed to stderr as a preflight (followed by `Run 'wtb doctor' for details.`), but the preflight **never changes create's exit code**.
 
 ### `wtb init-claude`
 
@@ -441,6 +467,9 @@ If nothing is found, wtb still runs with defaults — it prints a warning to std
 | `end_command` | string | — | Runs in the worktree before removal. Setting this **suppresses** the automatic `docker compose down` |
 | `env.file` | string[] | `["./.env"]` | Env files to copy into the worktree |
 | `env.adjust` | map | `{}` | Per-key adjustment (see [Environment variable adjustment](#environment-variable-adjustment)) |
+| `env.port_propagation` | bool / object | `true` | Propagate a bumped port into other env values + the compose copy. Boolean shorthand, or `{ enabled, files, compose }`. See [Port propagation](#port-propagation-envport_propagation) |
+| `compose.isolate_name` | bool | `true` | Rewrite the worktree's top-level Compose `name:` to `<original>-<branch-slug>`. See [Docker Compose integration](#docker-compose-integration) |
+| `compose.container_name` | enum | `"suffix"` | How to handle services' `container_name:`: `suffix` / `strip` / `keep`. See [Docker Compose integration](#docker-compose-integration) |
 | `volumes.exclude` | string[] | `[]` | Compose volume keys to **exclude** from auto-cloning. Default: every named non-`external` volume in the Compose file is cloned. See [Volume cloning](#volume-cloning) |
 | `volumes.seed_command` | string | — | Command run in the new worktree (via `/bin/sh`) when `wtb create --seed` is used, **instead of** cloning volume data. Lets a worktree start from a freshly seeded DB rather than a copy of main's. See [Volume cloning](#volume-cloning) |
 
@@ -503,6 +532,29 @@ Port collision sources considered:
 
 Key naming: only POSIX-compliant names (`^[A-Za-z_][A-Za-z0-9_]*$`) are recognized as adjustable variables. Lines whose key doesn't match are passed through untouched (they're treated as ordinary file content, not as keys to adjust).
 
+### Port propagation (`env.port_propagation`)
+
+A bumped port is rarely referenced only by its own variable. A `.env` often has it embedded in other values (`API_EXTERNAL_URL=http://127.0.0.1:54321`), and a compose file embeds it in `${VAR:-default}` defaults and string port mappings. **Port propagation (on by default) carries every old → new port change into those places too**, so a worktree's whole config stays internally consistent after a remap.
+
+When enabled, after wtb bumps a numeric (PORT-marker) `env.adjust` key it propagates the old→new port into:
+
+1. **Other values in the env files** that embed that port (e.g. `API_EXTERNAL_URL` follows `DB_PORT`'s bump).
+2. **The copied compose file** — `${VAR:-default}` defaults and string port/environment values.
+
+```yaml
+# wtb.yaml
+env:
+  # Boolean shorthand — enable (default) or disable everything:
+  port_propagation: true        # or false
+  # Full object form (defaults shown):
+  # port_propagation:
+  #   enabled: true              # master switch
+  #   files: []                  # extra files (beyond env.file) to propagate into
+  #   compose: true              # also rewrite ${VAR:-default}/string ports in the compose copy
+```
+
+`files` lists extra files (beyond `env.file`) to propagate the port change into. Propagation is **boundary-safe**: it only rewrites a port immediately preceded by `:` and followed by a URL/list/quote boundary — a bare number is never matched (a `5432` *inside* `54321` is safe). Disable the whole feature with `port_propagation: false`. Run [`wtb doctor`](#wtb-doctor) to see which values would or wouldn't follow a bump.
+
 ## Docker Compose integration
 
 When `docker_compose_file` is set and the file exists:
@@ -510,7 +562,31 @@ When `docker_compose_file` is set and the file exists:
 1. wtb reads it from the source repo.
 2. Calls `docker ps` to collect ports already claimed by running containers.
 3. For every `services.*.ports` mapping, the host port is rewritten to the first free port at/above the original, honoring the running-container set plus any ports already remapped in this pass.
-4. Writes the adjusted Compose file into the worktree at the same relative path.
+4. **Rewrites the worktree's Compose identity** so the stack actually isolates per worktree (see below).
+5. Writes the adjusted Compose file into the worktree at the same relative path.
+
+### Per-worktree identity rewrite (`compose:`)
+
+By default (`compose.isolate_name: true`) wtb rewrites the worktree's Compose copy so that each worktree gets its **own** Compose project instead of sharing one. This is the fix for stacks that hardcode a top-level `name:` and/or `container_name:` (e.g. Supabase CLI output): without it, a second `wtb create` produces a stack that attaches to or clobbers the first one's containers and volumes. The rewrite is **on by default** and happens in place in the worktree's compose file:
+
+- **Project name** — the top-level `name:` becomes `<original>-<branch-slug>`.
+- **Container names** — each service's `container_name:` is handled per `compose.container_name`.
+
+```yaml
+# wtb.yaml
+compose:
+  isolate_name: true        # rewrite the top-level name: per worktree (default). false to opt out.
+  container_name: suffix    # how to handle services' container_name::
+                            #   suffix — append -<branch-slug> (default)
+                            #   strip  — remove it (Compose then auto-generates a unique name)
+                            #   keep   — leave it as-is (a 2nd worktree's `up` WILL collide; wtb warns)
+```
+
+With `container_name: keep`, wtb prints a warning naming the services whose fixed `container_name:` will make a second worktree's `docker compose up` collide. Use `wtb doctor` to detect these problems before you hit them.
+
+### Rewritten files and git `skip-worktree`
+
+The worktree's compose copy (and any adjusted/propagated env files) may be **git-tracked** — `git worktree add` checks them out from the branch. Because wtb rewrites them in place per worktree, wtb marks each rewritten tracked file as git **`skip-worktree`**. This keeps the per-worktree rewrites from (a) showing up in `git status`, (b) blocking `wtb remove`'s dirty check, and (c) being accidentally committed back to the branch. To intentionally commit edits to such a file in a worktree, run `git update-index --no-skip-worktree <file>` first.
 
 Notes:
 
@@ -530,7 +606,9 @@ How it works:
 1. wtb enumerates `volumes:` keys from the Compose file.
 2. Volumes marked `external: true` are **skipped** (they're shared by design).
 3. Source volume name is resolved as `<source_project>_<key>` (or the explicit `volumes.<key>.name` if set). Same for the target with the new worktree's project name.
-4. **Stop-then-copy.** If any cloneable source volume is in use by a running container, wtb **stops the source Compose stack** (`docker compose stop` — containers/networks are preserved), clones, then **restarts it** (`docker compose start`). The restart runs in a `finally` block and is also wired to `SIGINT`, so an interrupted clone (Ctrl-C) never leaves your source services down. This makes a live dev DB clone safely with no manual step. Opt out with `--no-stop` (then in-use volumes are skipped with a warning instead), or use `--force-volume-copy` to clone live without stopping (data-corruption risk). Note: `docker compose start` brings up *every* stopped service in the project — if you had intentionally left some down, re-stop them after.
+4. **Plan-then-stop-then-copy.** wtb computes the full per-volume clone plan **before** stopping anything, and only stops the source Compose stack if at least one volume will actually be cloned (so it never stops the source, clones nothing, and fails to restart — which previously could leave your dev environment down). If a cloneable source volume is in use by a running container, wtb **stops the source Compose stack** (`docker compose stop` — containers/networks are preserved), clones, then **restarts it** (`docker compose start`, falling back to `up -d`). The restart runs in a `finally` block and is also wired to `SIGINT`, so an interrupted clone (Ctrl-C) never leaves your source services down. Volumes held by a *different* Compose project are skipped without stopping anything, and a defensive guard refuses to clone when source and target resolve to the same volume name (no self-overwrite). Opt out with `--no-stop` (then in-use volumes are skipped with a warning instead), or use `--force-volume-copy` to clone live without stopping (data-corruption risk). Note: `docker compose start` brings up *every* stopped service in the project — if you had intentionally left some down, re-stop them after.
+
+   **If the restart fails** (both `docker compose start` and the `up -d` fallback error), `wtb create` / `wtb reclone` **exit with code `5` (Docker error) even without `--strict`** — a failed restart leaves your running source environment broken, so this is treated as a hard failure — and print the exact recovery command to run by hand.
 5. For each volume:
    - **If the source stack was stopped** (or `--force-volume-copy` was passed, or nothing was running), wtb clones it.
    - **If `--no-stop` is set and a running container is using the source volume**, wtb skips it with a warning (a live filesystem copy of an active database can corrupt — Postgres/MySQL/Redis). Stop the source side with `docker compose stop` first, drop `--no-stop`, or pass `--force-volume-copy`.
@@ -621,7 +699,7 @@ Exit codes (`src/constants/index.ts`):
 | `2` | Invalid CLI usage — missing argument, unknown option/command, invalid/excess arguments, and conflicting options (e.g. `wtb ports --json --pretty`, or a branch argument combined with `--all`). `--help`/`--version` still exit `0` |
 | `3` | Not in a git repository |
 | `4` | Configuration error (config not found-but-invalid, parse failure, or validation failure) |
-| `5` | Docker error — currently emitted only by `wtb prune --yes` when one or more volume removals fail (a partial prune). Other Docker problems still degrade gracefully (warn + continue) or surface as `1` |
+| `5` | Docker error — emitted by `wtb prune --yes` when one or more volume removals fail (a partial prune), and by `wtb create` / `wtb reclone` when the source Compose stack was stopped to clone and **could not be restarted** (both `docker compose start` and the `up -d` fallback failed — this exits `5` even without `--strict`, since the source environment is left broken; a recovery command is printed). Other Docker problems still degrade gracefully (warn + continue) or surface as `1` |
 | `6` | Worktree already exists — `wtb create` for a branch that already has a worktree, without `--exists-ok` |
 | `130` / `143` | Interrupted by SIGINT (Ctrl-C) / SIGTERM. Treat the run as aborted — an interrupted `create` may be partially done |
 
@@ -762,6 +840,8 @@ wtb adjusts against *known* sources:
 - For Docker Compose: currently running containers and the ports it remapped earlier in the same pass.
 
 It does **not** probe arbitrary OS-level listening sockets. If something outside Docker is holding a port (a native dev server you started by hand, another project on the same machine, etc.), you'll need to stop it or edit `env.adjust` manually. Check `wtb status -a` to see what wtb thinks is going on.
+
+If two worktrees' stacks collide rather than isolate, the usual cause is a fixed Compose `name:` / `container_name:` or a port published literally instead of via an `env.adjust`-bumped variable. Run [`wtb doctor`](#wtb-doctor) — it pinpoints exactly these relocatability problems and tells you which config keys (`compose.isolate_name`, `env.port_propagation`) handle each one.
 
 ### "Worktree for branch 'X' already exists" (exit 6)
 The branch already has a worktree. `wtb ls` shows where it is. `wtb remove X` cleans it up first — or pass `--exists-ok` to `wtb create` if reusing it is fine (prints the path, exits `0`).

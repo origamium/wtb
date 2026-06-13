@@ -46,6 +46,20 @@ env:
     APP_PORT: 1 # PORT → next free port (e.g. 3000 → 3001, 3002, ...)
     DB_PORT: 1 # PORT → next free port (e.g. 5432 → 5433, 5434, ...)
 
+  # Port propagation (default: ON). After wtb bumps a PORT-marker variable, it
+  # propagates the old → new port into OTHER values that embed it — e.g.
+  # API_EXTERNAL_URL=http://127.0.0.1:54321 follows DB_PORT's bump — and into the
+  # copied compose file's `${VAR:-default}` ports and string port values. The
+  # rewrite is boundary-safe (only a port immediately after `:` and at a value
+  # boundary is touched; a bare 5432 inside 54321 is never matched).
+  #
+  # Shorthand (boolean): port_propagation: true   # or false to disable entirely
+  # Full object form (defaults shown):
+  # port_propagation:
+  #   enabled: true   # master switch
+  #   files: []       # extra files (beyond env.file) to propagate ports into
+  #   compose: true   # also rewrite ${VAR:-default}/string ports in the compose copy
+
 # Volume cloning: by default wtb clones every named (non-external) Docker volume
 # declared in docker-compose.yml (here: postgres_data, shared_data) into each new
 # worktree's project, so a new branch starts with a full copy of main's DB data —
@@ -54,3 +68,14 @@ volumes:
   exclude: [] # e.g. [shared_data] to skip cloning a regenerable volume
   # seed_command: docker compose up -d postgres && ./scripts/seed.sh
   #   ^ used by `wtb create --seed`: seeds a fresh DB instead of cloning main's.
+
+# Docker Compose identity isolation (default: ON). wtb rewrites the worktree's
+# compose copy so stacks with a fixed `name:` / `container_name:` (e.g. Supabase
+# CLI output) actually isolate across worktrees instead of colliding.
+# compose:
+#   isolate_name: true        # rewrite top-level project name → <original>-<branch-slug>
+#                             #   set false to opt out and share one Compose project
+#   container_name: suffix    # how to handle services' container_name::
+#                             #   suffix — append -<branch-slug> (default)
+#                             #   strip  — remove it (compose auto-generates a unique name)
+#                             #   keep   — leave as-is (a 2nd worktree's `up` will collide)

@@ -28,6 +28,7 @@ Git worktree をベースにした CLI ツールで、ブランチごとに独�
   - [`path`](#wtb-path-branch)
   - [`ports`](#wtb-ports-branch)
   - [`status`](#wtb-status)
+  - [`doctor`](#wtb-doctor)
   - [`init-claude`](#wtb-init-claude)
 - [設定ファイル](#設定ファイル)
 - [環境変数の自動調整](#環境変数の自動調整)
@@ -244,6 +245,7 @@ wtb create release/v2.0 --no-create-branch
   "env": { "APP_PORT": { "from": "3000", "to": "3001" } },
   "composePorts": { "web": [{ "from": 3000, "to": 3001 }] },
   "volumes": { "cloned": ["db_data"], "skipped": [], "failed": [] },
+  "sourceStack": { "stopped": true, "restarted": true },
   "seed": null,
   "startCommand": { "ran": true, "failed": false },
   "ok": true
@@ -251,6 +253,7 @@ wtb create release/v2.0 --no-create-branch
 ```
 
 - `volumes.skipped` の各要素は `{ name, reason }`、`volumes.failed` は `{ name, error }`。`seed` は `--seed` 使用時に `{ ran, failed }`、未使用なら `null`(`startCommand` も `start_command` 設定時に同じ形)。
+- `sourceStack` は `{ stopped, restarted, restartError?, recoverCommand? }` — クローンのためにソーススタックを止めた場合に現れます。`restarted` が `false` のときは `restartError`/`recoverCommand` がソーススタックの復旧方法を示し、コマンドは `--strict` の有無に関わらず exit `5`(Docker エラー)で終了します。
 - volume クローンまたは seed が失敗すると `ok` は `false`。`--strict --json` でもその失敗で exit `1` になります — JSON を書き切ってから exit code が設定されます。
 - 既存 worktree に対する `--exists-ok` では `{ branch, path, created: false, existing: true, createdBranch: false, dryRun, ok: true }` に縮小されます。
 
@@ -409,6 +412,8 @@ wtb ports -a               # 全 worktree を JSON 配列で
 
 未知のブランチを渡すと `Available worktrees:` の一覧を stderr に出して exit `1` になります。
 
+`wtb ports` は Compose のポートマッピング中の `${VAR}` / `${VAR:-default}` 参照を **静的に解決** します — worktree の env ファイルを参照し、Docker も起動中スタックも不要です。`'${KONG_HTTP_PORT:-54321}:8000'` のようなマッピング(以前は空のエンドポイントになっていた)が具体的な host ポートに解決されます。優先順位: **worktree の env ファイルの値 > Compose のデフォルト > 未解決**。未解決の変数はスキップ(エンドポイントなし)され、その変数名を含む警告が stderr に出ます。既知の制限: ネストしたデフォルト(`${A:-${B}}`)、ポート範囲、IPv6 は解決しません。
+
 出力スキーマと利用例は [Claude Code連携](#claude-code-連携) を参照。
 
 ### `wtb status`
@@ -445,6 +450,27 @@ wtb status
    📦 Services: 3
    🔧 Environment: .env, .env.local
 ```
+
+### `wtb doctor`
+
+静的なプリフライト — **Docker 不要**。worktree を作る *前* に、リポジトリの Compose / env ファイルを検査し、worktree 間で衝突しうる問題を洗い出します: 固定された Compose の project name や `container_name:`、`env.adjust` のポート bump に追従しないリテラルな公開ポート、ポートマッピング中の未解決 `${VAR}`、調整対象ポートを埋め込んだ env 値、シェルの `COMPOSE_PROJECT_NAME`(worktree 分離を無効化する)など。
+
+| オプション | 説明 |
+|-----------|------|
+| `--json` | 機械可読な JSON オブジェクトをちょうど 1 つ stdout に出力 |
+| `--strict` | `warning` か `error` の finding が 1 つでもあれば exit `1`(デフォルトは warning があっても exit `0`) |
+
+```bash
+wtb doctor                 # 人間向けレポート
+wtb doctor --json | jq .   # 機械可読
+wtb doctor --strict        # CI ステップをクリーンなレポートでゲートする
+```
+
+各 finding は `{ id, severity, message, suggestion }` で、`severity` は `info` / `warning` / `error`。finding id: `fixed-project-name`、`container-name`、`literal-env-port`、`literal-compose-port`、`unresolved-port-variable`、`compose-project-name-env`、`no-compose-file`。**該当する自動処理が有効なとき finding は `info` に格下げ** されます — project name / container name 系のチェックは identity rewrite(`compose.isolate_name`)、リテラルポートのチェックは port propagation(`env.port_propagation`)で、どちらもデフォルト ON。無効化していると `warning` になります。
+
+**Exit code:** デフォルトは **warning があっても exit `0`**(agent/CI フレンドリー — JSON の `ok` と `summary` が結果を持つので、ラッパー側で判断できる)。`--strict` を渡すと warning か error があるとき exit `1`。`--json` はちょうど 1 つの JSON オブジェクト(`{ composeFile, findings, summary: { info, warning, error }, ok }`)を stdout に出します。
+
+同じチェックは [`wtb create`](#wtb-create-branch)(`--dry-run` も含む)実行時に自動でも走ります: warning/error の finding は stderr にプリフライトとして出力(末尾に `Run 'wtb doctor' for details.`)されますが、**create の exit code は一切変えません**。
 
 ### `wtb init-claude`
 
@@ -539,6 +565,28 @@ env:
 - **文字列** (`"new-key"`): 指定した文字列で値を置換。キーが存在しなければリテラルとして追記。
 - **null**: 変数をファイルから削除（存在しなければ no-op）。
 
+#### ポート伝播(`env.port_propagation`)
+
+bump されたポートは、その変数だけでなく他の値にも埋め込まれていることがよくあります。`.env` には `API_EXTERNAL_URL=http://127.0.0.1:54321` のように埋め込まれ、Compose には `${VAR:-default}` のデフォルトや文字列のポートマッピングに現れます。**ポート伝播(デフォルト ON)は old → new のポート変更をそれらの箇所にも反映** し、リマップ後も worktree の設定全体が内部的に整合するようにします。
+
+有効なとき、数値(PORT マーカー)の `env.adjust` キーを bump した後、old→new のポートを次へ伝播します:
+
+1. **そのポートを埋め込んだ env ファイル中の他の値**(例: `API_EXTERNAL_URL` が `DB_PORT` の bump に追従)。
+2. **コピーされた Compose ファイル** — `${VAR:-default}` のデフォルトと文字列のポート/environment 値。
+
+```yaml
+env:
+  # boolean ショートハンド — 全体を有効化(デフォルト)/無効化:
+  port_propagation: true        # または false
+  # フルオブジェクト形式(デフォルト値):
+  # port_propagation:
+  #   enabled: true              # マスタースイッチ
+  #   files: []                  # env.file 以外で伝播対象に追加するファイル
+  #   compose: true              # Compose コピーの ${VAR:-default}/文字列ポートも書き換え
+```
+
+`files` は `env.file` 以外で伝播対象に加えるファイルを列挙します。伝播は **境界安全** です: 直前が `:` で直後が URL/リスト/クォートの境界であるポートだけを書き換え、裸の数値は決してマッチしません(`54321` の *中* の `5432` は安全)。`port_propagation: false` で機能全体を無効化できます。bump にどの値が追従するか・しないかは [`wtb doctor`](#wtb-doctor) で確認できます。
+
 ### Docker Compose 連携
 
 `docker_compose_file` を設定すると、wtbが自動的に:
@@ -547,6 +595,29 @@ env:
 - worktree削除前に `docker compose -f <docker_compose_file> down` を実行(設定したファイルを明示的に渡すので `compose.dev.yml` のような非デフォルト名でも正しく停止)
 
 なお、コピーされる Compose ファイルはパースして再シリアライズされるため、YAML のコメント・アンカー・元の整形は保持されません(wtb が書き出すすべての Compose ファイルに当てはまります)。Docker が未インストール/デーモン停止中でも Compose ファイルはパース・書き出しされますが、避けるべき稼働中コンテナが無いため host ポートは元の値のままになります(警告が出ます)。
+
+#### worktree ごとの identity 書き換え(`compose:`)
+
+デフォルト(`compose.isolate_name: true`)では、wtb は worktree の Compose コピーを書き換えて、各 worktree が 1 つの Compose プロジェクトを共有するのではなく **それぞれ独自の** プロジェクトを持つようにします。これは、トップレベルの `name:` や `container_name:` をハードコードするスタック(例: Supabase CLI の出力)に対する修正です: これが無いと、2 回目の `wtb create` で作られるスタックは 1 つ目のコンテナ/volume にアタッチまたは上書きしてしまいます。書き換えは **デフォルト ON** で、worktree の compose ファイルをその場で書き換えます:
+
+- **project name** — トップレベルの `name:` を `<original>-<branch-slug>` にする。
+- **container name** — 各サービスの `container_name:` を `compose.container_name` に従って処理。
+
+```yaml
+# wtb.yaml
+compose:
+  isolate_name: true        # worktree ごとにトップレベル name: を書き換え(デフォルト)。false で無効化。
+  container_name: suffix    # サービスの container_name: の扱い:
+                            #   suffix — -<branch-slug> を付加(デフォルト)
+                            #   strip  — 削除(Compose が一意名を自動生成)
+                            #   keep   — そのまま(2 つ目の worktree の `up` が衝突する; wtb が警告)
+```
+
+`container_name: keep` のとき、wtb は固定 `container_name:` を持つサービスを名指しで警告します(2 つ目の worktree の `docker compose up` が衝突するため)。これらの問題は事前に `wtb doctor` で検出できます。
+
+#### 書き換えたファイルと git `skip-worktree`
+
+worktree の compose コピー(および調整/伝播された env ファイル)は **git 追跡** されていることがあります — `git worktree add` がブランチからチェックアウトするためです。wtb はそれらを worktree ごとにその場で書き換えるので、書き換えた追跡ファイルを git の **`skip-worktree`** に設定します。これにより worktree 固有の書き換えが (a) `git status` に出ない、(b) `wtb remove` の dirty チェックをブロックしない、(c) 誤ってブランチにコミットされない、ようになります。worktree 内でそのようなファイルの変更を意図的にコミットしたい場合は、先に `git update-index --no-skip-worktree <file>` を実行してください。
 
 ```yaml
 docker_compose_file: ./docker-compose.yml
@@ -599,6 +670,9 @@ env:
 | `end_command` | string | — | worktree削除前に実行するコマンド |
 | `env.file` | string[] | `["./.env"]` | 処理する環境変数ファイルのリスト |
 | `env.adjust` | object | `{}` | 調整設定（数値: 空きポート検索, 文字列: 置換, null: 削除） |
+| `env.port_propagation` | bool / object | `true` | bump されたポートを他の env 値と Compose コピーに伝播。boolean ショートハンド、または `{ enabled, files, compose }`。[ポート伝播](#ポート伝播envport_propagation) 参照 |
+| `compose.isolate_name` | bool | `true` | worktree のトップレベル Compose `name:` を `<original>-<branch-slug>` に書き換え。[Docker Compose 連携](#docker-compose-連携) 参照 |
+| `compose.container_name` | enum | `"suffix"` | サービスの `container_name:` の扱い: `suffix` / `strip` / `keep`。[Docker Compose 連携](#docker-compose-連携) 参照 |
 | `volumes.exclude` | string[] | `[]` | 自動クローンから**除外**する compose volume key 一覧。デフォルトでは Compose の named non-`external` volume をすべて自動クローンする |
 | `volumes.seed_command` | string | — | `wtb create --seed` 指定時に、volume データのクローンの**代わりに**新 worktree 内(`/bin/sh`)で実行するコマンド。main のクローンではなく新規 seed された DB から worktree を始められる。詳細は [Volume の自動クローン](#volume-の自動クローン) |
 
@@ -618,7 +692,9 @@ Compose ファイルが remap された後、wtb は **Compose の `volumes:` �
 1. wtb は Compose の `volumes:` キーを列挙します。
 2. `external: true` のものは **対象外** (共有意図のため)。
 3. ソース volume 名は `<source_project>_<key>` (もしくは `volumes.<key>.name` で明示されていればそれ)、ターゲットも同様に新 worktree の project name を使って解決。
-4. **stop-then-copy。** クローン対象のソース volume を稼働中コンテナが使用していれば、wtb は **ソース Compose スタックを stop**(`docker compose stop` — コンテナ・ネットワーク・volume は保持)してからコピーし、**restart**(`docker compose start`)します。restart は `finally` で実行され、さらに `SIGINT` にも結線されているため、コピーが途中で失敗しても・Ctrl-C で中断してもソースのサービスが落ちたまま放置されることはありません。これでライブ DB も手動操作ゼロで安全にクローンできます。`--no-stop` で stop せず稼働中 volume を skip(警告つき)、`--force-volume-copy` で stop せずライブコピー(破損リスクあり)に切り替えられます。なお `docker compose start` はプロジェクト内の停止中サービスを**すべて**起動するため、意図的に落としていたサービスがあればクローン後に再度停止してください。
+4. **plan-then-stop-then-copy。** wtb は何かを止める **前に** volume ごとのクローン計画を全て算出し、実際に 1 つ以上の volume をクローンする場合に限ってソース Compose スタックを止めます(これにより、ソースを止めたのに何もクローンせず restart に失敗して dev 環境を落としたまま、という以前の問題を防ぎます)。クローン対象のソース volume を稼働中コンテナが使用していれば、wtb は **ソース Compose スタックを stop**(`docker compose stop` — コンテナ・ネットワーク・volume は保持)してからコピーし、**restart**(`docker compose start`、失敗時は `up -d` にフォールバック)します。restart は `finally` で実行され、さらに `SIGINT` にも結線されているため、コピーが途中で失敗しても・Ctrl-C で中断してもソースのサービスが落ちたまま放置されることはありません。**別の** Compose project が掴んでいる volume は何も止めずに skip され、source と target が同じ volume 名に解決される場合はクローンを拒否します(自己上書き防止)。`--no-stop` で stop せず稼働中 volume を skip(警告つき)、`--force-volume-copy` で stop せずライブコピー(破損リスクあり)に切り替えられます。なお `docker compose start` はプロジェクト内の停止中サービスを**すべて**起動するため、意図的に落としていたサービスがあればクローン後に再度停止してください。
+
+   **restart に失敗した場合**(`docker compose start` と `up -d` フォールバックの両方がエラー)、`wtb create` / `wtb reclone` は **`--strict` 無しでも exit code `5`(Docker エラー)で終了** します — restart の失敗は稼働中のソース環境を壊れたまま残すため、ハードな失敗として扱います — そして手動で実行する復旧コマンドを出力します。
 5. 各 volume について:
    - **ソーススタックを stop した場合**(または `--force-volume-copy`、もしくは何も稼働していない場合)はクローンします。
    - **`--no-stop` 指定かつ稼働中コンテナがソース volume を使用中** なら skip + 警告 (Postgres/MySQL/Redis などはライブコピーで破損する可能性があるため)。`docker compose stop` してから、`--no-stop` を外して、または `--force-volume-copy` で実行してください。
@@ -703,7 +779,7 @@ src/
 | `2` | CLI 引数エラー — 引数不足、未知のオプション/コマンド、不正/過剰な引数、排他オプションの併用(例: `wtb ports --json --pretty`、branch 引数と `--all` の併用)。`--help`/`--version` は exit `0` のまま |
 | `3` | git リポジトリ外 |
 | `4` | 設定エラー(設定ファイルのパース失敗・バリデーション失敗) |
-| `5` | Docker エラー — 現状は `wtb prune --yes` で volume 削除に失敗したときのみ(部分的な prune)。それ以外の Docker の問題は従来どおり graceful に degrade する(警告して継続)か、`1` として表面化する |
+| `5` | Docker エラー — `wtb prune --yes` で volume 削除に失敗したとき(部分的な prune)、および `wtb create` / `wtb reclone` でクローンのためにソース Compose スタックを止めたものの **restart できなかった**とき(`docker compose start` と `up -d` フォールバックの両方が失敗 — これは `--strict` 無しでも exit `5`。ソース環境が壊れたまま残るため。復旧コマンドが出力される)。それ以外の Docker の問題は従来どおり graceful に degrade する(警告して継続)か、`1` として表面化する |
 | `6` | worktree が既に存在 — 既に worktree を持つブランチへの `wtb create`(`--exists-ok` なし) |
 | `130` / `143` | SIGINT (Ctrl-C) / SIGTERM による中断。中断扱いにすること — 中断された `create` は途中状態の可能性がある |
 
@@ -845,6 +921,8 @@ Gitリポジトリ内からwtbを実行してください。ツールはGitル�
 2. 実行中のDockerコンテナが占有しているポート
 
 `wtb status -a` で各worktreeに割り当てられているポートを確認できます。
+
+2 つの worktree のスタックが分離されずに衝突する場合、よくある原因は固定された Compose の `name:` / `container_name:`、または `env.adjust` で bump される変数経由ではなくリテラルに公開されたポートです。[`wtb doctor`](#wtb-doctor) を実行してください — まさにこれらの relocatability の問題を指摘し、どの設定キー(`compose.isolate_name`、`env.port_propagation`)が各問題を処理するか教えてくれます。
 
 ### Dockerが利用できない
 
