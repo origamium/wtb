@@ -8,6 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`wtb doctor [--json] [--strict]`** — static preflight (no Docker needed) that
+  inspects the repo's compose + env files for worktree-relocatability problems.
+  Findings are `{ id, severity (info|warning|error), message, suggestion }`; ids:
+  `fixed-project-name`, `container-name`, `literal-env-port`, `literal-compose-port`,
+  `unresolved-port-variable`, `compose-project-name-env`, `no-compose-file`. A
+  finding is downgraded to `info` when the relevant auto-handling (identity rewrite /
+  port propagation) is enabled (the default) and is a `warning` when disabled.
+  **Default exits `0` even with warnings** (agent/CI friendly — the JSON `ok`/`summary`
+  carry the result); `--strict` exits `1` if any warning-or-error finding exists.
+  `--json` prints exactly one JSON object to stdout. The same checks run automatically
+  during `wtb create` (and `--dry-run`) as a preflight, printing warning/error findings
+  to stderr without ever changing create's exit code.
+- **Per-worktree Docker Compose identity isolation** (new `compose:` config section,
+  **default ON**). `compose.isolate_name: true` rewrites the compose top-level `name:`
+  (project name) per worktree to `<original>-<branch-slug>`, and
+  `compose.container_name` (`suffix` | `strip` | `keep`, default `suffix`) controls how
+  each service's `container_name:` is handled. This is the headline fix: stacks with a
+  fixed `name:`/`container_name:` (e.g. Supabase CLI output) now actually isolate across
+  worktrees instead of colliding. Opt out with `compose.isolate_name: false` /
+  `container_name: keep`.
+- **Port propagation** (new `env.port_propagation` config, **default ON**). After wtb
+  bumps a numeric (PORT-marker) env var, it propagates the old → new port into (a) other
+  values in the env files that embed that port (e.g.
+  `API_EXTERNAL_URL=http://127.0.0.1:54321` follows the bump) and (b) the copied compose
+  file's `${VAR:-default}` defaults and string port/environment values. Accepts a boolean
+  shorthand or an object `{ enabled, files, compose }`; `files` adds extra propagation
+  targets beyond `env.file`. Boundary-safe: only a port immediately preceded by `:` and
+  followed by a URL/list/quote boundary is rewritten — a bare `5432` inside `54321` is
+  never touched. Disable with `port_propagation: false`.
+- **`wtb ports` resolves `${VAR}` / `${VAR:-default}` in compose port mappings** —
+  statically, against the worktree's env files (no Docker, no running stack). Mappings
+  like `'${KONG_HTTP_PORT:-54321}:8000'` previously yielded empty endpoints; they now
+  resolve. Precedence: worktree env-file value > compose default > unresolved (skipped,
+  with a stderr warning naming the variable). Not resolved: nested defaults
+  `${A:-${B}}`, port ranges, and IPv6.
 - **`wtb create --strict` / `wtb reclone --strict`** — opt-in non-zero exit when a
   volume clone (or the `--seed` command) fails. Default stays exit `0` (the worktree
   exists), preserving the documented contract; `--strict` makes the failure exit `1`
@@ -58,6 +93,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `volumeExists()` exported from `src/core/docker/volume.ts` for programmatic use.
 
 ### Changed
+- **Per-worktree compose rewrite is now default ON** (behavior change). The worktree's
+  `docker-compose.yml` is rewritten in place — project name (`compose.isolate_name`),
+  container names (`compose.container_name`), and, with propagation, `${VAR:-default}`
+  ports and embedded URLs. Stacks with a fixed `name:`/`container_name:` now isolate
+  across worktrees instead of colliding. Opt out with `compose.isolate_name: false`.
+  Note: the worktree compose copy is reformatted by the YAML writer (comments not
+  preserved in the compose file; env files DO preserve comments).
+- **Port propagation is now default ON** (behavior change). Bumped ports propagate into
+  other env-file values and the compose copy (see Added). Opt out with
+  `port_propagation: false`.
+- **Rewritten tracked files are marked git `skip-worktree`** — the worktree's compose
+  copy and any adjusted/propagated env files that are git-tracked, so the per-worktree
+  rewrites stay out of `git status`, don't block `wtb remove`, and aren't accidentally
+  committed back. To intentionally commit such a file, run
+  `git update-index --no-skip-worktree <file>` first.
+- **Port search now spans the full range above 9999.** Previously the free-port search
+  was capped at 9999, so a port like `54321` fell back to `original + 1` *without*
+  checking occupancy and could collide with a running stack. The search now extends to
+  65535, consults docker-published ports (`docker ps`) in addition to other worktrees'
+  env files, and never returns an in-use port when a free one exists.
+- **Volume clone is safer** (behavior change). wtb now computes the full per-volume clone
+  plan *before* stopping the source stack, and only stops it if at least one volume will
+  actually be cloned (previously it could stop the source stack, clone nothing, and fail
+  to restart — leaving the dev environment down). Volumes held by a *different* Compose
+  project are skipped without stopping, and a defensive guard refuses to clone when source
+  and target resolve to the same volume name. Restart now tries `docker compose start`
+  then falls back to `up -d`; **if both fail, `wtb create` / `wtb reclone` now exit with
+  code `5` (DOCKER_ERROR) even without `--strict`** and print the exact recovery command,
+  because a failed restart leaves the user's running source environment broken. JSON
+  output gains a `sourceStack: { stopped, restarted, restartError?, recoverCommand? }`
+  object.
 - Centralized command error handling via new `withErrorHandling` wrapper
   (`src/cli/utils/command-helpers.ts`); all six commands now share the same
   CLIError-aware exit path.
