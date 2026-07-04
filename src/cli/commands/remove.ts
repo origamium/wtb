@@ -8,6 +8,7 @@ import * as path from "node:path"
 import { Command } from "commander"
 import { EXIT_CODES } from "../../constants/index.js"
 import { loadConfig } from "../../core/config/loader.js"
+import { readComposeFile, resolveComposeProjectName } from "../../core/docker/compose.js"
 import { getGitRootOrThrow } from "../../core/git/repository.js"
 import {
   clearSkipWorktree,
@@ -16,6 +17,7 @@ import {
   isSamePath,
   listWorktrees,
   loadWtbManagedManifest,
+  markSkipWorktreeIfTracked,
   removeWorktree,
 } from "../../core/git/worktree.js"
 import { CLIError, getErrorMessage } from "../../utils/error.js"
@@ -117,7 +119,12 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
       forceGitRemoval = true
     }
 
-    const status = execGitSafe(["status", "--porcelain"], { cwd: worktreePath })
+    // core.quotePath=false: 非 ASCII のパス (例 `.env.日本語`) を git が 8 進エスケープ +
+    // ダブルクオートで返すと managed 一致が外れ、sha が一致していても常に dirty 判定になり
+    // remove が永久にブロックされる。クオートを無効化してパスをそのまま比較できるようにする。
+    const status = execGitSafe(["-c", "core.quotePath=false", "status", "--porcelain"], {
+      cwd: worktreePath,
+    })
     const reallyDirty = status
       .split("\n")
       .filter((line) => line.trim().length > 0)
@@ -136,6 +143,15 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
       })
 
     if (reallyDirty.length > 0) {
+      // 削除を拒否する = worktree は残る。上で skip-worktree を解除したままだと、wtb の
+      // per-worktree 書き換えが git status に modified として残り続け、ユーザーが誤って
+      // コミットしうる (skip-worktree が防ぐはずだった事故)。wtb 出力そのまま (sha 一致) の
+      // managed ファイルは skip-worktree を復元する (ユーザー手編集分は可視のまま残す)。
+      for (const [normalized, sha] of managedByNormalized) {
+        if (gitHashObject(worktreePath, normalized) === sha) {
+          markSkipWorktreeIfTracked(normalized, worktreePath)
+        }
+      }
       throw new CLIError(
         `Worktree for '${branch}' has uncommitted or untracked changes; commit/stash them or pass -f to force removal`,
         EXIT_CODES.GENERAL_ERROR
@@ -175,13 +191,38 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
     } else {
       const worktreeComposePath = path.resolve(worktreePath, config.docker_compose_file)
       if (existsSync(worktreeComposePath)) {
+        // `docker compose down` は `-p` 無しだと env(COMPOSE_PROJECT_NAME) > 固定 name: >
+        // ディレクトリ名 の順で project を解決する。worktree の .env や shell に
+        // COMPOSE_PROJECT_NAME があると **source** プロジェクトに解決され、source の
+        // コンテナ/ネットワーク (--remove-volumes なら volume まで) を消してしまう。
+        // これを防ぐため target project 名を明示解決して `-p` で渡し、source と一致する
+        // 場合は teardown を拒否する (create 側の self-overwrite ガードと対の防御)。
+        const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
+        const sourceProject = safeResolveProject(sourceComposePath, gitRoot)
+        const targetProject = safeResolveProject(worktreeComposePath, worktreePath)
+
         console.log("")
-        if (removeVolumes) {
-          console.log("🐳 Stopping Docker Compose services and removing volumes...")
+        if (targetProject === null) {
+          console.log(
+            "  ⚠️  Skipped Docker Compose teardown: could not resolve this worktree's Compose project name (compose unreadable). Tear it down manually if needed."
+          )
+        } else if (sourceProject !== null && targetProject === sourceProject) {
+          console.log(
+            `  ⚠️  Skipped Docker Compose teardown: this worktree resolves to the SAME Compose project as the source ('${targetProject}'), so 'docker compose down' would tear down your source stack${removeVolumes ? " and DELETE its volumes" : ""}. This usually means COMPOSE_PROJECT_NAME is set or the compose 'name:' is fixed. Tear it down manually if that's intended.`
+          )
         } else {
-          console.log("🐳 Stopping Docker Compose services...")
+          if (removeVolumes) {
+            console.log("🐳 Stopping Docker Compose services and removing volumes...")
+          } else {
+            console.log("🐳 Stopping Docker Compose services...")
+          }
+          await runDockerComposeDown(
+            worktreePath,
+            worktreeComposePath,
+            targetProject,
+            removeVolumes
+          )
         }
-        await runDockerComposeDown(worktreePath, worktreeComposePath, removeVolumes)
       } else if (removeVolumes) {
         // compose file が worktree に無いと down -v を実行できない
         console.log("")
@@ -238,18 +279,21 @@ async function executeRemoveCommand(branch: string, options: RemoveOptions): Pro
  *
  * docker_compose_file は compose.dev.yml のような非デフォルト名でも良いので、
  * compose のデフォルト探索に頼らず `-f <path>` で明示的に渡す (composeStop と同じ流儀)。
+ * project 名も `-p` で明示し、source プロジェクトを誤って down しないようにする。
  *
  * @param worktreePath - worktree のパス
  * @param composeFilePath - worktree 内の Compose ファイルの絶対パス
+ * @param projectName - この worktree の Compose プロジェクト名 (source とは別物であること)
  * @param removeVolumes - true なら `down -v` で named volume も削除
  */
 async function runDockerComposeDown(
   worktreePath: string,
   composeFilePath: string,
+  projectName: string,
   removeVolumes: boolean = false
 ): Promise<void> {
   try {
-    const args = ["compose", "-f", composeFilePath, "down"]
+    const args = ["compose", "-f", composeFilePath, "-p", projectName, "down"]
     if (removeVolumes) {
       args.push("-v")
     }
@@ -265,13 +309,28 @@ async function runDockerComposeDown(
   }
 }
 
+/** compose ファイルを読んで Compose プロジェクト名を解決する。読めなければ null。 */
+function safeResolveProject(composePath: string, workdir: string): string | null {
+  try {
+    return resolveComposeProjectName(readComposeFile(composePath), workdir)
+  } catch {
+    return null
+  }
+}
+
+/** POSIX シェル向けに単一引用符でクオートする。 */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
 /**
  * end_commandを実行
  */
 async function executeEndCommand(command: string, worktreePath: string): Promise<void> {
   try {
     const commandPath = path.resolve(worktreePath, command)
-    const actualCommand = existsSync(commandPath) ? commandPath : command
+    // 昇格したパスは /bin/sh のコマンド文字列に埋まるのでクオートする (スペース等対策)。
+    const actualCommand = existsSync(commandPath) ? shellQuote(commandPath) : command
 
     executeLifecycleCommand(actualCommand, worktreePath)
     console.log("  ✅ End command completed successfully")

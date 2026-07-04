@@ -3,6 +3,7 @@
  * Docker Composeファイルの読み込み、書き込み、ポート調整を担当
  */
 
+import { createHash } from "node:crypto"
 import { existsSync } from "node:fs"
 import fs from "fs-extra"
 import { parse, parseDocument, stringify, visit } from "yaml"
@@ -49,7 +50,10 @@ export function readComposeFile(filePath: string, options?: FileOperationOptions
       encoding: options?.encoding || FILE_ENCODING,
     })
 
-    const parsed = parse(content) as ComposeConfig
+    // merge: true で YAML merge key (`<<: *anchor`) を解決する。解決しないと anchor 内の
+    // ports / container_name が service に現れず (service.ports === undefined)、identity
+    // 書き換え・ポート調整・伝播が全て素通りして worktree 間で同一ポートが公開される。
+    const parsed = parse(content, { merge: true }) as ComposeConfig
 
     if (!parsed || typeof parsed !== "object") {
       throw new Error("Invalid Docker Compose file format")
@@ -268,13 +272,15 @@ export function propagatePortsInComposeValues(
   const changes: ComposeValueChange[] = []
 
   // 1 つの文字列値に伝播を適用し、変わった場合だけ changes に記録して新値を返す。
+  // ports パス → defaults パスの順で適用する。逆順だと defaults が env 由来の新ポートを
+  // default に差し込んだ直後に ports パスがそれを再マップして二重ホップ (A→B→C) する。
   const rewrite = (raw: string, location: string): string => {
-    const afterDefaults = propagateComposeDefaults(raw, envChanges, map)
-    const afterPorts = propagatePortsInValue(afterDefaults, map).value
-    if (afterPorts !== raw) {
-      changes.push({ location, from: raw, to: afterPorts })
+    const afterPorts = propagatePortsInValue(raw, map).value
+    const afterDefaults = propagateComposeDefaults(afterPorts, envChanges, map)
+    if (afterDefaults !== raw) {
+      changes.push({ location, from: raw, to: afterDefaults })
     }
-    return afterPorts
+    return afterDefaults
   }
 
   for (const [serviceName, service] of Object.entries(newConfig.services ?? {})) {
@@ -302,11 +308,20 @@ export function propagatePortsInComposeValues(
       })
     }
 
-    // ports: 文字列エントリのみ対象（`${VAR:-54321}:8000` 形式を修正）
+    // ports: `${VAR:-54321}:8000` のような変数入りエントリの **default 部分のみ** 伝播する。
+    // - parseable な `host:container` リテラルは adjustPortsInCompose の管轄なので除外。
+    // - propagatePortsInValue の `:port` 正規表現は使わない。ports 文字列に当てると
+    //   コンテナ側ポート (例 "${VAR:-5432}:5432" の後半) まで書き換えてしまうため。
+    //   propagateComposeDefaults だけを使い `${VAR:-default}` の default だけを直す。
     if (Array.isArray(service.ports)) {
       service.ports = service.ports.map((portMapping, index) => {
         if (typeof portMapping !== "string") return portMapping
-        return rewrite(portMapping, `${serviceName}.ports[${index}]`)
+        if (parsePortMapping(portMapping)) return portMapping
+        const next = propagateComposeDefaults(portMapping, envChanges, map)
+        if (next !== portMapping) {
+          changes.push({ location: `${serviceName}.ports[${index}]`, from: portMapping, to: next })
+        }
+        return next
       })
     }
   }
@@ -539,6 +554,24 @@ export function sanitizeProjectSlug(branch: string): string {
     return `wtb${s}`
   }
   return s
+}
+
+/**
+ * branch の slug が既存の他 worktree の slug と衝突する場合に、raw branch の短いハッシュを
+ * 付けて一意化する。unicode/記号だけが違う別ブランチ (例 `機能-a` と `修正-a` は共に `a`、
+ * 全 unicode のブランチは共に `wtb`) が同一 project slug に畳まれ、2 つ目の `docker compose
+ * up` が 1 つ目のスタックを乗っ取る/衝突するのを防ぐ。衝突が無ければ素の slug をそのまま返す
+ * ので、通常の ASCII ブランチの読みやすい名前は変わらない。
+ *
+ * @param branch - 対象ブランチ名
+ * @param otherBranches - 既存の他 worktree のブランチ名 (自分自身を含んでいてもよい)
+ */
+export function uniqueProjectSlug(branch: string, otherBranches: string[]): string {
+  const base = sanitizeProjectSlug(branch)
+  const collides = otherBranches.some((b) => b !== branch && sanitizeProjectSlug(b) === base)
+  if (!collides) return base
+  const hash = createHash("sha1").update(branch).digest("hex").slice(0, 6)
+  return sanitizeProjectSlug(`${base}-${hash}`)
 }
 
 /**

@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`wtb remove` no longer risks tearing down the SOURCE stack.** `docker compose down`
+  now passes an explicit `-p <worktree-project>` and refuses teardown when the worktree
+  resolves to the same Compose project as the source (e.g. `COMPOSE_PROJECT_NAME` set or a
+  fixed `name:`), which previously could stop — and with `--remove-volumes` delete the
+  volumes of — the source project.
+- **Port propagation no longer corrupts container ports in compose `ports:`.** A mapping
+  like `"5432:5432"` (or `${VAR:-5432}:5432`) is no longer rewritten on its container side;
+  parseable literal mappings are left to the port-adjuster, and only `${VAR:-default}`
+  host-port defaults are propagated. Also fixes a chained-map double-hop on env values.
+- **Compose port allocation now also avoids ports held by stopped sibling worktrees and by
+  the env phase's own just-assigned ports**, not just currently-running containers,
+  preventing silent host-port collisions between worktrees.
+- **`--force-volume-copy` refuses to overwrite a pre-existing volume that isn't
+  `wtb.managed`**, so an unrelated volume that happens to share the target name is never
+  wiped; an overwrite also requires `--force-volume-copy` even if the target only gains data
+  after planning (TOCTOU guard).
+- **`wtb prune` is scoped to the current repository** via a new `wtb.repo` volume label, so
+  it can no longer delete another repo's live wtb volumes on the same host. Volumes created
+  before this release lack the label and are left untouched.
+- **`wtb doctor` accuracy**: downgrade-to-`info` now matches what create actually does — it
+  accounts for `docker_compose_file` being unset, keys container-name findings on
+  `compose.container_name` (not `isolate_name`), and no longer claims a literal
+  `HOST:CONTAINER` mapping is auto-fixed by propagation. New finding ids: `compose-file-env`,
+  `compose-override-file`, `fixed-volume-name`, `fixed-network-name`,
+  `unsupported-compose-port`.
+- **YAML merge keys (`<<: *anchor`) are now resolved** when reading compose files, so
+  anchored `ports`/`container_name` are isolated instead of silently passing through.
+- **Interrupted volume clones report their outcome**: a Ctrl-C during the
+  stop → clone → restart window now prints whether the source stack came back and the exact
+  recovery command if it did not.
+- Worktree slugs that collapse to the same value (e.g. unicode-only branches) are
+  disambiguated with a short hash to prevent cross-worktree identity collisions.
+- A failed compose rewrite is now reflected in the create banner, `--json` (`composeFailed`,
+  `ok:false`), and `--strict` exit code instead of silently reporting success.
+- Hardening: recovery/lifecycle commands are shell-quoted; `git` operands are protected with
+  `--end-of-options`; a blocked `wtb remove` restores managed-file skip-worktree bits; and
+  non-ASCII managed paths no longer permanently block `wtb remove`.
+
+## [1.1.0] - 2026-06-13
+
 ### Added
 - **`wtb doctor [--json] [--strict]`** — static preflight (no Docker needed) that
   inspects the repo's compose + env files for worktree-relocatability problems.

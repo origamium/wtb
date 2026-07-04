@@ -12,6 +12,7 @@ import type { Command } from "commander"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { EXIT_CODES } from "../../constants/index.js"
 import * as loaderModule from "../../core/config/loader.js"
+import * as composeModule from "../../core/docker/compose.js"
 import * as repositoryModule from "../../core/git/repository.js"
 import * as worktreeModule from "../../core/git/worktree.js"
 import * as execModule from "../../utils/exec.js"
@@ -21,6 +22,7 @@ vi.mock("node:fs", () => ({
   existsSync: vi.fn(() => true),
 }))
 vi.mock("../../core/config/loader.js")
+vi.mock("../../core/docker/compose.js")
 vi.mock("../../core/git/repository.js")
 vi.mock("../../core/git/worktree.js")
 vi.mock("../../utils/exec.js")
@@ -54,6 +56,12 @@ describe("remove command", () => {
     })
     // git status --porcelain → clean by default
     vi.mocked(execModule.execGitSafe).mockReturnValue("")
+    // compose の project 解決: source(/repo) と worktree で別プロジェクトを返す
+    // (一致すると teardown はソース保護のため skip される)。
+    vi.mocked(composeModule.readComposeFile).mockReturnValue({ services: {} } as never)
+    vi.mocked(composeModule.resolveComposeProjectName).mockImplementation((_cfg, workdir) =>
+      workdir === "/repo" ? "srcproj" : "wtproj"
+    )
   })
 
   afterEach(() => {
@@ -72,9 +80,12 @@ describe("remove command", () => {
     ).rejects.toThrow("exit")
 
     expect(exit).toHaveBeenCalledWith(EXIT_CODES.GENERAL_ERROR)
-    expect(execModule.execGitSafe).toHaveBeenCalledWith(["status", "--porcelain"], {
-      cwd: WORKTREE_PATH,
-    })
+    expect(execModule.execGitSafe).toHaveBeenCalledWith(
+      ["-c", "core.quotePath=false", "status", "--porcelain"],
+      {
+        cwd: WORKTREE_PATH,
+      }
+    )
     // 破壊的処理は一切走らないこと
     expect(execModule.execDockerSafe).not.toHaveBeenCalled()
     expect(worktreeModule.removeWorktree).not.toHaveBeenCalled()
@@ -89,11 +100,11 @@ describe("remove command", () => {
     expect(worktreeModule.removeWorktree).toHaveBeenCalledWith(WORKTREE_PATH, { force: true })
   })
 
-  it("passes the configured compose file via 'docker compose -f <path> down'", async () => {
+  it("passes the configured compose file and worktree project via 'docker compose -f <path> -p <project> down'", async () => {
     await command.parseAsync(["feature/x"], { from: "user" })
 
     expect(execModule.execDockerSafe).toHaveBeenCalledWith(
-      ["compose", "-f", path.resolve(WORKTREE_PATH, "compose.dev.yml"), "down"],
+      ["compose", "-f", path.resolve(WORKTREE_PATH, "compose.dev.yml"), "-p", "wtproj", "down"],
       { cwd: WORKTREE_PATH }
     )
     // manifest が空 (managed ファイルなし) かつ clean なので force は不要 (false)。
@@ -106,9 +117,24 @@ describe("remove command", () => {
     await command.parseAsync(["feature/x", "--remove-volumes"], { from: "user" })
 
     expect(execModule.execDockerSafe).toHaveBeenCalledWith(
-      ["compose", "-f", path.resolve(WORKTREE_PATH, "compose.dev.yml"), "down", "-v"],
+      ["compose", "-f", path.resolve(WORKTREE_PATH, "compose.dev.yml"), "-p", "wtproj", "down", "-v"],
       { cwd: WORKTREE_PATH }
     )
+  })
+
+  it("refuses teardown (protects source) when the worktree resolves to the source project", async () => {
+    // COMPOSE_PROJECT_NAME 相当: source と worktree が同一プロジェクトに解決される。
+    vi.mocked(composeModule.resolveComposeProjectName).mockReturnValue("srcproj")
+
+    await command.parseAsync(["feature/x", "--remove-volumes"], { from: "user" })
+
+    // down は一切呼ばれない (source を巻き込まないため)。
+    expect(execModule.execDockerSafe).not.toHaveBeenCalled()
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("SAME Compose project as the source")
+    )
+    // teardown は skip されるが worktree 自体の削除は行われる。
+    expect(worktreeModule.removeWorktree).toHaveBeenCalled()
   })
 
   it("B1: ignores a managed file that still equals wtb's output and force-removes the worktree", async () => {

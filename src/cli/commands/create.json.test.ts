@@ -156,7 +156,7 @@ describe("create command --json / --exists-ok", () => {
       })
     }
 
-    it("exits 1 when the seed command fails (human mode)", async () => {
+    it("signals failure via process.exitCode when the seed command fails (human mode)", async () => {
       configureSeed()
       vi.mocked(execModule.executeLifecycleCommand).mockImplementation(() => {
         throw new Error("seed boom")
@@ -164,12 +164,14 @@ describe("create command --json / --exists-ok", () => {
       const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
         throw new Error("exited")
       })
+      process.exitCode = undefined
 
-      await expect(
-        command.parseAsync(["feature/x", "--seed", "--strict"], { from: "user" })
-      ).rejects.toThrow("exited")
+      await command.parseAsync(["feature/x", "--seed", "--strict"], { from: "user" })
 
-      expect(exitSpy).toHaveBeenCalledWith(EXIT_CODES.GENERAL_ERROR)
+      // 人間モードでも即 process.exit せず exitCode を設定する (buffered stdout の flush 保護)。
+      expect(exitSpy).not.toHaveBeenCalled()
+      expect(process.exitCode).toBe(EXIT_CODES.GENERAL_ERROR)
+      process.exitCode = undefined
       exitSpy.mockRestore()
     })
 

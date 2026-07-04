@@ -223,9 +223,16 @@ export function getDockerVolumes(options?: ExecOptions): VolumeInfo[] {
  * @param options - 実行オプション
  * @returns wtb 管理 volume 名の配列
  */
-export function getWtbManagedVolumeNames(options?: ExecOptions): string[] {
+export function getWtbManagedVolumeNames(repoLabel?: string, options?: ExecOptions): string[] {
   try {
-    const output = execDockerCommand(DOCKER_COMMANDS.MANAGED_VOLUMES, options)
+    // repoLabel が渡されたら `wtb.repo=<hash>` でも絞る。これで prune は自リポジトリの
+    // volume だけを候補にし、同一ホスト上の別リポジトリの現役 volume を巻き込まない。
+    // 値は repoVolumeLabel が返す hex のみ許可 (シェル文字列に埋めるため念のため検証)。
+    const command =
+      repoLabel && /^[a-f0-9]+$/.test(repoLabel)
+        ? `docker volume ls --filter label=wtb.managed=true --filter label=wtb.repo=${repoLabel} --format "{{.Name}}"`
+        : DOCKER_COMMANDS.MANAGED_VOLUMES
+    const output = execDockerCommand(command, options)
     return output
       .split("\n")
       .map((l) => l.trim())

@@ -243,7 +243,7 @@ describe("copyVolume atomic overwrite", () => {
     vi.mocked(spawn).mockImplementation(() => fakeRsyncProc(0) as never)
     vi.mocked(execDockerSafe).mockImplementation((args: string[]) => {
       if (args.includes(DU_CMD)) {
-        const vol = mountVol(args, ":/data")
+        const vol = mountVol(args, ":/data:ro")
         return vol === SOURCE || vol.includes("__wtbtmp_") ? "100" : "0"
       }
       return ""
@@ -298,7 +298,7 @@ describe("copyVolume atomic overwrite", () => {
     // rsync 'succeeds' but the temp ends up empty while source has data
     vi.mocked(execDockerSafe).mockImplementation((args: string[]) => {
       if (args.includes(DU_CMD)) {
-        const vol = mountVol(args, ":/data")
+        const vol = mountVol(args, ":/data:ro")
         return vol === SOURCE ? "100" : "0"
       }
       return ""
@@ -335,7 +335,7 @@ describe("copyVolume atomic overwrite", () => {
     // temp volume is the ONLY intact data and must NOT be deleted.
     vi.mocked(execDockerSafe).mockImplementation((args: string[]) => {
       if (args.includes(DU_CMD)) {
-        const vol = mountVol(args, ":/data")
+        const vol = mountVol(args, ":/data:ro")
         return vol === SOURCE || vol.includes("__wtbtmp_") ? "100" : "0"
       }
       if (args.includes(CP_CMD) && args.includes(`${TARGET}:/target`)) {

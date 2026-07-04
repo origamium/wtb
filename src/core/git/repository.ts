@@ -101,7 +101,11 @@ export function revisionExists(revision: string, cwd?: string): boolean {
   }
 
   try {
-    execGitSafe(["rev-parse", "--verify", "--quiet", `${revision}^{commit}`], { cwd })
+    // --end-of-options: `-` 始まりの base_branch (config 由来) がフラグとして解釈されて
+    // 誤ったエラーになるのを防ぐ。
+    execGitSafe(["rev-parse", "--verify", "--quiet", "--end-of-options", `${revision}^{commit}`], {
+      cwd,
+    })
     return true
   } catch {
     return false

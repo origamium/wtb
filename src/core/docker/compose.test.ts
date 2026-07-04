@@ -10,10 +10,12 @@ import {
   findAvailablePort,
   parsePortMapping,
   propagatePortsInComposeValues,
+  readComposeFile,
   resolveComposeProjectName,
   rewriteComposeIdentity,
   sanitizeContainerName,
   sanitizeProjectSlug,
+  uniqueProjectSlug,
   writeComposeFile,
 } from "./compose"
 
@@ -330,6 +332,93 @@ describe("propagatePortsInComposeValues", () => {
     // biome-ignore lint/suspicious/noTemplateCurlyInString: literal compose syntax
     expect(config.services.kong.ports).toEqual(["${KONG_HTTP_PORT:-54321}:8000"])
     expect(changes).toHaveLength(0)
+  })
+
+  it("does NOT rewrite the container-side port of a parseable literal mapping (H1)", () => {
+    // 5432:5432 は adjustPortsInCompose の管轄。伝播が :5432 (コンテナ側) を書き換えると
+    // 公開ポートが listen ポートと食い違う。parseable なマッピングは伝播対象外にする。
+    const envChanges = { DB_PORT: { from: "5432", to: "5433" } }
+    const map = buildPortMap([{ key: "DB_PORT", from: "5432", to: "5433" }])
+    const cfg: ComposeConfig = {
+      services: { db: { image: "postgres", ports: ["5432:5432"] } },
+    }
+    const { config, changes } = propagatePortsInComposeValues(cfg, envChanges, map)
+    expect(config.services.db.ports).toEqual(["5432:5432"])
+    expect(changes).toHaveLength(0)
+  })
+
+  it("still rewrites a variable-default host port (propagation's real target)", () => {
+    const envChanges = { DB_PORT: { from: "5432", to: "5433" } }
+    const map = buildPortMap([{ key: "DB_PORT", from: "5432", to: "5433" }])
+    const cfg: ComposeConfig = {
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal compose syntax
+      services: { db: { image: "postgres", ports: ["${DB_PORT:-5432}:5432"] } },
+    }
+    const { config } = propagatePortsInComposeValues(cfg, envChanges, map)
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: literal compose syntax
+    expect(config.services.db.ports).toEqual(["${DB_PORT:-5433}:5432"])
+  })
+
+  it("does not double-hop a chained map when substituting a variable default (F6)", () => {
+    // A:3001→3002, B:3002→3003。旧実装は defaults→ports の順で B の new(3002) を再マップして
+    // 3003 にしてしまった。ports→defaults の順にして単一ホップに保つ。
+    const envChanges = { A_URL: { from: "x:3001", to: "x:3002" } }
+    const map = buildPortMap([
+      { key: "A", from: "3001", to: "3002" },
+      { key: "B", from: "3002", to: "3003" },
+    ])
+    const cfg: ComposeConfig = {
+      services: {
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: literal compose syntax
+        app: { image: "app", environment: { DB: "${A_URL:-host:3001}" } },
+      },
+    }
+    const { config } = propagatePortsInComposeValues(cfg, envChanges, map)
+    // rule-1 が A_URL の new 値 (x:3002) を差し込む。ports パスが 3002→3003 に再マップしない。
+    expect((config.services.app.environment as Record<string, string>).DB).toBe(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal compose syntax
+      "${A_URL:-x:3002}"
+    )
+  })
+})
+
+describe("readComposeFile — YAML merge keys (H7)", () => {
+  it("resolves `<<: *anchor` so anchored ports/container_name become visible", () => {
+    const yaml = [
+      "services:",
+      "  base: &base",
+      "    image: postgres",
+      '    ports: ["5432:5432"]',
+      "  db:",
+      "    <<: *base",
+      "    container_name: mydb",
+      "",
+    ].join("\n")
+    const filePath = path.join(tmpDir, "docker-compose.yml")
+    fs.writeFileSync(filePath, yaml)
+    const cfg = readComposeFile(filePath)
+    // merge key を解決しないと db.ports は undefined になり全書き換えが素通りする。
+    expect(cfg.services.db.ports).toEqual(["5432:5432"])
+    expect((cfg.services.db as { container_name?: string }).container_name).toBe("mydb")
+  })
+})
+
+describe("uniqueProjectSlug", () => {
+  it("returns the plain slug when there is no collision", () => {
+    expect(uniqueProjectSlug("feature/x", ["main", "other"])).toBe("feature-x")
+  })
+
+  it("ignores the branch itself in the collision set", () => {
+    expect(uniqueProjectSlug("feature/x", ["feature/x", "main"])).toBe("feature-x")
+  })
+
+  it("disambiguates when two different branches collapse to the same slug", () => {
+    // 機能-a と 修正-a は sanitizeProjectSlug では両方 'a' に畳まれる。
+    const a = uniqueProjectSlug("機能-a", ["修正-a"])
+    const b = uniqueProjectSlug("修正-a", ["機能-a"])
+    expect(a).not.toBe(b)
+    // ハッシュは決定的 (同じ入力なら同じ出力)。
+    expect(uniqueProjectSlug("機能-a", ["修正-a"])).toBe(a)
   })
 })
 

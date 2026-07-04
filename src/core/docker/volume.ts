@@ -5,10 +5,58 @@
  */
 
 import { spawn } from "node:child_process"
+import { createHash } from "node:crypto"
+import { realpathSync } from "node:fs"
 import { FILE_ENCODING } from "../../constants/index.js"
 import type { ComposeConfig } from "../../types/index.js"
 import { execDockerSafe } from "../../utils/exec.js"
 import { out } from "../../utils/output.js"
+
+/**
+ * リポジトリを一意に識別する volume ラベル値 (`wtb.repo=<hash>`) を求める。
+ * canonical な gitRoot パスの短いハッシュ。`wtb prune` はこの値で候補を絞り、別リポジトリの
+ * wtb volume を「孤児」と誤認して消すのを防ぐ (repo スコープ)。
+ */
+export function repoVolumeLabel(gitRoot: string): string {
+  let canonical: string
+  try {
+    canonical = realpathSync(gitRoot)
+  } catch {
+    canonical = gitRoot
+  }
+  return createHash("sha1").update(canonical).digest("hex").slice(0, 12)
+}
+
+/** Docker volume 名の許容文字。破壊的操作の前に名前を検証する防御に使う。 */
+const DOCKER_VOLUME_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/
+
+/**
+ * 破壊的操作 (clear / atomic overwrite の tmp 作成) の前に volume 名を検証する。
+ * Docker 自身も不正名を弾くが、`/` を含む名前が万一ここへ届くと `-v /:/target` の
+ * bind mount としてホストの `/` を消しかねない。防御的に早期に throw する。
+ */
+function assertValidVolumeName(volumeName: string): void {
+  if (!DOCKER_VOLUME_NAME.test(volumeName)) {
+    throw new Error(`Refusing to operate on invalid Docker volume name: '${volumeName}'`)
+  }
+}
+
+/**
+ * 指定 volume が wtb 作成 (`wtb.managed=true` ラベル付き) かを判定する。
+ * inspect 失敗 (存在しない等) は false。破壊的な上書きの前に「wtb が所有する volume か」を
+ * 確認し、無関係な既存 volume を誤って消さないためのガードに使う。
+ */
+export function volumeIsWtbManaged(volumeName: string): boolean {
+  try {
+    const label = execDockerSafe(
+      ["volume", "inspect", "--format", '{{ index .Labels "wtb.managed" }}', volumeName],
+      {}
+    )
+    return label.trim() === "true"
+  } catch {
+    return false
+  }
+}
 
 /**
  * ボリュームコピーの進捗情報
@@ -32,6 +80,13 @@ export interface VolumeCopyOptions {
   incremental?: boolean
   /** rsync `-z` 相当(cp フォールバックでは無視) */
   compress?: boolean
+  /** 作成する volume に付与するリポジトリ識別ラベル値 (`wtb.repo=<value>`)。prune の repo スコープ用。 */
+  repoLabel?: string
+}
+
+/** repoLabel から createVolume 用の extraLabels を作る。 */
+function repoLabelArg(repoLabel?: string): Record<string, string> {
+  return repoLabel ? { "wtb.repo": repoLabel } : {}
 }
 
 /**
@@ -50,7 +105,7 @@ export function getVolumeSize(volumeName: string): number | null {
         "run",
         "--rm",
         "-v",
-        `${volumeName}:/data`,
+        `${volumeName}:/data:ro`,
         "alpine",
         "sh",
         "-c",
@@ -71,15 +126,23 @@ export function getVolumeSize(volumeName: string): number | null {
  * @param volumeName - 作成するボリューム名
  * @param driver - ドライバー（デフォルト: local）
  */
-export function createVolume(volumeName: string, driver: string = "local"): void {
+export function createVolume(
+  volumeName: string,
+  driver: string = "local",
+  extraLabels: Record<string, string> = {}
+): void {
+  assertValidVolumeName(volumeName)
   // wtb が作成した volume には `wtb.managed=true` ラベルを付け、自己識別できるようにする。
   // これで `wtb status` はディレクトリ名の命名規則に依存せず (カスタム -p パスでも)
   // wtb 管理 volume を正確に列挙でき、ユーザ/agent も
   // `docker volume ls --filter label=wtb.managed=true` で発見・整理できる。
-  execDockerSafe(
-    ["volume", "create", "--driver", driver, "--label", "wtb.managed=true", volumeName],
-    {}
-  )
+  // extraLabels には作成元リポジトリを示す `wtb.repo=<hash>` を渡し、`wtb prune` が
+  // 別リポジトリの現役 volume を「孤児」と誤認して消すのを防ぐ (repo スコープ)。
+  const labelArgs: string[] = ["--label", "wtb.managed=true"]
+  for (const [k, v] of Object.entries(extraLabels)) {
+    labelArgs.push("--label", `${k}=${v}`)
+  }
+  execDockerSafe(["volume", "create", "--driver", driver, ...labelArgs, volumeName], {})
 }
 
 /**
@@ -104,6 +167,7 @@ export function removeVolume(volumeName: string): void {
  * overwrite の commit 段階で共有する。
  */
 function clearVolume(volumeName: string): void {
+  assertValidVolumeName(volumeName)
   execDockerSafe(
     [
       "run",
@@ -187,7 +251,7 @@ export async function copyVolumeWithRsync(
   // `docker volume create` は idempotent (既存 volume なら何もせず成功) なので
   // 失敗 = 本当のエラー (daemon down / 不正な名前 / driver エラー)。握り潰さず
   // 伝播させ、呼び出し側で copy 失敗として明確に扱う。
-  createVolume(targetVolume)
+  createVolume(targetVolume, "local", repoLabelArg(options.repoLabel))
 
   const totalBytes = getVolumeSize(sourceVolume) ?? 0
 
@@ -297,11 +361,12 @@ export async function copyVolumeWithCp(
   options: {
     onProgress?: (progress: VolumeCopyProgress) => void
     clearTarget?: boolean
+    repoLabel?: string
   } = {}
 ): Promise<void> {
   const { onProgress, clearTarget = false } = options
   // idempotent: 既存なら no-op で成功。失敗は本当のエラーなので伝播させる。
-  createVolume(targetVolume)
+  createVolume(targetVolume, "local", repoLabelArg(options.repoLabel))
 
   const totalBytes = getVolumeSize(sourceVolume) ?? 0
 
@@ -420,10 +485,29 @@ async function copyVolumeAtomicOverwrite(
   // この時 tmp を消すと唯一の正データを失うため、cleanup では tmp を残して復旧手順を出す。
   let commitStarted = false
   let commitDone = false
+
+  // mid-commit で失敗/中断した場合の復旧案内。SIGINT が finally をバイパスするため、
+  // 通常の finally からも prepend した signal handler からも同じ文言を出せるよう関数化する。
+  const printRecovery = (): void => {
+    out(`  ⚠️  Overwrite of '${targetVolume}' failed mid-commit — its data may be incomplete.`)
+    out(`      A verified full copy is preserved in temp volume '${tmp}'. Recover with:`)
+    out(
+      `        docker run --rm -v ${tmp}:/from -v ${targetVolume}:/to alpine sh -c 'find /to -mindepth 1 -delete && cp -a /from/. /to/' && docker volume rm ${tmp}`
+    )
+  }
+  // commit 窓の間だけ有効化する signal handler。cli/index.ts の SIGINT/SIGTERM handler は
+  // process.exit() で finally をバイパスするので、prepend した handler で復旧案内を出す
+  // (tmp は finally が走らないため残る = 案内どおり復旧できる)。
+  const abortSignals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"]
+  let onAbort: (() => void) | undefined
+
   try {
-    createVolume(tmp)
+    createVolume(tmp, "local", repoLabelArg(options.repoLabel))
     // 1. stage
-    await copyVolume(sourceVolume, tmp, { onProgress: options.onProgress })
+    await copyVolume(sourceVolume, tmp, {
+      onProgress: options.onProgress,
+      repoLabel: options.repoLabel,
+    })
     // 2. verify — この gate だけが破壊的な commit を守る。サイズを確定できない
     //    (getVolumeSize が null) 場合は「空かもしれない」を「空でない」と誤認して
     //    target を消すことがないよう、確認できないなら必ず abort する。
@@ -439,20 +523,21 @@ async function copyVolumeAtomicOverwrite(
         `Staged copy of '${sourceVolume}' is empty — aborting overwrite to protect '${targetVolume}'`
       )
     }
-    // 3. commit (target を消すのはここが初めて)
+    // 3. commit (target を消すのはここが初めて)。この窓の間は SIGINT でも復旧案内を出す。
+    onAbort = () => printRecovery()
+    for (const sig of abortSignals) process.prependListener(sig, onAbort)
     commitStarted = true
-    await copyVolumeWithCp(tmp, targetVolume, { clearTarget: true })
+    await copyVolumeWithCp(tmp, targetVolume, { clearTarget: true, repoLabel: options.repoLabel })
     commitDone = true
   } finally {
+    if (onAbort) {
+      for (const sig of abortSignals) process.removeListener(sig, onAbort)
+    }
     // 4. cleanup。commit 開始後に失敗した場合だけは tmp を残す (target が壊れていて
     //    tmp が唯一の完全コピーのため)。それ以外 (staging/verify 失敗 = target 無傷、
     //    または commit 成功) では tmp は不要なので削除する。
     if (commitStarted && !commitDone) {
-      out(`  ⚠️  Overwrite of '${targetVolume}' failed mid-commit — its data may be incomplete.`)
-      out(`      A verified full copy is preserved in temp volume '${tmp}'. Recover with:`)
-      out(
-        `        docker run --rm -v ${tmp}:/from -v ${targetVolume}:/to alpine sh -c 'find /to -mindepth 1 -delete && cp -a /from/. /to/' && docker volume rm ${tmp}`
-      )
+      printRecovery()
     } else {
       removeVolume(tmp)
     }

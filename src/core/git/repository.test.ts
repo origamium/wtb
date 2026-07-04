@@ -177,7 +177,7 @@ describe("Git Repository Operations (Refactored)", () => {
       expect(exists).toBe(true)
       expect(execFileSync).toHaveBeenCalledWith(
         "git",
-        ["rev-parse", "--verify", "--quiet", "v1.0.0^{commit}"],
+        ["rev-parse", "--verify", "--quiet", "--end-of-options", "v1.0.0^{commit}"],
         expect.objectContaining({ cwd: testRepoPath })
       )
     })

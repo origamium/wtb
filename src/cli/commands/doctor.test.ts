@@ -106,7 +106,11 @@ describe("doctor command surface", () => {
   })
 
   it("--strict exits 1 when findings include warnings", async () => {
-    vi.mocked(composeModule.readComposeFile).mockReturnValue(compose({ name: "myapp" }))
+    // Unresolved port variable is always a warning regardless of identity/propagation options.
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: testing compose interpolation syntax
+      compose({ services: { web: { ports: ["${MISSING_PORT}:80"] } } })
+    )
     const originalExitCode = process.exitCode
     await doctorCommand().parseAsync(["--strict"], { from: "user" })
     expect(process.exitCode).toBe(EXIT_CODES.GENERAL_ERROR)
@@ -114,8 +118,11 @@ describe("doctor command surface", () => {
   })
 
   it("--json --strict with findings sets exitCode=1 AND emits full valid JSON (B2)", async () => {
-    // Simulate a compose with a fixed project name to trigger a warning finding
-    vi.mocked(composeModule.readComposeFile).mockReturnValue(compose({ name: "myapp" }))
+    // Unresolved port variable → guaranteed warning finding.
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: testing compose interpolation syntax
+      compose({ services: { web: { ports: ["${MISSING_PORT}:80"] } } })
+    )
     const originalExitCode = process.exitCode
     await doctorCommand().parseAsync(["--json", "--strict"], { from: "user" })
     // exitCode must be set (not process.exit which would flush-race on pipes)

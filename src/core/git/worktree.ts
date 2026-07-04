@@ -97,31 +97,39 @@ export function markWtbManagedFile(cwd: string, relativePath: string): void {
   }
   if (!tracked) return // 未追跡 → skip-worktree も manifest 記録も不要
 
+  // 先に manifest へ sha を記録し、成功したときだけ skip-worktree を立てる。逆順だと、
+  // manifest 記録に失敗した場合にファイルが skip-worktree で隠れるのに manifest には無い
+  // = `wtb remove` の dirty チェックが検出できず、ユーザー編集ごと worktree を消す穴になる。
+  // 記録できなければ skip-worktree を立てない (= git status に見える fail-safe に倒す)。
+  if (!recordWtbManagedFile(cwd, relativePath)) return
+
   try {
     execGitSafe(["update-index", "--skip-worktree", "--", relativePath], { cwd })
   } catch {
     // best-effort
   }
-  recordWtbManagedFile(cwd, relativePath)
 }
 
 /**
  * wtb が書き換えた追跡ファイルの現在の blob sha をマニフェストへ read-merge-write する。
- * 追跡ファイルでない / 解決失敗時は何もしない (best-effort)。
+ * 追跡ファイルでない / 解決失敗 / 書き込み失敗時は false を返す (呼び出し側が
+ * skip-worktree を立てるかの判断に使う)。
  */
-export function recordWtbManagedFile(cwd: string, relativePath: string): void {
+export function recordWtbManagedFile(cwd: string, relativePath: string): boolean {
   const sha = gitHashObject(cwd, relativePath)
-  if (sha === null) return
+  if (sha === null) return false
 
   const manifestPath = resolveManifestPath(cwd)
-  if (!manifestPath) return
+  if (!manifestPath) return false
 
   try {
     const manifest = loadWtbManagedManifest(cwd)
     manifest[relativePath] = sha
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    return true
   } catch {
     // best-effort: 記録できなくても worktree は使える
+    return false
   }
 }
 
@@ -271,7 +279,8 @@ export function createWorktree(
   }
 
   const args = useExistingBranch
-    ? ["worktree", "add", worktreePath, branchName]
+    ? // --end-of-options: `-` 始まりのブランチ名がフラグとして解釈されるのを防ぐ
+      ["worktree", "add", worktreePath, "--end-of-options", branchName]
     : trackFrom
       ? ["worktree", "add", worktreePath, "-b", branchName, "--track", trackFrom]
       : baseBranch

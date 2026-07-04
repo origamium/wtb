@@ -22,7 +22,7 @@ import {
   readComposeFile,
   resolveComposeProjectName,
   rewriteComposeIdentity,
-  sanitizeProjectSlug,
+  uniqueProjectSlug,
   writeComposeFile,
 } from "../../core/docker/compose.js"
 import {
@@ -31,9 +31,11 @@ import {
   getContainersUsingVolume,
   getContainersUsingVolumeWithProject,
   getVolumeSize,
+  repoVolumeLabel,
   type ResolvedVolume,
   resolveVolumeName,
   volumeExists,
+  volumeIsWtbManaged,
 } from "../../core/docker/volume.js"
 import {
   copyAndAdjustEnvFile,
@@ -302,6 +304,7 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
   let composeValueChanges: ComposeValueChange[] = []
   let volumeResult: VolumeCopyResult = emptyVolumeCopyResult()
   let startCommandFailed = false
+  let composeFailed = false
 
   // link_files に含まれるパスはコピーをスキップしてシンボリックリンクを優先する
   const linkFileSet = new Set(config.link_files ?? [])
@@ -374,6 +377,7 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
       composePorts = composeResult.portChanges
       composeIdentity = composeResult.identity
       composeValueChanges = composeResult.composeValueChanges
+      composeFailed = composeResult.failed
     }
   }
 
@@ -448,6 +452,12 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
       out(
         "⚠️  Worktree created, but the seed command FAILED — this worktree's data is NOT ready. See the error above; re-run the seed in the worktree after resolving it."
       )
+    } else if (composeFailed) {
+      // worktree は作られたが compose の identity/ポート分離に失敗した。`docker compose up`
+      // が source と衝突しうるので、成功バナーを出さず machine-parsable に警告する。
+      out(
+        "⚠️  Worktree created, but Docker Compose setup FAILED — this worktree's compose is NOT isolated; 'docker compose up' may collide with the source stack. See the error above."
+      )
     } else {
       out("🎉 Worktree created successfully!")
     }
@@ -491,7 +501,8 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
       startCommand: config.start_command
         ? { ran: !dryRun && !skipStart, failed: startCommandFailed }
         : null,
-      ok: volumeFailures === 0 && !seedFailed && !sourceRestartFailed,
+      composeFailed,
+      ok: volumeFailures === 0 && !seedFailed && !sourceRestartFailed && !composeFailed,
     })
   }
 
@@ -508,12 +519,12 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
   // - --strict 時のデータ分離未達成 (volume/seed 失敗) は GENERAL_ERROR (1)
   if (!dryRun && sourceRestartFailed) {
     process.exitCode = EXIT_CODES.DOCKER_ERROR
-  } else if (!dryRun && options.strict === true && (volumeFailures > 0 || seedFailed)) {
-    if (json) {
-      process.exitCode = EXIT_CODES.GENERAL_ERROR
-    } else {
-      process.exit(EXIT_CODES.GENERAL_ERROR)
-    }
+  } else if (
+    !dryRun &&
+    options.strict === true &&
+    (volumeFailures > 0 || seedFailed || composeFailed)
+  ) {
+    process.exitCode = EXIT_CODES.GENERAL_ERROR
   }
 }
 
@@ -620,6 +631,11 @@ async function linkConfiguredFiles(
   }
 }
 
+/** POSIX シェル向けに単一引用符でクオートする (スペース/`$`/`;` を含むパスの安全な埋め込み)。 */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
 /**
  * start_commandを実行
  *
@@ -628,7 +644,9 @@ async function linkConfiguredFiles(
 async function executeStartCommand(command: string, worktreePath: string): Promise<boolean> {
   try {
     const commandPath = path.resolve(worktreePath, command)
-    const actualCommand = existsSync(commandPath) ? commandPath : command
+    // 昇格したパスは /bin/sh のコマンド文字列に埋まるので、スペース等を含んでも壊れない
+    // ようクオートする。command そのものは (昇格しない場合) ユーザーの shell 式なので触らない。
+    const actualCommand = existsSync(commandPath) ? shellQuote(commandPath) : command
 
     executeLifecycleCommand(actualCommand, worktreePath)
     out("  ✅ Start command completed successfully")
@@ -651,7 +669,7 @@ async function executeStartCommand(command: string, worktreePath: string): Promi
 async function executeSeedCommand(command: string, worktreePath: string): Promise<boolean> {
   try {
     const commandPath = path.resolve(worktreePath, command)
-    const actualCommand = existsSync(commandPath) ? commandPath : command
+    const actualCommand = existsSync(commandPath) ? shellQuote(commandPath) : command
 
     executeLifecycleCommand(actualCommand, worktreePath)
     out("  ✅ Seed command completed successfully")
@@ -670,6 +688,8 @@ export interface SetupComposeResult {
   identity: ComposeIdentityRewrite
   /** env→compose ポート伝播による文字列値の書き換え内訳 (--json / ロギング用) */
   composeValueChanges: ComposeValueChange[]
+  /** compose 書き換えが例外で中断された (worktree の compose が未分離のまま) */
+  failed: boolean
 }
 
 /**
@@ -693,13 +713,13 @@ async function setupDockerCompose(
   const emptyIdentity: ComposeIdentityRewrite = { containerNames: [] }
   const composeValueChanges: ComposeValueChange[] = []
   if (!config.docker_compose_file) {
-    return { portChanges, identity: emptyIdentity, composeValueChanges }
+    return { portChanges, identity: emptyIdentity, composeValueChanges, failed: false }
   }
 
   const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
   if (!existsSync(sourceComposePath)) {
     out(`⚠️  Docker Compose source not found: ${config.docker_compose_file} (skipped)`)
-    return { portChanges, identity: emptyIdentity, composeValueChanges }
+    return { portChanges, identity: emptyIdentity, composeValueChanges, failed: false }
   }
 
   const targetComposePath = path.resolve(worktreePath, config.docker_compose_file)
@@ -711,6 +731,7 @@ async function setupDockerCompose(
   // (source は不変なので --exists-ok の再実行でも二重変換にならない)。
 
   let identity: ComposeIdentityRewrite = emptyIdentity
+  let failed = false
   try {
     out("🐳 Configuring Docker Compose...")
 
@@ -721,7 +742,10 @@ async function setupDockerCompose(
     const composeIdentity = config.compose ?? { isolate_name: true, container_name: "suffix" }
     let workingConfig = sourceConfig
     if (composeIdentity.isolate_name || composeIdentity.container_name !== "keep") {
-      const slug = sanitizeProjectSlug(branch)
+      // 他 worktree の slug と衝突する場合は raw branch のハッシュで一意化する
+      // (unicode/記号だけ違う別ブランチが同一 project slug に畳まれる事故を防ぐ)。
+      const otherBranches = safeWorktreeBranches()
+      const slug = uniqueProjectSlug(branch, otherBranches)
       const rewritten = rewriteComposeIdentity(workingConfig, {
         slug,
         isolateName: composeIdentity.isolate_name,
@@ -783,13 +807,20 @@ async function setupDockerCompose(
     }
 
     // ── (3) ポート調整 (使用中ポートを避けて host ポートを bump) ──────────────────
-    // 実行中のコンテナのポートを取得してポート衝突を避ける
-    // Docker が利用できない場合は空配列になる（エラーは無視）
-    let usedPorts: number[] = []
-    try {
-      usedPorts = getUsedPorts()
-    } catch {
-      // Docker が利用できない場合はポート調整なし
+    // used ポートの母集団を 3 つ union する。docker ps だけに頼ると、停止中の兄弟
+    // worktree や env フェーズが既に採番したポートを見落として衝突する:
+    //   (a) 実行中コンテナが publish 中のポート (docker ps)
+    //   (b) 兄弟 worktree (source/main 含む) の compose ファイルの host ポート
+    //       — 停止中でも衝突するので compose ファイルを直接読む
+    //   (c) この worktree の env フェーズが今回採番した数値ポート (envChanges)
+    //       — env と compose が同じホストポートを別サービスに割り当てないように
+    const usedPorts: number[] = []
+    // Docker が利用できない場合は getUsedPorts 内部で握りつぶされ空配列になる
+    for (const p of getUsedPorts()) usedPorts.push(p)
+    for (const p of collectWorktreeComposePorts(worktreePath, config)) usedPorts.push(p)
+    for (const change of Object.values(envChanges)) {
+      const p = Number.parseInt(change.to, 10)
+      if (!Number.isNaN(p)) usedPorts.push(p)
     }
 
     const adjustedConfig = adjustPortsInCompose(workingConfig, usedPorts)
@@ -852,9 +883,14 @@ async function setupDockerCompose(
       out("  ℹ️  Tip: Run 'docker compose up -d' in the worktree to start services")
     }
   } catch (error) {
-    out(`  ⚠️  Docker Compose setup skipped: ${getErrorMessage(error)}`)
+    // 書き換えが途中で失敗した = worktree の compose が未分離のまま残る。exit code /
+    // banner / --json に反映できるよう failed を立てて呼び出し側に伝える。
+    failed = true
+    out(
+      `  ⚠️  Docker Compose setup FAILED (${getErrorMessage(error)}) — this worktree's compose is NOT isolated; a 'docker compose up' may collide with the source stack.`
+    )
   }
-  return { portChanges, identity, composeValueChanges }
+  return { portChanges, identity, composeValueChanges, failed }
 }
 
 /**
@@ -926,6 +962,9 @@ export async function setupVolumeCopy(
     return emptyVolumeCopyResult() // nothing to copy — silent
   }
 
+  // 作成する volume に付ける repo 識別ラベル (prune の repo スコープ用)。
+  const repoLabel = repoVolumeLabel(gitRoot)
+
   // Compose の実際のプロジェクト名 (compose-spec 準拠) を解決する。
   // source は source config + gitRoot、target は worktree の identity-rewrite 済み
   // コピー + worktreePath から解決する (project 名が分離されているので別物になる)。
@@ -990,8 +1029,8 @@ export async function setupVolumeCopy(
   let stoppedStack = false
 
   // 停止した source スタックを堅牢に復帰する: composeStart → (失敗時) composeUp →
-  // (両方失敗時) error と recover コマンドを記録する。
-  const recoverCommand = `docker compose -f ${sourceComposePath} -p ${sourceProject} up -d`
+  // (両方失敗時) error と recover コマンドを記録する。パスはコピペで安全なようクオートする。
+  const recoverCommand = `docker compose -f ${shellQuote(sourceComposePath)} -p ${shellQuote(sourceProject)} up -d`
   const restartSourceStack = (): { restarted: boolean; error?: string } => {
     try {
       composeStart(sourceComposePath, sourceProject, gitRoot)
@@ -1015,8 +1054,17 @@ export async function setupVolumeCopy(
       composeStop(sourceComposePath, sourceProject, gitRoot)
       stoppedStack = true
       restartOnAbort = () => {
-        // mid-signal は best-effort で堅牢復帰を試みる
-        restartSourceStack()
+        // SIGINT/SIGTERM で中断された: source を復帰してから、その結果をユーザーに伝える
+        // (無言で終わると source が DOWN のままか復帰したのか分からない)。
+        out("")
+        out("  ⚠️  Interrupted — restarting the source Compose stack before exit...")
+        const r = restartSourceStack()
+        if (r.restarted) {
+          out("  ✅ Source stack restarted")
+        } else {
+          out(`  ⚠️  Failed to restart source stack: ${r.error}`)
+          out(`     Your source environment is DOWN. Bring it back up manually: ${recoverCommand}`)
+        }
       }
       for (const sig of abortSignals) {
         process.prependListener(sig, restartOnAbort)
@@ -1064,7 +1112,31 @@ export async function setupVolumeCopy(
         const targetSize = getVolumeSize(target.name)
         const targetMayHaveData = targetSize === null || targetSize > 0
         if (targetMayHaveData) {
-          // force でないケースは plan 段階で skip 済みなので、ここに来るのは force のみ。
+          // 既存データの上書きは --force-volume-copy のときだけ。plan 段階で非 force は
+          // skip 済みだが、stop 後の TOCTOU で target がデータを得た場合に備え、ここでも
+          // force を必須にする (force でなければ絶対に上書きしない)。
+          if (!force) {
+            out(
+              `  ⏭️  ${entry.key}: target volume '${target.name}' gained data after planning — skipping (use --force-volume-copy to overwrite)`
+            )
+            result.skipped.push({
+              name: entry.key,
+              reason: "target volume already has data (appeared after planning)",
+            })
+            continue
+          }
+          // force でも、wtb が作成した volume でなければ無関係な既存 volume を消しかねない。
+          // ラベル未確認 (wtb.managed≠true) の volume は上書きせず fail させ、判断を委ねる。
+          if (!volumeIsWtbManaged(target.name)) {
+            out(
+              `  ❌ ${entry.key}: target volume '${target.name}' has data but is NOT wtb-managed — refusing to overwrite an unrelated volume even with --force-volume-copy. Rename or remove it manually.`
+            )
+            result.failed.push({
+              name: entry.key,
+              error: `target volume '${target.name}' has data but is not wtb-managed — refusing to overwrite`,
+            })
+            continue
+          }
           targetHadData = true
         }
       }
@@ -1073,6 +1145,7 @@ export async function setupVolumeCopy(
         await copyVolume(source.name, target.name, {
           onProgress: createVolumeCopyProgressHandler(`  📦 ${entry.key}`),
           clearTarget: targetHadData,
+          repoLabel,
         })
         out(`  ✅ Cloned ${source.name} → ${target.name}`)
         result.cloned.push(entry.key)
@@ -1244,6 +1317,52 @@ export function planVolumeClones(
   return plan
 }
 
+/** 他 worktree のブランチ名を安全に取得する (listWorktrees が throw しても [])。 */
+function safeWorktreeBranches(): string[] {
+  try {
+    return listWorktrees()
+      .map((w) => w.branch)
+      .filter((b): b is string => typeof b === "string" && b.length > 0)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 既存の各 worktree (main/source を含む) の compose ファイルから、既に割り当て済みの
+ * host ポートを収集する。停止中の兄弟 worktree は docker ps に出ないが同じ host ポートを
+ * 予約しているので、compose ファイルを直接読んで衝突回避の母集団に加える。target worktree
+ * は自分がこれから書き込むので除外する。
+ */
+function collectWorktreeComposePorts(targetRoot: string, config: WtbConfig): number[] {
+  if (!config.docker_compose_file) return []
+  const ports: number[] = []
+  const resolvedTarget = path.resolve(targetRoot)
+  try {
+    for (const wt of listWorktrees()) {
+      if (path.resolve(wt.path) === resolvedTarget) continue
+      const composePath = path.resolve(wt.path, config.docker_compose_file)
+      if (!existsSync(composePath)) continue
+      try {
+        const cfg = readComposeFile(composePath)
+        for (const svc of Object.values(cfg.services ?? {})) {
+          if (!Array.isArray(svc.ports)) continue
+          for (const entry of svc.ports) {
+            if (typeof entry !== "string") continue
+            const parsed = parsePortMapping(entry)
+            if (parsed) ports.push(parsed.hostPort)
+          }
+        }
+      } catch {
+        // ignore unreadable / invalid sibling compose
+      }
+    }
+  } catch {
+    // ignore worktree listing errors (e.g. not in git repo)
+  }
+  return ports
+}
+
 /**
  * 既存の各 worktree (main/source を含む) の環境変数ファイルから、既に使われている
  * ポート番号を収集する（数値調整キーに対応するポートのみ）。
@@ -1361,6 +1480,11 @@ export async function applyEnvAdjustments(
         allChanges[change.key] = { from: change.from, to: change.to }
         allEnvAdjustmentChanges.push(change)
         directlyAdjustedKeys.add(change.key)
+        // このファイルが採番したポートを共有 usedPorts に予約する。copyAndAdjustEnvFile は
+        // usedPorts のローカルコピーで採番するため、押し戻さないと次の env.file が同じ
+        // ポートを別サービスに割り当ててしまう (同一 worktree 内の衝突)。
+        const toPort = Number.parseInt(change.to, 10)
+        if (!Number.isNaN(toPort)) usedPorts.push(toPort)
       }
     } catch (error) {
       out(`  ❌ Failed to adjust ${relativePath}: ${getErrorMessage(error)}`)

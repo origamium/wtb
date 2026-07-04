@@ -46,9 +46,12 @@ describe("createWorktree", () => {
 
   it("checks out an existing branch without -b", () => {
     createWorktree("feature/x", "/wt/feature-x", { useExistingBranch: true })
-    expect(execGitSafe).toHaveBeenCalledWith(["worktree", "add", "/wt/feature-x", "feature/x"], {
-      cwd: undefined,
-    })
+    expect(execGitSafe).toHaveBeenCalledWith(
+      ["worktree", "add", "/wt/feature-x", "--end-of-options", "feature/x"],
+      {
+        cwd: undefined,
+      }
+    )
   })
 
   it("creates a tracking branch from the remote ref when trackFrom is set", () => {

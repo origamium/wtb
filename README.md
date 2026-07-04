@@ -221,17 +221,24 @@ In human mode, `create` echoes every adjustment it applied — per-key env bumps
   "dryRun": false,
   "env": { "APP_PORT": { "from": "3000", "to": "3001" } },
   "composePorts": { "web": [{ "from": 3000, "to": 3001 }] },
-  "volumes": { "cloned": ["db_data"], "skipped": [], "failed": [] },
-  "sourceStack": { "stopped": true, "restarted": true },
+  "composeIdentity": { "projectName": { "from": "app", "to": "app-feature-auth" }, "containerNames": [] },
+  "composeValueChanges": [],
+  "volumes": {
+    "cloned": ["db_data"], "skipped": [], "failed": [],
+    "sourceStack": { "stopped": true, "restarted": true }
+  },
+  "sourceRestartFailed": false,
   "seed": null,
   "startCommand": { "ran": true, "failed": false },
+  "composeFailed": false,
   "ok": true
 }
 ```
 
 - `volumes.skipped` entries are `{ name, reason }`; `volumes.failed` entries are `{ name, error }`. `seed` is `{ ran, failed }` when `--seed` was used, else `null`; same shape for `startCommand` when `start_command` is configured.
-- `sourceStack` is `{ stopped, restarted, restartError?, recoverCommand? }` — present when wtb stopped the source stack to clone. If `restarted` is `false`, `restartError`/`recoverCommand` explain how to bring the source stack back up, and the command exits `5` (Docker error) regardless of `--strict`.
-- `ok` is `false` when a volume clone or the seed command failed. `--strict --json` still exits `1` on such failures — the JSON is written first, then the exit code is set.
+- `volumes.sourceStack` is `{ stopped, restarted, restartError?, recoverCommand? }` — present when wtb stopped the source stack to clone. If `restarted` is `false`, top-level `sourceRestartFailed` is `true`, `restartError`/`recoverCommand` explain how to bring the source stack back up, and the command exits `5` (Docker error) regardless of `--strict`.
+- `composeFailed` is `true` if the per-worktree compose rewrite threw (the worktree's compose is not isolated).
+- `ok` is `false` when a volume clone, the seed command, or the compose rewrite failed, or the source stack failed to restart. `--strict --json` still exits `1` on such failures — the JSON is written first, then the exit code is set.
 - With `--exists-ok` on an already-existing worktree the object is reduced to `{ branch, path, created: false, existing: true, createdBranch: false, dryRun, ok: true }`.
 
 ### `wtb remove <branch>`
@@ -247,7 +254,7 @@ Removes the worktree that owns `<branch>`. Guards against removing the main repo
 
 Without `-f`, a worktree with uncommitted or untracked changes fails fast with exit `1` (`Worktree for '<branch>' has uncommitted or untracked changes; commit/stash them or pass -f to force removal`) — **before** any Docker teardown or volume deletion, so a doomed removal can't tear down services or drop volumes first.
 
-Ordering: Docker teardown → `end_command` → `git worktree remove`. If `end_command` is set, wtb assumes you own teardown and skips the automatic `docker compose down`. The automatic teardown passes your configured Compose file explicitly (`docker compose -f <docker_compose_file> down [-v]`), so non-default filenames like `compose.dev.yml` are torn down correctly.
+Ordering: Docker teardown → `end_command` → `git worktree remove`. If `end_command` is set, wtb assumes you own teardown and skips the automatic `docker compose down`. The automatic teardown passes your configured Compose file **and** the worktree's resolved Compose project explicitly (`docker compose -f <docker_compose_file> -p <worktree-project> down [-v]`), so non-default filenames like `compose.dev.yml` are torn down correctly. If the worktree resolves to the **same** Compose project as the source (e.g. a `COMPOSE_PROJECT_NAME` in your shell/`.env`, or a fixed `name:`), wtb **skips the teardown** rather than risk stopping — or with `--remove-volumes`, deleting the volumes of — your source stack; tear that project down manually if you intended to.
 
 ```bash
 wtb remove feature/old --no-docker          # Docker daemon already stopped
@@ -423,7 +430,7 @@ wtb doctor --json | jq .   # machine-readable
 wtb doctor --strict        # gate a CI step on a clean report
 ```
 
-Each finding is `{ id, severity, message, suggestion }`, where `severity` is `info`, `warning`, or `error`. Finding ids: `fixed-project-name`, `container-name`, `literal-env-port`, `literal-compose-port`, `unresolved-port-variable`, `compose-project-name-env`, `no-compose-file`. A finding is **downgraded to `info` when the relevant auto-handling is enabled** — identity rewrite (`compose.isolate_name`) for the project-name/container-name checks, port propagation (`env.port_propagation`) for the literal-port check — both of which are on by default; it's a `warning` when you've disabled them.
+Each finding is `{ id, severity, message, suggestion }`, where `severity` is `info`, `warning`, or `error`. Finding ids: `fixed-project-name`, `container-name`, `literal-env-port`, `literal-compose-port`, `unsupported-compose-port` (port ranges / long-form wtb can't bump), `unresolved-port-variable`, `compose-project-name-env`, `compose-file-env` (`COMPOSE_FILE` in your shell), `compose-override-file` (a `docker-compose.override.yml` sibling wtb doesn't rewrite), `fixed-volume-name` / `fixed-network-name` (a non-external `name:` that would be shared across worktrees), `no-compose-file`. A finding is **downgraded to `info` when the relevant auto-handling actually applies** — identity rewrite (`compose.isolate_name`) for the fixed-project-name check, container-name rewrite (`compose.container_name` ≠ `keep`) for the container-name check, and port propagation (`env.port_propagation`) for the env-embed check — **and only when `docker_compose_file` is set** so wtb actually rewrites the file. Literal `HOST:CONTAINER` compose ports always stay a `warning` (propagation only rewrites `${VAR:-default}`-form host ports).
 
 **Exit codes:** the default **exits `0` even when warnings exist** (agent/CI friendly — the JSON `ok` and `summary` carry the result, so a wrapper can decide what to do). Pass `--strict` to exit `1` when any warning or error is present. `--json` prints exactly one JSON object to stdout (`{ composeFile, findings, summary: { info, warning, error }, ok }`).
 
@@ -666,7 +673,7 @@ Script failures are **non-fatal** — wtb prints a warning and the worktree is l
 ```
 src/
 ├── cli/
-│   ├── commands/      init, create, remove, reclone, prune, ls, path, ports, status, init-claude
+│   ├── commands/      init, create, remove, reclone, prune, ls, path, ports, status, doctor, init-claude
 │   ├── utils/         worktree/ports renderers, command error wrapper, claude skill installer
 │   └── index.ts       commander wiring + global error handlers
 ├── core/

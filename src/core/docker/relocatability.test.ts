@@ -10,11 +10,13 @@ import { analyzeRelocatability } from "./relocatability.js"
 const originalEnv = { ...process.env }
 
 afterEach(() => {
-  // restore COMPOSE_PROJECT_NAME between tests
-  if ("COMPOSE_PROJECT_NAME" in originalEnv) {
-    process.env.COMPOSE_PROJECT_NAME = originalEnv.COMPOSE_PROJECT_NAME
-  } else {
-    delete process.env.COMPOSE_PROJECT_NAME
+  // restore COMPOSE_PROJECT_NAME / COMPOSE_FILE between tests
+  for (const key of ["COMPOSE_PROJECT_NAME", "COMPOSE_FILE"] as const) {
+    if (key in originalEnv) {
+      process.env[key] = originalEnv[key]
+    } else {
+      delete process.env[key]
+    }
   }
 })
 
@@ -33,7 +35,12 @@ const baseCompose = (over: Partial<ComposeConfig> = {}): ComposeConfig => ({
   ...over,
 })
 
-const baseOptions = { identityRewriteEnabled: false, portPropagationEnabled: false }
+const baseOptions = {
+  identityRewriteEnabled: false,
+  containerNameRewriteEnabled: false,
+  composePortPropagationEnabled: false,
+  envPortPropagationEnabled: false,
+}
 
 describe("analyzeRelocatability", () => {
   describe("null compose → no-compose-file", () => {
@@ -128,7 +135,7 @@ describe("analyzeRelocatability", () => {
       expect(r.ok).toBe(false)
     })
 
-    it("emits info when identityRewrite=true", () => {
+    it("emits info when containerNameRewriteEnabled=true", () => {
       const r = analyzeRelocatability({
         compose: baseCompose({
           services: { db: { container_name: "mydb" } },
@@ -136,10 +143,25 @@ describe("analyzeRelocatability", () => {
         composeFile: null,
         envMap: {},
         config: baseCfg(),
-        options: { ...baseOptions, identityRewriteEnabled: true },
+        options: { ...baseOptions, containerNameRewriteEnabled: true },
       })
       const f = r.findings.find((x) => x.id === "container-name")
       expect(f?.severity).toBe("info")
+    })
+
+    it("stays warning when only identity (not container_name) rewrite is on (container_name: keep)", () => {
+      const r = analyzeRelocatability({
+        compose: baseCompose({
+          services: { db: { container_name: "mydb" } },
+        }),
+        composeFile: null,
+        envMap: {},
+        config: baseCfg(),
+        // isolate_name on but container_name mode is 'keep' → names NOT rewritten
+        options: { ...baseOptions, identityRewriteEnabled: true, containerNameRewriteEnabled: false },
+      })
+      const f = r.findings.find((x) => x.id === "container-name")
+      expect(f?.severity).toBe("warning")
     })
   })
 
@@ -150,7 +172,7 @@ describe("analyzeRelocatability", () => {
         composeFile: null,
         envMap: { APP_PORT: "3001" },
         config: baseCfg({ env: { file: [".env"], adjust: { APP_PORT: 1 }, port_propagation: { enabled: false, files: [], compose: false } } }),
-        options: { ...baseOptions, portPropagationEnabled: false },
+        options: baseOptions,
       })
       const f = r.findings.find((x) => x.id === "literal-compose-port")
       expect(f).toBeDefined()
@@ -160,19 +182,17 @@ describe("analyzeRelocatability", () => {
       expect(r.ok).toBe(false)
     })
 
-    it("emits info instead of warning when portPropagationEnabled=true", () => {
+    it("stays warning even when compose port propagation is enabled (propagation never rewrites literal mappings)", () => {
       const r = analyzeRelocatability({
         compose: baseCompose({ services: { web: { ports: ["3001:80"] } } }),
         composeFile: null,
         envMap: { APP_PORT: "3001" },
         config: baseCfg({ env: { file: [".env"], adjust: { APP_PORT: 1 }, port_propagation: { enabled: true, files: [], compose: true } } }),
-        options: { ...baseOptions, portPropagationEnabled: true },
+        options: { ...baseOptions, composePortPropagationEnabled: true },
       })
       const f = r.findings.find((x) => x.id === "literal-compose-port")
-      expect(f?.severity).toBe("info")
-      // Message should be reassuring (not say "won't follow") when propagation is enabled (M3)
-      expect(f?.message).toContain("port propagation is enabled")
-      expect(f?.message).not.toContain("won't follow")
+      expect(f?.severity).toBe("warning")
+      expect(f?.message).toContain("won't follow")
     })
 
     it("does NOT flag literal ports that are not adjusted", () => {
@@ -188,18 +208,43 @@ describe("analyzeRelocatability", () => {
   })
 
   describe("literal-env-port heuristic", () => {
-    it("emits info when a non-adjust env var embeds an adjusted port", () => {
+    it("emits info when propagation is enabled (embed will be updated)", () => {
       const r = analyzeRelocatability({
         compose: baseCompose({ services: {} }),
         composeFile: null,
         envMap: { APP_PORT: "3001", API_URL: "http://localhost:3001/api" },
-        config: baseCfg({ env: { file: [".env"], adjust: { APP_PORT: 1 }, port_propagation: { enabled: false, files: [], compose: false } } }),
-        options: baseOptions,
+        config: baseCfg({ env: { file: [".env"], adjust: { APP_PORT: 1 }, port_propagation: { enabled: true, files: [], compose: true } } }),
+        options: { ...baseOptions, envPortPropagationEnabled: true },
       })
       const f = r.findings.find((x) => x.id === "literal-env-port")
       expect(f).toBeDefined()
       expect(f?.severity).toBe("info")
       expect(f?.variable).toBe("API_URL")
+    })
+
+    it("emits warning when propagation is disabled (embed won't be updated)", () => {
+      const r = analyzeRelocatability({
+        compose: baseCompose({ services: {} }),
+        composeFile: null,
+        envMap: { APP_PORT: "3001", API_URL: "http://localhost:3001/api" },
+        config: baseCfg({ env: { file: [".env"], adjust: { APP_PORT: 1 }, port_propagation: { enabled: false, files: [], compose: false } } }),
+        options: { ...baseOptions, envPortPropagationEnabled: false },
+      })
+      const f = r.findings.find((x) => x.id === "literal-env-port")
+      expect(f?.severity).toBe("warning")
+      expect(f?.variable).toBe("API_URL")
+    })
+
+    it("does NOT false-positive on a value that merely starts with the adjusted port (no leading colon)", () => {
+      // TIMEOUT_MS=3001 must not be flagged — env propagation only rewrites ':<port>' boundaries.
+      const r = analyzeRelocatability({
+        compose: baseCompose({ services: {} }),
+        composeFile: null,
+        envMap: { APP_PORT: "3001", TIMEOUT_MS: "3001" },
+        config: baseCfg({ env: { file: [".env"], adjust: { APP_PORT: 1 }, port_propagation: { enabled: false, files: [], compose: false } } }),
+        options: baseOptions,
+      })
+      expect(r.findings.find((x) => x.id === "literal-env-port")).toBeUndefined()
     })
 
     it("does NOT flag the adjust env key itself", () => {
@@ -284,6 +329,101 @@ describe("analyzeRelocatability", () => {
         options: baseOptions,
       })
       expect(r.findings.find((x) => x.id === "compose-project-name-env")).toBeUndefined()
+    })
+  })
+
+  describe("unsupported-compose-port (ranges/long-form)", () => {
+    it("warns on a port range that wtb can't bump", () => {
+      const r = analyzeRelocatability({
+        compose: baseCompose({ services: { web: { ports: ["8000-8010:8000-8010"] } } }),
+        composeFile: null,
+        envMap: {},
+        config: baseCfg(),
+        options: baseOptions,
+      })
+      const f = r.findings.find((x) => x.id === "unsupported-compose-port")
+      expect(f?.severity).toBe("warning")
+      expect(r.ok).toBe(false)
+    })
+
+    it("does NOT warn on a bare single container port (ephemeral host port)", () => {
+      const r = analyzeRelocatability({
+        compose: baseCompose({ services: { web: { ports: ["3000"] } } }),
+        composeFile: null,
+        envMap: {},
+        config: baseCfg(),
+        options: baseOptions,
+      })
+      expect(r.findings.find((x) => x.id === "unsupported-compose-port")).toBeUndefined()
+    })
+  })
+
+  describe("fixed volume/network names", () => {
+    it("warns on a non-external volume with an explicit name:", () => {
+      const r = analyzeRelocatability({
+        compose: baseCompose({ volumes: { db: { name: "pgdata" } } } as Partial<ComposeConfig>),
+        composeFile: null,
+        envMap: {},
+        config: baseCfg(),
+        options: baseOptions,
+      })
+      const f = r.findings.find((x) => x.id === "fixed-volume-name")
+      expect(f?.severity).toBe("warning")
+      expect(f?.message).toContain("pgdata")
+    })
+
+    it("does NOT warn on an external volume with a name:", () => {
+      const r = analyzeRelocatability({
+        compose: baseCompose({
+          volumes: { db: { name: "pgdata", external: true } },
+        } as Partial<ComposeConfig>),
+        composeFile: null,
+        envMap: {},
+        config: baseCfg(),
+        options: baseOptions,
+      })
+      expect(r.findings.find((x) => x.id === "fixed-volume-name")).toBeUndefined()
+    })
+
+    it("emits info (not warning) for a fixed network name", () => {
+      const r = analyzeRelocatability({
+        compose: baseCompose({ networks: { net: { name: "shared" } } } as Partial<ComposeConfig>),
+        composeFile: null,
+        envMap: {},
+        config: baseCfg(),
+        options: baseOptions,
+      })
+      const f = r.findings.find((x) => x.id === "fixed-network-name")
+      expect(f?.severity).toBe("info")
+    })
+  })
+
+  describe("environment overrides", () => {
+    it("warns when COMPOSE_FILE is set", () => {
+      process.env.COMPOSE_FILE = "docker-compose.yml:docker-compose.prod.yml"
+      const r = analyzeRelocatability({
+        compose: baseCompose(),
+        composeFile: null,
+        envMap: {},
+        config: baseCfg(),
+        options: baseOptions,
+      })
+      const f = r.findings.find((x) => x.id === "compose-file-env")
+      expect(f?.severity).toBe("warning")
+    })
+
+    it("warns for each discovered override file", () => {
+      const r = analyzeRelocatability({
+        compose: baseCompose(),
+        composeFile: "/repo/docker-compose.yml",
+        envMap: {},
+        config: baseCfg(),
+        options: baseOptions,
+        overrideFiles: ["docker-compose.override.yml"],
+      })
+      const f = r.findings.find((x) => x.id === "compose-override-file")
+      expect(f?.severity).toBe("warning")
+      expect(f?.message).toContain("docker-compose.override.yml")
     })
   })
 

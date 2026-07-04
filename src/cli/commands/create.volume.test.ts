@@ -80,6 +80,9 @@ describe("setupVolumeCopy orchestration", () => {
     vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue([])
     vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue([])
     vi.mocked(volumeModule.copyVolume).mockResolvedValue(undefined)
+    // Default: pre-existing targets are wtb-managed (so a force overwrite is allowed).
+    vi.mocked(volumeModule.volumeIsWtbManaged).mockReturnValue(true)
+    vi.mocked(volumeModule.repoVolumeLabel).mockReturnValue("repohash")
   })
 
   /** holders を sourceProject 所属として返す helper (planVolumeClones 用)。 */
@@ -449,8 +452,20 @@ describe("setupVolumeCopy orchestration", () => {
     expect(result.sourceStack?.restarted).toBe(false)
     expect(result.sourceStack?.restartError).toContain("up failed")
     expect(result.sourceStack?.recoverCommand).toBe(
-      "docker compose -f /repo/docker-compose.yml -p source_proj up -d"
+      "docker compose -f '/repo/docker-compose.yml' -p 'source_proj' up -d"
     )
+  })
+
+  it("refuses to overwrite a pre-existing target volume that is NOT wtb-managed even with force", async () => {
+    // 無関係な既存 volume と名前が衝突 → force でも wtb.managed でなければ消さない。
+    vi.mocked(volumeModule.getVolumeSize).mockImplementation((name) =>
+      name === "target_proj_postgres_data" ? 1024 : 0
+    )
+    vi.mocked(volumeModule.volumeIsWtbManaged).mockReturnValue(false)
+    const result = await run(true)
+    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+    expect(result.failed).toHaveLength(1)
+    expect(result.failed[0].error).toContain("not wtb-managed")
   })
 
   it("GUARD: source project === target project → all-failed, no stop, no copy", async () => {

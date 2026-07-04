@@ -1,12 +1,14 @@
 /**
  * @fileoverview `wtb doctor` コマンド実装
  */
+import { existsSync } from "node:fs"
+import * as path from "node:path"
 import { Command } from "commander"
 import { EXIT_CODES } from "../../constants/index.js"
 import { loadConfig } from "../../core/config/loader.js"
 import { readComposeFile } from "../../core/docker/compose.js"
 import { resolveComposePath } from "../../core/docker/locate.js"
-import { analyzeRelocatability } from "../../core/docker/relocatability.js"
+import { type AnalyzeOptions, analyzeRelocatability } from "../../core/docker/relocatability.js"
 import { buildWorktreeEnvMap } from "../../core/environment/env-map.js"
 import { getGitRootOrThrow } from "../../core/git/repository.js"
 import type { DoctorCommandOptions, WtbConfig } from "../../types/index.js"
@@ -23,6 +25,43 @@ export function doctorCommand(): Command {
     .option("--json", "JSON output (machine-readable)")
     .option("--strict", "Exit with code 1 if any warning or error finding exists")
     .action(withErrorHandling(executeDoctorCommand))
+}
+
+/**
+ * doctor の finding 降格判定に使う options を、create の実挙動と一致させて構築する。
+ * 重要: docker_compose_file が未設定なら create の compose フェーズは丸ごとスキップされる
+ * ので、compose を自動検出できても identity/ポートの書き換えは走らない → 各フラグは false。
+ */
+function buildAnalyzeOptions(config: WtbConfig): AnalyzeOptions {
+  const composeConfigured = !!config.docker_compose_file
+  const isolate = config.compose?.isolate_name ?? true
+  const containerMode = config.compose?.container_name ?? "suffix"
+  const propEnabled = config.env.port_propagation?.enabled ?? true
+  const propCompose = config.env.port_propagation?.compose ?? true
+  return {
+    identityRewriteEnabled: isolate && composeConfigured,
+    containerNameRewriteEnabled: containerMode !== "keep" && composeConfigured,
+    composePortPropagationEnabled: propEnabled && propCompose && composeConfigured,
+    envPortPropagationEnabled: propEnabled,
+  }
+}
+
+/**
+ * compose ファイルに隣接し docker が自動マージする override ファイルを列挙する。
+ * override の auto-merge はデフォルト名の compose にのみ効くので、その組み合わせに限定して
+ * 偽陽性を避ける。
+ */
+function discoverOverrideFiles(composePath: string | null): string[] {
+  if (!composePath) return []
+  const dir = path.dirname(composePath)
+  const base = path.basename(composePath)
+  const overrideMap: Record<string, string[]> = {
+    "docker-compose.yml": ["docker-compose.override.yml", "docker-compose.override.yaml"],
+    "docker-compose.yaml": ["docker-compose.override.yml", "docker-compose.override.yaml"],
+    "compose.yml": ["compose.override.yml", "compose.override.yaml"],
+    "compose.yaml": ["compose.override.yml", "compose.override.yaml"],
+  }
+  return (overrideMap[base] ?? []).filter((c) => existsSync(path.join(dir, c)))
 }
 
 async function executeDoctorCommand(options: DoctorCommandOptions): Promise<void> {
@@ -64,10 +103,8 @@ async function executeDoctorCommand(options: DoctorCommandOptions): Promise<void
     composeFile: composePath,
     envMap,
     config,
-    options: {
-      identityRewriteEnabled: config.compose?.isolate_name ?? false,
-      portPropagationEnabled: config.env.port_propagation?.enabled ?? false,
-    },
+    options: buildAnalyzeOptions(config),
+    overrideFiles: discoverOverrideFiles(composePath),
   })
 
   if (options.json) {
@@ -105,10 +142,8 @@ export function runRelocatabilityPreflight(gitRoot: string, config: WtbConfig): 
       composeFile: composePath,
       envMap,
       config,
-      options: {
-        identityRewriteEnabled: config.compose?.isolate_name ?? false,
-        portPropagationEnabled: config.env.port_propagation?.enabled ?? false,
-      },
+      options: buildAnalyzeOptions(config),
+      overrideFiles: discoverOverrideFiles(composePath),
     })
 
     const actionableFindings = report.findings.filter(

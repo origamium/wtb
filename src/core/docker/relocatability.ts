@@ -13,8 +13,13 @@ export interface RelocatabilityFinding {
     | "container-name"
     | "literal-env-port"
     | "literal-compose-port"
+    | "unsupported-compose-port"
     | "unresolved-port-variable"
     | "compose-project-name-env"
+    | "compose-file-env"
+    | "compose-override-file"
+    | "fixed-volume-name"
+    | "fixed-network-name"
     | "no-compose-file"
   severity: FindingSeverity
   message: string
@@ -31,8 +36,14 @@ export interface RelocatabilityReport {
 }
 
 export interface AnalyzeOptions {
+  /** top-level `name:` の per-worktree 書き換えが create で実際に走るか (isolate_name && compose 設定済み) */
   identityRewriteEnabled: boolean
-  portPropagationEnabled: boolean
+  /** container_name の per-worktree 書き換えが走るか (container_name !== 'keep' && compose 設定済み) */
+  containerNameRewriteEnabled: boolean
+  /** compose の `${VAR:-default}` 形式ポート伝播が走るか (propagation.enabled && compose && 設定済み) */
+  composePortPropagationEnabled: boolean
+  /** env ファイルのポート伝播が走るか (propagation.enabled) */
+  envPortPropagationEnabled: boolean
 }
 
 export function analyzeRelocatability(input: {
@@ -41,8 +52,10 @@ export function analyzeRelocatability(input: {
   envMap: Record<string, string>
   config: WtbConfig
   options: AnalyzeOptions
+  /** docker が自動マージする override ファイル (docker-compose.override.yml 等) の相対名。caller が I/O で発見して渡す。 */
+  overrideFiles?: string[]
 }): RelocatabilityReport {
-  const { compose, composeFile, envMap, config, options } = input
+  const { compose, composeFile, envMap, config, options, overrideFiles = [] } = input
   const findings: RelocatabilityFinding[] = []
 
   if (compose === null) {
@@ -65,7 +78,7 @@ export function analyzeRelocatability(input: {
         : `All worktrees share Compose project '${compose.name}'; a 2nd wtb create will attach to/clobber the first stack`,
       suggestion: options.identityRewriteEnabled
         ? undefined
-        : "Enable compose.isolate_name in wtb.yaml, or remove the top-level name: from your compose file",
+        : "Set docker_compose_file and enable compose.isolate_name in wtb.yaml so wtb rewrites it, or remove the top-level name: from your compose file",
     })
   }
 
@@ -74,17 +87,19 @@ export function analyzeRelocatability(input: {
     .filter(([, svc]) => svc.container_name)
     .map(([name]) => name)
   if (servicesWithContainerName.length > 0) {
-    const sev: FindingSeverity = options.identityRewriteEnabled ? "info" : "warning"
+    // container_name の書き換えは compose.container_name (suffix/strip/keep) で決まる。
+    // isolate_name ではなくこのモードで判定する ('keep' や compose 未設定なら書き換えない)。
+    const sev: FindingSeverity = options.containerNameRewriteEnabled ? "info" : "warning"
     const count = servicesWithContainerName.length
     findings.push({
       id: "container-name",
       severity: sev,
-      message: options.identityRewriteEnabled
+      message: options.containerNameRewriteEnabled
         ? `${count} service(s) have container_name (${servicesWithContainerName.join(", ")}); wtb rewrites container names per worktree`
-        : `${count} service(s) have container_name (${servicesWithContainerName.join(", ")}); multiple worktrees will conflict`,
-      suggestion: options.identityRewriteEnabled
+        : `${count} service(s) have container_name (${servicesWithContainerName.join(", ")}); multiple worktrees will conflict on these fixed names`,
+      suggestion: options.containerNameRewriteEnabled
         ? undefined
-        : "Set compose.container_name to 'strip' or 'suffix' in wtb.yaml, or remove container_name from your services",
+        : "Set compose.container_name to 'strip' or 'suffix' in wtb.yaml (and set docker_compose_file so wtb rewrites the file), or remove container_name from your services",
     })
   }
 
@@ -112,15 +127,28 @@ export function analyzeRelocatability(input: {
         if (mapping && adjustedPorts.has(mapping.hostPort)) {
           // biome-ignore lint/style/noNonNullAssertion: has() guard above ensures the value exists
           const envKey = adjustedPorts.get(mapping.hostPort)!
-          const sev: FindingSeverity = options.portPropagationEnabled ? "info" : "warning"
+          // 常に warning。compose ポート伝播は `${VAR:-default}` 形式しか書き換えない
+          // (リテラル `host:container` は対象外)。adjustPortsInCompose は稼働中コンテナと
+          // 衝突したときだけ bump し、env の採番とは連動しないので「env に追従する」保証はない。
           findings.push({
             id: "literal-compose-port",
-            severity: sev,
+            severity: "warning",
             service: svcName,
-            message: options.portPropagationEnabled
-              ? `Service '${svcName}' publishes host port ${mapping.hostPort} literally; port propagation is enabled and will rewrite this mapping per worktree`
-              : `Service '${svcName}' publishes host port ${mapping.hostPort} literally; wtb bumps ${envKey} but this mapping won't follow`,
+            message: `Service '${svcName}' publishes host port ${mapping.hostPort} literally; wtb bumps ${envKey} but this literal mapping won't follow (port propagation only rewrites \${VAR}-form mappings)`,
             suggestion: `Use '\${${envKey}:-${mapping.hostPort}}:${mapping.containerPort}' in your compose ports`,
+          })
+        } else if (!mapping && /\d-\d/.test(raw)) {
+          // range ("8000-8010:8000-8010") は adjustPortsInCompose も伝播もそのまま素通しする
+          // ので、worktree 間で同一ポートを公開して衝突しうる。静的に警告する。
+          // (bare "3000" のような ephemeral host port は衝突しないので対象外。)
+          findings.push({
+            id: "unsupported-compose-port",
+            severity: "warning",
+            service: svcName,
+            message: `Service '${svcName}' has a port mapping '${raw}' wtb can't parse (port range or long-form); it is left as-is and will be identical across worktrees, so two stacks may collide on it`,
+            suggestion:
+              // biome-ignore lint/suspicious/noTemplateCurlyInString: literal ${VAR:-port} shown as advice text
+              "Use short 'HOST:CONTAINER' form with a '${VAR:-port}' host port so wtb can bump it per worktree",
           })
         }
       } else {
@@ -142,22 +170,28 @@ export function analyzeRelocatability(input: {
     }
   }
 
-  // (c') literal-env-port: env keys NOT in adjust whose value embeds an adjusted port
+  // (c') literal-env-port: env keys NOT in adjust whose value embeds an adjusted port.
+  // 境界は「直前が `:`」に限定する (旧実装の `^` 先頭一致は TIMEOUT_MS=3000 のような
+  // 非ポート値まで拾う偽陽性だった)。これは env ポート伝播が実際に書き換える形と一致する。
   const adjustKeySet = new Set(Object.keys(config.env.adjust ?? {}))
   for (const [envKey, envVal] of Object.entries(envMap)) {
     if (adjustKeySet.has(envKey)) continue
     for (const [port] of adjustedPorts) {
       const portStr = String(port)
-      const boundaryRe = new RegExp(
-        `(?:^|:|localhost:|127\\.0\\.0\\.1:)${portStr}(?:[^0-9]|$)`
-      )
+      const boundaryRe = new RegExp(`:${portStr}(?:[^0-9]|$)`)
       if (boundaryRe.test(envVal)) {
+        // env ポート伝播が有効なら、この埋め込みポートは実際に書き換えられる (= handled)。
+        // 無効なら追従しないので警告する。
         findings.push({
           id: "literal-env-port",
-          severity: "info",
+          severity: options.envPortPropagationEnabled ? "info" : "warning",
           variable: envKey,
-          message: `Env var ${envKey}='${envVal}' appears to embed adjusted port ${portStr}; it won't be updated when wtb bumps ports`,
-          suggestion: "If this value needs the port, reference the port env var directly",
+          message: options.envPortPropagationEnabled
+            ? `Env var ${envKey}='${envVal}' embeds adjusted port ${portStr}; port propagation will update it per worktree`
+            : `Env var ${envKey}='${envVal}' embeds adjusted port ${portStr}; port propagation is disabled so it won't be updated when wtb bumps ports`,
+          suggestion: options.envPortPropagationEnabled
+            ? undefined
+            : "Enable env.port_propagation in wtb.yaml, or reference the port env var directly",
         })
         break // one finding per env key
       }
@@ -172,6 +206,64 @@ export function analyzeRelocatability(input: {
       severity: "warning",
       message: `COMPOSE_PROJECT_NAME='${composeProjectNameEnv}' overrides per-worktree identity; wtb cannot isolate while it is set`,
       suggestion: "Unset COMPOSE_PROJECT_NAME from your shell environment",
+    })
+  }
+
+  // compose-file-env: COMPOSE_FILE は docker が読み込む compose ファイルを差し替えるが、
+  // wtb は config.docker_compose_file しか書き換えないので、指したファイルが未分離になる。
+  const composeFileEnv = process.env.COMPOSE_FILE
+  if (composeFileEnv && composeFileEnv.trim() !== "") {
+    findings.push({
+      id: "compose-file-env",
+      severity: "warning",
+      message: `COMPOSE_FILE='${composeFileEnv}' changes which compose file(s) docker loads; wtb only rewrites docker_compose_file, so any other file it points to is not isolated`,
+      suggestion: "Unset COMPOSE_FILE, or point docker_compose_file at the same file wtb should rewrite",
+    })
+  }
+
+  // compose-override-file: docker compose は docker-compose.override.yml 等を自動マージするが
+  // wtb は書き換えない。そこに固定 container_name/ports があると分離が黙って破れる。
+  for (const overrideFile of overrideFiles) {
+    findings.push({
+      id: "compose-override-file",
+      severity: "warning",
+      message: `Compose override file '${overrideFile}' is auto-merged by 'docker compose' but wtb does not rewrite it; fixed container_name or ports there will break per-worktree isolation`,
+      suggestion: `Fold the overrides into ${config.docker_compose_file || "your compose file"}, or avoid fixed names/ports in the override`,
+    })
+  }
+
+  // fixed-volume-name / fixed-network-name: 非 external で明示 `name:` を持つ volume/network は
+  // project 名を書き換えても同じ実体名になり、worktree 間で共有される (data / DNS の非分離)。
+  const namedResources = (
+    section: Record<string, unknown> | undefined
+  ): Array<{ key: string; name: string }> => {
+    const out: Array<{ key: string; name: string }> = []
+    for (const [key, def] of Object.entries(section ?? {})) {
+      if (!def || typeof def !== "object") continue
+      const d = def as { name?: unknown; external?: unknown }
+      if (d.external) continue
+      if (typeof d.name === "string" && d.name.trim() !== "") out.push({ key, name: d.name })
+    }
+    return out
+  }
+  for (const { key, name } of namedResources(
+    (compose as { volumes?: Record<string, unknown> }).volumes
+  )) {
+    findings.push({
+      id: "fixed-volume-name",
+      severity: "warning",
+      message: `Volume '${key}' has a fixed name '${name}'; every worktree mounts the same volume, so data is NOT isolated (and wtb won't clone it)`,
+      suggestion: `Remove the explicit name: from volume '${key}' so Compose namespaces it per project`,
+    })
+  }
+  for (const { key, name } of namedResources(
+    (compose as { networks?: Record<string, unknown> }).networks
+  )) {
+    findings.push({
+      id: "fixed-network-name",
+      severity: "info",
+      message: `Network '${key}' has a fixed name '${name}'; worktrees will share this network`,
+      suggestion: `Remove the explicit name: from network '${key}' if you want per-worktree network isolation`,
     })
   }
 

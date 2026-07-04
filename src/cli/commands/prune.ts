@@ -21,7 +21,12 @@ import {
   readComposeFile,
   resolveComposeProjectName,
 } from "../../core/docker/compose.js"
-import { getContainersUsingVolume, removeVolume, volumeExists } from "../../core/docker/volume.js"
+import {
+  getContainersUsingVolume,
+  removeVolume,
+  repoVolumeLabel,
+  volumeExists,
+} from "../../core/docker/volume.js"
 import { getGitRootOrThrow } from "../../core/git/repository.js"
 import { listWorktrees } from "../../core/git/worktree.js"
 import type { WorktreeInfo } from "../../types/index.js"
@@ -116,7 +121,10 @@ async function executePruneCommand(options: PruneOptions): Promise<void> {
     // ignore — prune does not need config
   }
 
-  const managed = getWtbManagedVolumeNames()
+  // このリポジトリの volume だけを候補にする (`wtb.repo=<hash>` ラベルで絞る)。同一ホスト上の
+  // 別リポジトリの wtb volume を「孤児」と誤認して削除するのを防ぐ。repo ラベルが付く前
+  // (v1.1.0 以前) に作られた volume はここに現れず prune 対象外 = fail-safe。
+  const managed = getWtbManagedVolumeNames(repoVolumeLabel(gitRoot))
 
   // SAFETY: a labelled volume is judged "orphan" when it matches no live worktree's
   // project prefix. If worktree enumeration fails (returns []), EVERY volume would
