@@ -16,6 +16,7 @@
 #   examples/try.sh minimal
 #   examples/try.sh compose-minimal feature/db --real
 #   examples/try.sh compose-seed feature/fresh --real --seed
+#   examples/try.sh compose-identity feature/demo
 #
 set -euo pipefail
 

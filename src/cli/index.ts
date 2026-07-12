@@ -20,6 +20,7 @@ import { pruneCommand } from "./commands/prune.js"
 import { recloneCommand } from "./commands/reclone.js"
 import { removeCommand } from "./commands/remove.js"
 import { statusCommand } from "./commands/status.js"
+import { downCommand, upCommand } from "./commands/updown.js"
 
 /**
  * commander が使い方エラーとして報告する code の集合。
@@ -48,6 +49,28 @@ function mapCommanderExitCode(error: CommanderError): number {
   return EXIT_CODES.GENERAL_ERROR
 }
 
+function writeRemoveJsonUsageError(error: CommanderError): void {
+  const args = process.argv.slice(2)
+  if (args[0] !== "remove" || error.exitCode === 0) return
+  const optionBoundary = args.indexOf("--")
+  const removeArgs = args.slice(1, optionBoundary < 0 ? undefined : optionBoundary)
+  if (!removeArgs.includes("--json")) return
+  const branch = removeArgs
+    .find((value) => value !== "--json" && !value.startsWith("-"))
+  process.stdout.write(
+    `${JSON.stringify({
+      branch: branch ?? null,
+      path: null,
+      removed: false,
+      forced: removeArgs.includes("--force") || removeArgs.includes("-f"),
+      composeDown: null,
+      endCommand: null,
+      cleanupErrors: [error.message],
+      ok: false,
+    })}\n`
+  )
+}
+
 /**
  * メインCLIプログラムを作成・設定
  */
@@ -64,6 +87,8 @@ function createMainProgram(): Command {
   program.addCommand(createCommand())
   program.addCommand(removeCommand())
   program.addCommand(recloneCommand())
+  program.addCommand(upCommand())
+  program.addCommand(downCommand())
   program.addCommand(pruneCommand())
   program.addCommand(initCommand())
   program.addCommand(initClaudeCommand())
@@ -73,6 +98,7 @@ function createMainProgram(): Command {
   // で終了させる。exitOverride は addCommand したサブコマンドへ自動伝播しないため、
   // 各サブコマンドにも同じコールバックを設定する。
   const exitWithMappedCode = (error: CommanderError): never => {
+    writeRemoveJsonUsageError(error)
     process.exit(mapCommanderExitCode(error))
   }
   program.exitOverride(exitWithMappedCode)

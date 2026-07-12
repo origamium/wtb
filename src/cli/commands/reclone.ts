@@ -7,15 +7,14 @@
  * データ自律性を回復するための primitive。
  */
 
-import * as path from "node:path"
 import { Command } from "commander"
 import { EXIT_CODES } from "../../constants/index.js"
 import { loadConfig } from "../../core/config/loader.js"
-import { getGitRootOrThrow } from "../../core/git/repository.js"
-import { getWorktreePath, isSamePath, listWorktrees } from "../../core/git/worktree.js"
+import { getRepositoryContext } from "../../core/git/repository.js"
+import { isSamePath } from "../../core/git/worktree.js"
 import { CLIError } from "../../utils/error.js"
 import { out, setJsonOutputMode } from "../../utils/output.js"
-import { withErrorHandling } from "../utils/command-helpers.js"
+import { resolveWorktreeTarget, withErrorHandling } from "../utils/command-helpers.js"
 import {
   emptyVolumeCopyResult,
   previewVolumeCopy,
@@ -74,39 +73,14 @@ async function executeRecloneCommand(
   const json = options.json === true
   setJsonOutputMode(json)
 
-  const gitRoot = getGitRootOrThrow()
+  // NOTE: getGitRootOrThrow (--show-toplevel) は worktree 内では worktree 自身を返すため
+  // 使えない — source を指す main worktree root が必要 (でないと worktree 内からの実行が
+  // 常に main-repo ガードで拒否される)。
+  const repository = getRepositoryContext()
+  const gitRoot = repository.mainRoot
 
   // 対象 worktree の解決: branch 指定があればそれ、無ければ cwd を含む worktree。
-  let worktreePath: string
-  let targetBranch: string
-  if (branch) {
-    const resolved = getWorktreePath(branch)
-    if (!resolved) {
-      // 一覧はエラー診断の一部なので stderr に出す (stdout を script 出力用に汚さない)。
-      // "Error: ..." 本文は withErrorHandling が CLIError から stderr へ出力する。
-      console.error("Available worktrees:")
-      for (const wt of listWorktrees()) {
-        console.error(`  ${wt.branch}: ${wt.path}`)
-      }
-      throw new CLIError(`No worktree found for branch '${branch}'`, EXIT_CODES.GENERAL_ERROR)
-    }
-    worktreePath = resolved
-    targetBranch = branch
-  } else {
-    const cwd = path.resolve(process.cwd())
-    const match = listWorktrees().find((wt) => {
-      const r = path.resolve(wt.path)
-      return cwd === r || cwd.startsWith(`${r}${path.sep}`)
-    })
-    if (!match) {
-      throw new CLIError(
-        "Could not determine the current worktree — run `wtb reclone <branch>` with an explicit branch, or cd into a worktree.",
-        EXIT_CODES.GENERAL_ERROR
-      )
-    }
-    worktreePath = match.path
-    targetBranch = match.branch
-  }
+  const { worktreePath, targetBranch } = resolveWorktreeTarget("reclone", branch)
 
   // main repo を対象にすると source project == target project になり、volume を
   // 自分自身にクローンする無意味/危険な操作になるため拒否する。
@@ -168,12 +142,15 @@ async function executeRecloneCommand(
   const result = await setupVolumeCopy(gitRoot, worktreePath, config, {
     force: options.forceVolumeCopy === true,
     stop: options.stop,
+    branch: targetBranch,
+    commonGitDir: repository.commonGitDir,
   })
 
   // source スタックを停止したまま再開に失敗した = ユーザの稼働中環境が壊れた状態。
   // --strict の有無に関わらず非ゼロ終了 (DOCKER_ERROR) する (create.ts と同じ contract)。
-  const sourceRestartFailed =
-    result.sourceStack?.stopped === true && result.sourceStack?.restarted === false
+  // `compose stop` 自体が失敗しても一部 service だけ停止済みの可能性がある。
+  // その復旧にも失敗した場合は、stop の完了可否に関係なく hard Docker failure。
+  const sourceRestartFailed = result.sourceStack?.restarted === false
 
   out("")
   if (result.failed.length > 0) {

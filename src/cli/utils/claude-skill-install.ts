@@ -8,7 +8,7 @@ import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 import fs from "fs-extra"
 import { APP_VERSION } from "../../constants/index.js"
-import { getGitRoot, isGitRepository } from "../../core/git/repository.js"
+import { getMainWorktreeRoot, isGitRepository } from "../../core/git/repository.js"
 
 export interface InstallOptions {
   /** 既存ファイルを上書き */
@@ -148,7 +148,7 @@ export function resolveTargetDir(opts: InstallOptions, cwd?: string): string {
   if (!isGitRepository(cwd)) {
     throw new Error("Not in a git repository (use --user to install globally)")
   }
-  const root = getGitRoot(cwd)
+  const root = getMainWorktreeRoot(cwd)
   return path.join(root, ".claude", "skills", "wtb")
 }
 

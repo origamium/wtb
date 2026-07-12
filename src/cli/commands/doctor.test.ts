@@ -40,7 +40,7 @@ const compose = (over: Partial<ComposeConfig> = {}): ComposeConfig =>
 
 beforeEach(() => {
   vi.clearAllMocks()
-  vi.mocked(repositoryModule.getGitRootOrThrow).mockReturnValue("/repo")
+  vi.mocked(repositoryModule.getMainWorktreeRoot).mockReturnValue("/repo")
   vi.mocked(loaderModule.loadConfig).mockReturnValue(cfg())
   vi.mocked(envMapModule.buildWorktreeEnvMap).mockReturnValue({ APP_PORT: "3001" })
   vi.mocked(locateModule.resolveComposePath).mockReturnValue("/repo/docker-compose.yml")

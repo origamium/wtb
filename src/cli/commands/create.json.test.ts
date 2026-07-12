@@ -34,6 +34,11 @@ describe("create command --json / --exists-ok", () => {
     writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
     command = createCommand()
     vi.mocked(repositoryModule.getGitRootOrThrow).mockReturnValue("/repo")
+    vi.mocked(repositoryModule.getRepositoryContext).mockReturnValue({
+      currentRoot: "/repo",
+      mainRoot: "/repo",
+      commonGitDir: "/repo/.git",
+    })
     vi.mocked(repositoryModule.branchExists).mockReturnValue(false)
     vi.mocked(repositoryModule.remoteBranchExists).mockReturnValue(false)
     vi.mocked(repositoryModule.revisionExists).mockReturnValue(true)
@@ -94,6 +99,62 @@ describe("create command --json / --exists-ok", () => {
     expect(logSpy).not.toHaveBeenCalled()
   })
 
+  it("surfaces optional missing files as setupWarnings without failing create", async () => {
+    vi.mocked(loaderModule.loadConfig).mockReturnValue({
+      base_branch: "main",
+      docker_compose_file: "",
+      copy_files: ["missing.local"],
+      link_files: [],
+      env: { file: [], adjust: {} },
+      volumes: { exclude: [] },
+    })
+
+    await command.parseAsync(["feature/x", "--json"], { from: "user" })
+
+    const payload = parsePayload()
+    expect(payload.setupWarnings).toEqual([
+      expect.objectContaining({ phase: "copy", path: "missing.local" }),
+    ])
+    expect(payload.setupFailures).toEqual([])
+    expect(payload.ok).toBe(true)
+  })
+
+  it("surfaces runtime path failures and makes --strict non-zero", async () => {
+    vi.mocked(loaderModule.loadConfig).mockReturnValue({
+      base_branch: "main",
+      docker_compose_file: "",
+      copy_files: ["../unsafe"],
+      link_files: [],
+      env: { file: [], adjust: {} },
+      volumes: { exclude: [] },
+    })
+    process.exitCode = undefined
+
+    await command.parseAsync(["feature/x", "--json", "--strict"], { from: "user" })
+
+    const payload = parsePayload()
+    expect(payload.setupFailures).toEqual([
+      expect.objectContaining({ phase: "copy", path: "../unsafe" }),
+    ])
+    expect(payload.ok).toBe(false)
+    expect(process.exitCode).toBe(EXIT_CODES.GENERAL_ERROR)
+    process.exitCode = undefined
+  })
+
+  it("rejects --seed with --no-docker before creating a worktree", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("exited")
+    })
+
+    await expect(
+      command.parseAsync(["feature/x", "--seed", "--no-docker"], { from: "user" })
+    ).rejects.toThrow("exited")
+
+    expect(exitSpy).toHaveBeenCalledWith(EXIT_CODES.GENERAL_ERROR)
+    expect(worktreeModule.createWorktree).not.toHaveBeenCalled()
+    exitSpy.mockRestore()
+  })
+
   it("--exists-ok prints the existing path and exits 0 without touching the worktree", async () => {
     vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/existing/worktree-feature-x")
 
@@ -118,6 +179,24 @@ describe("create command --json / --exists-ok", () => {
       ok: true,
     })
     expect(logSpy).not.toHaveBeenCalled()
+  })
+
+  it("checks existence while holding the repository lock and releases on early return", async () => {
+    const release = vi.fn().mockResolvedValue(undefined)
+    vi.mocked(repositoryModule.acquireRepositoryLock).mockResolvedValue(release)
+    vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/existing/worktree-feature-x")
+
+    await command.parseAsync(["feature/x", "--exists-ok"], { from: "user" })
+
+    expect(repositoryModule.acquireRepositoryLock).toHaveBeenCalledWith({
+      currentRoot: "/repo",
+      mainRoot: "/repo",
+      commonGitDir: "/repo/.git",
+    })
+    expect(
+      vi.mocked(repositoryModule.acquireRepositoryLock).mock.invocationCallOrder[0]
+    ).toBeLessThan(vi.mocked(worktreeModule.getWorktreePath).mock.invocationCallOrder[0])
+    expect(release).toHaveBeenCalledTimes(1)
   })
 
   it("fails with dedicated exit code 6 (WORKTREE_EXISTS) when the worktree exists without --exists-ok", async () => {

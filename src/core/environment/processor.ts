@@ -8,6 +8,7 @@ import * as path from "node:path"
 import fs from "fs-extra"
 import { BACKUP_EXTENSION, FILE_ENCODING, MAX_TCP_PORT, PORT_RANGE } from "../../constants/index.js"
 import type { FileOperationOptions } from "../../types/index.js"
+import { atomicWriteFileSync } from "../../utils/atomic-file.js"
 import { out } from "../../utils/output.js"
 
 // =============================================================================
@@ -223,7 +224,7 @@ export function writeEnvFile(
       fs.mkdirpSync(dir)
     }
 
-    fs.writeFileSync(filePath, content, {
+    atomicWriteFileSync(filePath, content, {
       encoding: options?.encoding || FILE_ENCODING,
     })
 
@@ -231,6 +232,21 @@ export function writeEnvFile(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new Error(`Failed to write environment file: ${message}`)
+  }
+}
+
+/** Byte-preserving atomic copy used when env.adjust is empty. */
+export function copyEnvFileAtomic(sourcePath: string, targetPath: string): void {
+  try {
+    const content = fs.readFileSync(sourcePath)
+    const sourceMode = fs.statSync(sourcePath).mode & 0o7777
+    const dir = path.dirname(targetPath)
+    if (!existsSync(dir)) fs.mkdirpSync(dir)
+    atomicWriteFileSync(targetPath, content, { mode: sourceMode })
+    out(`🔧 Wrote environment file: ${targetPath}`)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`Failed to copy environment file atomically: ${message}`)
   }
 }
 
@@ -345,38 +361,4 @@ export function copyAndAdjustEnvFile(
 
   writeEnvFile(targetPath, parsed, options)
   return adjustedCount
-}
-
-// =============================================================================
-// バックアップ
-// =============================================================================
-
-/**
- * 環境変数ファイルをバックアップ
- */
-export function backupEnvFile(filePath: string, backupSuffix?: string): string {
-  const suffix = backupSuffix || BACKUP_EXTENSION
-  const backupPath = `${filePath}${suffix}`
-
-  if (existsSync(filePath)) {
-    fs.copyFileSync(filePath, backupPath)
-    out(`📋 Created backup: ${backupPath}`)
-  }
-
-  return backupPath
-}
-
-/**
- * 環境変数ファイルからバックアップを復元
- */
-export function restoreEnvFile(filePath: string, backupSuffix?: string): void {
-  const suffix = backupSuffix || BACKUP_EXTENSION
-  const backupPath = `${filePath}${suffix}`
-
-  if (!existsSync(backupPath)) {
-    throw new Error(`Backup file not found: ${backupPath}`)
-  }
-
-  fs.copyFileSync(backupPath, filePath)
-  out(`📋 Restored from backup: ${backupPath}`)
 }

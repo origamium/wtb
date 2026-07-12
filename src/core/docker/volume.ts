@@ -6,11 +6,28 @@
 
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { realpathSync } from "node:fs"
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs"
+import * as path from "node:path"
 import { FILE_ENCODING } from "../../constants/index.js"
 import type { ComposeConfig } from "../../types/index.js"
 import { execDockerSafe } from "../../utils/exec.js"
 import { out } from "../../utils/output.js"
+import {
+  acquireRepositoryLock,
+  type ReleaseRepositoryLock,
+} from "../git/repository.js"
 
 /**
  * リポジトリを一意に識別する volume ラベル値 (`wtb.repo=<hash>`) を求める。
@@ -27,8 +44,96 @@ export function repoVolumeLabel(gitRoot: string): string {
   return createHash("sha1").update(canonical).digest("hex").slice(0, 12)
 }
 
+/** wtb が Docker volume に付ける予約ラベル。 */
+export const WTB_VOLUME_LABELS = {
+  managed: "wtb.managed",
+  repo: "wtb.repo",
+  project: "wtb.project",
+  branch: "wtb.branch",
+  temp: "wtb.temp",
+} as const
+
+/** volume の所有者。repo/project/branch の 3 要素を揃えて初めて上書きを許可する。 */
+export interface VolumeOwnership {
+  repo: string
+  project: string
+  branch: string
+}
+
+/** docker volume inspect から得た wtb 所有権情報。 */
+export interface VolumeOwnershipInspection {
+  managed: boolean
+  repo?: string
+  project?: string
+  branch?: string
+  temp: boolean
+  labels: Record<string, string>
+}
+
+/** 永続化する atomic overwrite 復旧記録。 */
+export interface VolumeRecoveryRecord {
+  version: 1
+  /** Omitted by legacy atomic-overwrite records. */
+  kind?: "atomic-overwrite" | "incomplete-fresh-copy"
+  id: string
+  createdAt: string
+  sourceVolume: string
+  targetVolume: string
+  tempVolume: string
+  sourceBytes: number
+  stagedBytes: number
+  ownership: VolumeOwnership
+}
+
+/** 復旧記録と、その実ファイルパス。 */
+export interface StoredVolumeRecoveryRecord {
+  path: string
+  record: VolumeRecoveryRecord
+}
+
+/** common Git directory 配下に置く復旧記録ディレクトリを返す。 */
+export function getVolumeRecoveryDirectory(commonGitDir: string): string {
+  return path.join(commonGitDir, "wtb", "volume-recovery")
+}
+
+/**
+ * A destructive copy receives only the recovery directory, so derive the common Git directory
+ * from the one supported layout. Refusing arbitrary recovery paths is important: otherwise the
+ * copy and `prune --yes` could lock different repositories while manipulating the same temp
+ * volume/recovery record.
+ */
+function commonGitDirectoryFromRecoveryDirectory(recoveryDirectory: string): string {
+  const resolved = path.resolve(recoveryDirectory)
+  const wtbDirectory = path.dirname(resolved)
+  const commonGitDir = path.dirname(wtbDirectory)
+  if (
+    path.basename(resolved) !== "volume-recovery" ||
+    path.basename(wtbDirectory) !== "wtb" ||
+    path.resolve(getVolumeRecoveryDirectory(commonGitDir)) !== resolved
+  ) {
+    throw new Error(
+      `Volume recovery directory must be '<common-git-dir>/wtb/volume-recovery': '${recoveryDirectory}'`
+    )
+  }
+  return commonGitDir
+}
+
+/** 所有者と temp 識別子を createVolume 用ラベルへ変換する。 */
+export function buildWtbVolumeLabels(
+  ownership: VolumeOwnership,
+  options: { temp?: boolean } = {}
+): Record<string, string> {
+  return {
+    [WTB_VOLUME_LABELS.repo]: ownership.repo,
+    [WTB_VOLUME_LABELS.project]: ownership.project,
+    [WTB_VOLUME_LABELS.branch]: ownership.branch,
+    ...(options.temp === true ? { [WTB_VOLUME_LABELS.temp]: "true" } : {}),
+  }
+}
+
 /** Docker volume 名の許容文字。破壊的操作の前に名前を検証する防御に使う。 */
 const DOCKER_VOLUME_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/
+const RECOVERY_RECORD_ID = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/
 
 /**
  * 破壊的操作 (clear / atomic overwrite の tmp 作成) の前に volume 名を検証する。
@@ -59,6 +164,91 @@ export function volumeIsWtbManaged(volumeName: string): boolean {
 }
 
 /**
+ * volume の全ラベルを strict に取得する。Docker daemon/inspect/JSON の失敗は伝播し、
+ * 破壊的処理が「未管理 volume」と誤認して続行しないようにする。
+ */
+export function inspectVolumeOwnership(volumeName: string): VolumeOwnershipInspection {
+  assertValidVolumeName(volumeName)
+  const raw = execDockerSafe(
+    ["volume", "inspect", "--format", "{{json .}}", volumeName],
+    {}
+  )
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error(`Cannot parse Docker inspection for volume '${volumeName}'`)
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Invalid Docker inspection for volume '${volumeName}'`)
+  }
+  const inspection = parsed as Record<string, unknown>
+  if (inspection.Driver !== "local") {
+    throw new Error(
+      `Volume '${volumeName}' uses unsupported driver '${typeof inspection.Driver === "string" ? inspection.Driver : "unknown"}' — refusing to adopt, write, or remove it`
+    )
+  }
+  const driverOptions = inspection.Options
+  if (
+    driverOptions !== null &&
+    driverOptions !== undefined &&
+    (typeof driverOptions !== "object" ||
+      Array.isArray(driverOptions) ||
+      Object.keys(driverOptions).length > 0)
+  ) {
+    throw new Error(
+      `Volume '${volumeName}' has local driver options (for example a host bind mount) — refusing to adopt, write, or remove it`
+    )
+  }
+  const labels: Record<string, string> = {}
+  const rawLabels = inspection.Labels
+  if (rawLabels !== null && typeof rawLabels === "object" && !Array.isArray(rawLabels)) {
+    for (const [key, value] of Object.entries(rawLabels)) {
+      if (typeof value === "string") labels[key] = value
+    }
+  }
+  return {
+    managed: labels[WTB_VOLUME_LABELS.managed] === "true",
+    repo: labels[WTB_VOLUME_LABELS.repo],
+    project: labels[WTB_VOLUME_LABELS.project],
+    branch: labels[WTB_VOLUME_LABELS.branch],
+    temp: labels[WTB_VOLUME_LABELS.temp] === "true",
+    labels,
+  }
+}
+
+/** 3 要素すべてが一致する wtb volume だけを同一所有者とみなす。 */
+export function volumeOwnershipMatches(
+  actual: VolumeOwnershipInspection,
+  expected: VolumeOwnership
+): boolean {
+  return (
+    actual.managed &&
+    actual.repo === expected.repo &&
+    actual.project === expected.project &&
+    actual.branch === expected.branch
+  )
+}
+
+/** create/idempotent create の直後に、実 volume が期待した所有者と temp 種別か再確認する。 */
+export function assertVolumeOwnedBy(
+  volumeName: string,
+  expected: VolumeOwnership,
+  options: { temp?: boolean } = {}
+): VolumeOwnershipInspection {
+  const actual = inspectVolumeOwnership(volumeName)
+  if (
+    !volumeOwnershipMatches(actual, expected) ||
+    actual.temp !== (options.temp === true)
+  ) {
+    throw new Error(
+      `Volume '${volumeName}' ownership changed before copy — refusing to write to a foreign volume`
+    )
+  }
+  return actual
+}
+
+/**
  * ボリュームコピーの進捗情報
  */
 export interface VolumeCopyProgress {
@@ -82,11 +272,28 @@ export interface VolumeCopyOptions {
   compress?: boolean
   /** 作成する volume に付与するリポジトリ識別ラベル値 (`wtb.repo=<value>`)。prune の repo スコープ用。 */
   repoLabel?: string
+  /** repo/project/branch を揃えた所有者。新規 API では repoLabel 単体ではなくこちらを使う。 */
+  ownership?: VolumeOwnership
+  /** common Git directory 配下の復旧記録ディレクトリ。破壊的上書きでは必須。 */
+  recoveryDirectory?: string
+  /** 内部用: atomic overwrite の staging volume に temp ラベルを付ける。 */
+  tempVolume?: boolean
 }
 
-/** repoLabel から createVolume 用の extraLabels を作る。 */
-function repoLabelArg(repoLabel?: string): Record<string, string> {
-  return repoLabel ? { "wtb.repo": repoLabel } : {}
+type OwnedVolumeCopyOptions = VolumeCopyOptions & { ownership: VolumeOwnership }
+
+const VOLUME_CONTENT_SIZE_COMMAND =
+  'if [ -z "$(find /data -mindepth 1 -print -quit)" ]; then echo 0; else tar -C /data -cf - . | wc -c; fi'
+
+/** copy options から createVolume 用のラベルを作る (repoLabel は後方互換)。 */
+function volumeLabelArgs(options: VolumeCopyOptions): Record<string, string> {
+  if (options.ownership) {
+    return buildWtbVolumeLabels(options.ownership, { temp: options.tempVolume })
+  }
+  return {
+    ...(options.repoLabel ? { [WTB_VOLUME_LABELS.repo]: options.repoLabel } : {}),
+    ...(options.tempVolume === true ? { [WTB_VOLUME_LABELS.temp]: "true" } : {}),
+  }
 }
 
 /**
@@ -109,7 +316,7 @@ export function getVolumeSize(volumeName: string): number | null {
         "alpine",
         "sh",
         "-c",
-        "du -sb /data 2>/dev/null | cut -f1",
+        VOLUME_CONTENT_SIZE_COMMAND,
       ],
       {}
     )
@@ -117,6 +324,594 @@ export function getVolumeSize(volumeName: string): number | null {
     return Number.isNaN(size) ? null : size
   } catch {
     return null
+  }
+}
+
+interface SourceVolumeLease {
+  containerName: string
+  containerId: string
+  volumeName: string
+  snapshot: string
+  destination: string
+  readOnly: boolean
+  kind: "source" | "target"
+}
+
+interface TargetVolumeLease extends SourceVolumeLease {
+  ownership: VolumeOwnership
+  temp: boolean
+}
+
+/**
+ * Opaque lease set used while a lifecycle command may create/mount target
+ * volumes. A stopped Docker container pins each exact volume, so another wtb
+ * process cannot remove and replace it between ownership validation and
+ * `docker compose up` / a seed command.
+ */
+export interface TargetVolumeLifecycleLease {
+  release(): void
+}
+
+const LEASE_KEEPALIVE_COMMAND = "while :; do sleep 3600; done"
+
+function parseDockerObject(raw: string, description: string): Record<string, unknown> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error(`Cannot parse Docker inspection for ${description}`)
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Invalid Docker inspection for ${description}`)
+  }
+  return parsed as Record<string, unknown>
+}
+
+/** Validate that the exact running container we created still owns the expected named-volume mount. */
+function assertLeaseContainerStillValid(
+  lease: SourceVolumeLease,
+  options: { requireRunning: boolean } = { requireRunning: true }
+): { running: boolean } {
+  const inspection = parseDockerObject(
+    execDockerSafe(["container", "inspect", "--format", "{{json .}}", lease.containerId], {}),
+    `lease container '${lease.containerName}'`
+  )
+  if (inspection.Id !== lease.containerId || inspection.Name !== `/${lease.containerName}`) {
+    throw new Error(
+      `Lease container '${lease.containerName}' changed identity — refusing to continue`
+    )
+  }
+  const config = inspection.Config
+  const labels =
+    config !== null && typeof config === "object" && !Array.isArray(config)
+      ? (config as Record<string, unknown>).Labels
+      : undefined
+  if (labels === null || typeof labels !== "object" || Array.isArray(labels)) {
+    throw new Error(`Lease container '${lease.containerName}' lost its labels`)
+  }
+  const labelRecord = labels as Record<string, unknown>
+  if (labelRecord["wtb.temp"] !== "true" || labelRecord["wtb.lease"] !== lease.kind) {
+    throw new Error(`Lease container '${lease.containerName}' has unexpected ownership labels`)
+  }
+  const mounts = inspection.Mounts
+  if (!Array.isArray(mounts) || mounts.length !== 1) {
+    throw new Error(`Lease container '${lease.containerName}' has unexpected mounts`)
+  }
+  const mount = mounts[0]
+  if (mount === null || typeof mount !== "object" || Array.isArray(mount)) {
+    throw new Error(`Lease container '${lease.containerName}' has an invalid mount`)
+  }
+  const mountRecord = mount as Record<string, unknown>
+  if (
+    mountRecord.Type !== "volume" ||
+    mountRecord.Name !== lease.volumeName ||
+    mountRecord.Destination !== lease.destination ||
+    mountRecord.RW !== !lease.readOnly
+  ) {
+    throw new Error(
+      `Lease container '${lease.containerName}' no longer mounts exactly '${lease.volumeName}' at '${lease.destination}'`
+    )
+  }
+  const state = inspection.State
+  const running =
+    state !== null &&
+    typeof state === "object" &&
+    !Array.isArray(state) &&
+    (state as Record<string, unknown>).Running === true
+  if (options.requireRunning && !running) {
+    throw new Error(
+      `Lease container '${lease.containerName}' is no longer running — refusing to continue`
+    )
+  }
+  return { running }
+}
+
+function leaseContainerId(output: string, containerName: string): string {
+  const id = output.trim()
+  if (!/^[a-f0-9]{12,64}$/i.test(id)) {
+    throw new Error(`Docker did not return a valid id for lease container '${containerName}'`)
+  }
+  return id
+}
+
+/**
+ * Pin a source volume with a stopped container for the duration of a copy.
+ *
+ * `docker run -v missing:/source` silently creates a missing named volume. A strict inspect
+ * before the lease plus a byte-for-byte inspect snapshot after container creation catches a
+ * remove/recreate race; once the lease exists Docker refuses to remove the source volume.
+ */
+function acquireSourceVolumeLease(sourceVolume: string): SourceVolumeLease {
+  assertValidVolumeName(sourceVolume)
+  const before = execDockerSafe(["volume", "inspect", sourceVolume], {})
+  const sourceHash = createHash("sha1").update(sourceVolume).digest("hex").slice(0, 12)
+  const containerName = `wtb-volume-lease-${sourceHash}-${process.pid}-${Math.random()
+    .toString(36)
+    .slice(2, 10)}`
+  let lease: SourceVolumeLease | undefined
+  try {
+    const containerId = leaseContainerId(
+      execDockerSafe(
+        [
+          "run",
+          "--detach",
+          "--name",
+          containerName,
+          "--label",
+          "wtb.temp=true",
+          "--label",
+          "wtb.lease=source",
+          "--mount",
+          `type=volume,src=${sourceVolume},dst=/wtb-source,readonly`,
+          "alpine",
+          "sh",
+          "-c",
+          LEASE_KEEPALIVE_COMMAND,
+        ],
+        {}
+      ),
+      containerName
+    )
+    lease = {
+      containerName,
+      containerId,
+      volumeName: sourceVolume,
+      snapshot: before,
+      destination: "/wtb-source",
+      readOnly: true,
+      kind: "source",
+    }
+    const after = execDockerSafe(["volume", "inspect", sourceVolume], {})
+    if (after !== before) {
+      throw new Error(
+        `Source volume '${sourceVolume}' changed while acquiring a copy lease — refusing to copy`
+      )
+    }
+    lease.snapshot = after
+    assertLeaseContainerStillValid(lease)
+    return lease
+  } catch (error) {
+    if (lease) {
+      try {
+        execDockerSafe(["rm", "-f", lease.containerId], {})
+      } catch {
+        // Preserve the acquisition error; the leftover lease is safe and keeps data pinned.
+      }
+    }
+    throw error
+  }
+}
+
+function releaseVolumeLease(lease: SourceVolumeLease): void {
+  execDockerSafe(["rm", "-f", lease.containerId], {})
+}
+
+function targetLeaseContainerName(targetVolume: string): string {
+  const hash = createHash("sha1").update(targetVolume).digest("hex").slice(0, 12)
+  // Deterministic per target: `docker create --name` is the operation lock. A concurrent copy or
+  // stale lease therefore blocks safely with a name collision; stale target leases are never
+  // auto-removed because they may be the only thing still pinning data after an interrupted copy.
+  return `wtb-target-lease-${hash}`
+}
+
+function findExactContainerByName(
+  containerName: string
+): { id: string; name: string } | undefined {
+  const output = execDockerSafe(
+    [
+      "ps",
+      "--all",
+      "--no-trunc",
+      "--filter",
+      `name=^${containerName}$`,
+      "--format",
+      "{{.ID}}\t{{.Names}}",
+    ],
+    {}
+  )
+  const matches = output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const [id = "", name = ""] = line.split("\t")
+      return { id: id.trim(), name: name.trim() }
+    })
+    .filter(({ name }) => name === containerName)
+  if (matches.length === 0) return undefined
+  if (matches.length !== 1) {
+    throw new Error(`Multiple containers claim deterministic name '${containerName}'`)
+  }
+  return matches[0]
+}
+
+function assertNoUnresolvedTargetVolumeLease(targetVolume: string): void {
+  const containerName = targetLeaseContainerName(targetVolume)
+  const existing = findExactContainerByName(containerName)
+  if (!existing) return
+  const lease: SourceVolumeLease = {
+    containerName,
+    containerId: leaseContainerId(existing.id, containerName),
+    volumeName: targetVolume,
+    snapshot: "",
+    destination: "/wtb-target",
+    readOnly: false,
+    kind: "target",
+  }
+  const { running } = assertLeaseContainerStillValid(lease, { requireRunning: false })
+  throw new Error(
+    `Unresolved ${running ? "running" : "stopped"} target volume lease '${containerName}' is still pinning '${targetVolume}'. Inspect it and remove it manually only after confirming that no interrupted copy or recovery is pending`
+  )
+}
+
+export interface VolumeCloneOperationLock {
+  /** Deterministic name, exposed only for diagnostics and manual recovery instructions. */
+  containerName: string
+  release(): void
+}
+
+function assertCloneOperationLockContainer(
+  containerId: string,
+  containerName: string,
+  repo: string,
+  sourceProject: string,
+  options: { requireRunning: boolean }
+): { running: boolean } {
+  const inspection = parseDockerObject(
+    execDockerSafe(["container", "inspect", "--format", "{{json .}}", containerId], {}),
+    `clone-operation lock '${containerName}'`
+  )
+  if (inspection.Id !== containerId || inspection.Name !== `/${containerName}`) {
+    throw new Error(`Clone-operation lock '${containerName}' changed identity`)
+  }
+  const config = inspection.Config
+  const labels =
+    config !== null && typeof config === "object" && !Array.isArray(config)
+      ? (config as Record<string, unknown>).Labels
+      : undefined
+  if (labels === null || typeof labels !== "object" || Array.isArray(labels)) {
+    throw new Error(`Clone-operation lock '${containerName}' lost its labels`)
+  }
+  const labelRecord = labels as Record<string, unknown>
+  if (
+    labelRecord["wtb.temp"] !== "true" ||
+    labelRecord["wtb.lock"] !== "volume-clone" ||
+    labelRecord[WTB_VOLUME_LABELS.repo] !== repo ||
+    labelRecord["wtb.source-project"] !== sourceProject
+  ) {
+    throw new Error(`Clone-operation lock '${containerName}' has unexpected ownership labels`)
+  }
+  if (!Array.isArray(inspection.Mounts) || inspection.Mounts.length !== 0) {
+    throw new Error(`Clone-operation lock '${containerName}' has unexpected mounts`)
+  }
+  const state = inspection.State
+  const running =
+    state !== null &&
+    typeof state === "object" &&
+    !Array.isArray(state) &&
+    (state as Record<string, unknown>).Running === true
+  if (options.requireRunning && !running) {
+    throw new Error(`Clone-operation lock '${containerName}' is no longer running`)
+  }
+  return { running }
+}
+
+/**
+ * Serialize the full source-stack clone lifecycle for one repository + source Compose project.
+ * The deterministic running container survives `docker container prune`. Any stale lock is left
+ * untouched and requires explicit operator inspection/removal so an interrupted source restart
+ * cannot be silently overlapped by a later clone.
+ */
+export function acquireVolumeCloneOperationLock(
+  repo: string,
+  sourceProject: string
+): VolumeCloneOperationLock {
+  if (!repo || !sourceProject || repo.includes("\0") || sourceProject.includes("\0")) {
+    throw new Error("Volume clone operation lock requires non-empty repo and source project keys")
+  }
+  const hash = createHash("sha256")
+    .update(repo)
+    .update("\0")
+    .update(sourceProject)
+    .digest("hex")
+    .slice(0, 24)
+  const containerName = `wtb-volume-clone-lock-${hash}`
+  const existing = findExactContainerByName(containerName)
+  if (existing) {
+    let state: { running: boolean }
+    try {
+      const id = leaseContainerId(existing.id, containerName)
+      state = assertCloneOperationLockContainer(id, containerName, repo, sourceProject, {
+        requireRunning: false,
+      })
+    } catch (error) {
+      throw new Error(
+        `Deterministic clone-operation lock '${containerName}' already exists but cannot be validated. Do not remove it until any interrupted volume copy/source restart has been investigated: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+    throw new Error(
+      `Unresolved ${state.running ? "running" : "stopped"} clone-operation lock '${containerName}' already exists for repository '${repo}' and source project '${sourceProject}'. Inspect it and remove it manually only after confirming that no interrupted copy or source restart is pending`
+    )
+  }
+
+  let containerId: string
+  try {
+    containerId = leaseContainerId(
+      execDockerSafe(
+        [
+          "run",
+          "--detach",
+          "--name",
+          containerName,
+          "--label",
+          "wtb.temp=true",
+          "--label",
+          "wtb.lock=volume-clone",
+          "--label",
+          `${WTB_VOLUME_LABELS.repo}=${repo}`,
+          "--label",
+          `wtb.source-project=${sourceProject}`,
+          "alpine",
+          "sh",
+          "-c",
+          LEASE_KEEPALIVE_COMMAND,
+        ],
+        {}
+      ),
+      containerName
+    )
+    assertCloneOperationLockContainer(containerId, containerName, repo, sourceProject, {
+      requireRunning: true,
+    })
+  } catch (error) {
+    throw new Error(
+      `Could not acquire clone-operation lock '${containerName}'. Another clone may be running, or a stale lock from an interrupted clone/source restart needs manual recovery. Docker error: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
+
+  let released = false
+  return {
+    containerName,
+    release(): void {
+      if (released) return
+      assertCloneOperationLockContainer(containerId, containerName, repo, sourceProject, {
+        requireRunning: true,
+      })
+      execDockerSafe(["rm", "-f", containerId], {})
+      released = true
+    },
+  }
+}
+
+function assertTargetOwnership(
+  targetVolume: string,
+  ownership: VolumeOwnership,
+  temp: boolean
+): void {
+  const actual = inspectVolumeOwnership(targetVolume)
+  if (!volumeOwnershipMatches(actual, ownership) || actual.temp !== temp) {
+    const owner = `${actual.repo ?? "?"}/${actual.project ?? "?"}/${actual.branch ?? "?"}`
+    throw new Error(
+      `Target volume '${targetVolume}' ownership changed (${owner}, temp=${actual.temp}) — refusing to copy`
+    )
+  }
+}
+
+/**
+ * Pin the already-created, correctly-owned target with a stopped container. Docker refuses to
+ * remove a volume referenced by any container, so the name cannot be removed/recreated between
+ * ownership validation and the actual rsync/cp/atomic commit.
+ */
+function acquireTargetVolumeLease(
+  targetVolume: string,
+  ownership: VolumeOwnership,
+  options: { temp: boolean }
+): TargetVolumeLease {
+  assertValidVolumeName(targetVolume)
+  const before = execDockerSafe(["volume", "inspect", targetVolume], {})
+  assertTargetOwnership(targetVolume, ownership, options.temp)
+  const containerName = targetLeaseContainerName(targetVolume)
+  let lease: TargetVolumeLease | undefined
+  try {
+    const containerId = leaseContainerId(
+      execDockerSafe(
+        [
+          "run",
+          "--detach",
+          "--name",
+          containerName,
+          "--label",
+          "wtb.temp=true",
+          "--label",
+          "wtb.lease=target",
+          "--mount",
+          `type=volume,src=${targetVolume},dst=/wtb-target`,
+          "alpine",
+          "sh",
+          "-c",
+          LEASE_KEEPALIVE_COMMAND,
+        ],
+        {}
+      ),
+      containerName
+    )
+    lease = {
+      containerName,
+      containerId,
+      volumeName: targetVolume,
+      snapshot: before,
+      destination: "/wtb-target",
+      readOnly: false,
+      kind: "target",
+      ownership,
+      temp: options.temp,
+    }
+    const after = execDockerSafe(["volume", "inspect", targetVolume], {})
+    assertTargetOwnership(targetVolume, ownership, options.temp)
+    if (after !== before) {
+      throw new Error(
+        `Target volume '${targetVolume}' changed while acquiring a copy lease — refusing to copy`
+      )
+    }
+    lease.snapshot = after
+    assertTargetLeaseStillValid(lease)
+    return lease
+  } catch (error) {
+    if (lease) {
+      try {
+        releaseVolumeLease(lease)
+      } catch {
+        // Preserve the acquisition error. A leftover stopped lease safely pins the volume.
+      }
+    } else {
+      throw new Error(
+        `Could not acquire target volume lease '${containerName}'. Another copy may be running, or a stale lease from an interrupted copy is still pinning '${targetVolume}'. Inspect that container and remove it manually only after confirming no recovery is needed. Docker error: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+    throw error
+  }
+}
+
+/**
+ * Strictly prepare and pin every non-external target volume for a lifecycle
+ * operation. Missing (or safely removed empty-unmanaged) volumes are created
+ * with the complete ownership label set before their deterministic leases are
+ * acquired. If any volume cannot be proven safe, all leases already acquired
+ * by this call are released and the operation fails closed.
+ */
+export function acquireTargetVolumeLifecycleLeases(
+  targetVolumes: string[],
+  ownership: VolumeOwnership,
+  options: { requireEmpty?: boolean } = {}
+): TargetVolumeLifecycleLease {
+  const leases: TargetVolumeLease[] = []
+  const uniqueTargets = [...new Set(targetVolumes)]
+  try {
+    for (const targetVolume of uniqueTargets) {
+      assertNoUnresolvedTargetVolumeLease(targetVolume)
+      const runningHolders = getContainersUsingVolumeWithProjectOrThrow(targetVolume)
+      if (runningHolders.length > 0) {
+        const foreignHolders = runningHolders.filter(
+          (holder) => holder.project !== ownership.project
+        )
+        if (foreignHolders.length > 0) {
+          throw new Error(
+            `Target volume '${targetVolume}' is in use outside Compose project '${ownership.project}' by ${foreignHolders.map((holder) => holder.name).join(", ")}`
+          )
+        }
+        if (options.requireEmpty === true) {
+          throw new Error(
+            `Target volume '${targetVolume}' is already mounted by Compose project '${ownership.project}'; seed_command requires an exclusively leased fresh empty target`
+          )
+        }
+        // Same-project running containers already pin this exact name. Validate the volume's
+        // backend and ownership, but do not create a competing lease container.
+        assertTargetOwnership(targetVolume, ownership, false)
+        continue
+      }
+      const preflight = preflightTargetVolumeForCopy(targetVolume, ownership)
+      if (options.requireEmpty === true && preflight.size > 0) {
+        throw new Error(
+          `Target volume '${targetVolume}' already contains data; seed_command requires a fresh empty target`
+        )
+      }
+      createVolume(targetVolume, "local", buildWtbVolumeLabels(ownership))
+      const lease = acquireTargetVolumeLease(targetVolume, ownership, { temp: false })
+      if (options.requireEmpty === true) {
+        // The running lease now prevents remove/recreate and concurrent non-Compose mounting.
+        // Re-probe after acquisition so a writer between initial preflight and the lease cannot
+        // smuggle data into a seed target.
+        const leasedSize = getVolumeSize(targetVolume)
+        if (leasedSize === null || leasedSize !== 0) {
+          try {
+            releaseVolumeLease(lease)
+          } catch {
+            // A surviving running lease remains a safe fail-closed pin.
+          }
+          throw new Error(
+            leasedSize === null
+              ? `Cannot verify that leased target volume '${targetVolume}' is empty for seed_command`
+              : `Target volume '${targetVolume}' gained data before its seed lease was acquired`
+          )
+        }
+      }
+      leases.push(lease)
+    }
+  } catch (error) {
+    const cleanupErrors: unknown[] = []
+    for (const lease of leases.reverse()) {
+      try {
+        releaseVolumeLease(lease)
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError)
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        `Could not safely acquire target volume lifecycle leases and failed to release ${cleanupErrors.length} partial lease(s)`
+      )
+    }
+    throw error
+  }
+
+  let released = false
+  return {
+    release(): void {
+      if (released) return
+      const errors: unknown[] = []
+      for (const lease of [...leases].reverse()) {
+        try {
+          releaseVolumeLease(lease)
+        } catch (error) {
+          errors.push(error)
+        }
+      }
+      released = true
+      if (errors.length === 1) throw errors[0]
+      if (errors.length > 1) {
+        throw new AggregateError(errors, `Failed to release ${errors.length} target volume leases`)
+      }
+    },
+  }
+}
+
+function assertTargetLeaseStillValid(lease: TargetVolumeLease): void {
+  assertLeaseContainerStillValid(lease)
+  const current = execDockerSafe(["volume", "inspect", lease.volumeName], {})
+  if (current !== lease.snapshot) {
+    throw new Error(
+      `Target volume '${lease.volumeName}' changed after its copy lease was acquired — refusing to write`
+    )
+  }
+  assertTargetOwnership(lease.volumeName, lease.ownership, lease.temp)
+  const activeHolders = getRunningVolumeHoldersOrThrow(lease.volumeName).filter(
+    (holder) => holder.id !== lease.containerId
+  )
+  if (activeHolders.length > 0) {
+    throw new Error(
+      `Target volume '${lease.volumeName}' is in use by ${activeHolders.map((holder) => holder.name).join(", ")} while its copy lease is held`
+    )
   }
 }
 
@@ -153,10 +948,79 @@ export function createVolume(
  */
 export function removeVolume(volumeName: string): void {
   try {
+    const inspection = inspectVolumeOwnership(volumeName)
+    if (!inspection.managed || !inspection.temp) {
+      return
+    }
     execDockerSafe(["volume", "rm", "-f", volumeName], {})
   } catch {
     // best-effort cleanup; 失敗しても呼び出し側の処理は続行する
   }
+}
+
+/** volume を削除し、Docker エラーを握り潰さない破壊的処理向け API。 */
+export function removeVolumeOrThrow(volumeName: string): void {
+  assertValidVolumeName(volumeName)
+  // Revalidate the backend immediately before deletion. Callers may intentionally remove an
+  // empty unmanaged target, so ownership is not required here, but bind-backed/non-local storage
+  // must never reach `docker volume rm`.
+  inspectVolumeOwnership(volumeName)
+  execDockerSafe(["volume", "rm", "-f", volumeName], {})
+}
+
+/**
+ * volume の存在を strict に調べる。inspect の「存在しない」と「daemon down」を同一視
+ * しないよう、volume ls 自体の成否を確認したうえで完全一致する名前を探す。
+ */
+export function volumeExistsOrThrow(volumeName: string): boolean {
+  assertValidVolumeName(volumeName)
+  const output = execDockerSafe(
+    ["volume", "ls", "--quiet", "--filter", `name=^${volumeName}$`],
+    {}
+  )
+  return output
+    .split("\n")
+    .map((entry) => entry.trim())
+    .some((entry) => entry === volumeName)
+}
+
+/** strict な volume 使用中コンテナ列挙。prune/再作成の安全判定で使う。 */
+export function getContainersUsingVolumeOrThrow(volumeName: string): string[] {
+  return getRunningVolumeHoldersOrThrow(volumeName).map((holder) => holder.name)
+}
+
+interface RunningVolumeHolder {
+  id: string
+  name: string
+}
+
+function getRunningVolumeHoldersOrThrow(volumeName: string): RunningVolumeHolder[] {
+  assertValidVolumeName(volumeName)
+  const output = execDockerSafe(
+    [
+      "ps",
+      "--no-trunc",
+      "--filter",
+      `volume=${volumeName}`,
+      "--format",
+      "{{.ID}}\t{{.Names}}",
+    ],
+    {}
+  )
+  if (!output) return []
+  return output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const tabIndex = line.indexOf("\t")
+      if (tabIndex < 0) return { id: line, name: line }
+      return {
+        id: line.slice(0, tabIndex).trim(),
+        name: line.slice(tabIndex + 1).trim(),
+      }
+    })
+    .filter((entry) => entry.id.length > 0 && entry.name.length > 0)
 }
 
 /**
@@ -191,6 +1055,126 @@ function clearVolume(volumeName: string): void {
 function makeTempVolumeName(targetVolume: string): string {
   const suffix = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
   return `${targetVolume}__wtbtmp_${suffix}`
+}
+
+function makeRecoveryId(): string {
+  return `${Date.now()}_${process.pid}_${Math.random().toString(36).slice(2, 10)}`
+}
+
+function fsyncDirectory(directory: string): void {
+  const fd = openSync(directory, "r")
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/** JSON を同一 directory 内で write+fsync+rename し、復旧記録を原子的に公開する。 */
+export function writeVolumeRecoveryRecord(
+  recoveryDirectory: string,
+  record: VolumeRecoveryRecord
+): StoredVolumeRecoveryRecord {
+  if (!RECOVERY_RECORD_ID.test(record.id)) {
+    throw new Error(`Invalid volume recovery record id '${record.id}'`)
+  }
+  mkdirSync(recoveryDirectory, { recursive: true, mode: 0o700 })
+  const finalPath = path.join(recoveryDirectory, `${record.id}.json`)
+  const tempPath = path.join(recoveryDirectory, `.${record.id}.${process.pid}.tmp`)
+  let fd: number | undefined
+  try {
+    fd = openSync(tempPath, "wx", 0o600)
+    writeFileSync(fd, `${JSON.stringify(record, null, 2)}\n`, "utf8")
+    fsyncSync(fd)
+    closeSync(fd)
+    fd = undefined
+    renameSync(tempPath, finalPath)
+    fsyncDirectory(recoveryDirectory)
+    return { path: finalPath, record }
+  } catch (error) {
+    if (fd !== undefined) closeSync(fd)
+    try {
+      unlinkSync(tempPath)
+    } catch {
+      // temp が未作成/rename 済みなら何もしない
+    }
+    throw error
+  }
+}
+
+function isVolumeOwnership(value: unknown): value is VolumeOwnership {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false
+  const candidate = value as Partial<VolumeOwnership>
+  return (
+    typeof candidate.repo === "string" &&
+    candidate.repo.length > 0 &&
+    typeof candidate.project === "string" &&
+    candidate.project.length > 0 &&
+    typeof candidate.branch === "string" &&
+    candidate.branch.length > 0
+  )
+}
+
+function isVolumeRecoveryRecord(value: unknown): value is VolumeRecoveryRecord {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false
+  const record = value as Partial<VolumeRecoveryRecord>
+  return (
+    record.version === 1 &&
+    (record.kind === undefined ||
+      record.kind === "atomic-overwrite" ||
+      record.kind === "incomplete-fresh-copy") &&
+    typeof record.id === "string" &&
+    RECOVERY_RECORD_ID.test(record.id) &&
+    typeof record.createdAt === "string" &&
+    typeof record.sourceVolume === "string" &&
+    DOCKER_VOLUME_NAME.test(record.sourceVolume) &&
+    typeof record.targetVolume === "string" &&
+    DOCKER_VOLUME_NAME.test(record.targetVolume) &&
+    typeof record.tempVolume === "string" &&
+    DOCKER_VOLUME_NAME.test(record.tempVolume) &&
+    typeof record.sourceBytes === "number" &&
+    Number.isSafeInteger(record.sourceBytes) &&
+    record.sourceBytes >= 0 &&
+    typeof record.stagedBytes === "number" &&
+    Number.isSafeInteger(record.stagedBytes) &&
+    record.stagedBytes >= 0 &&
+    isVolumeOwnership(record.ownership)
+  )
+}
+
+/**
+ * 復旧記録を読み込む。1 件でも破損していれば例外にし、prune が保護対象を見落として
+ * temp volume を削除することを防ぐ (fail-closed)。
+ */
+export function readVolumeRecoveryRecords(
+  recoveryDirectory: string
+): StoredVolumeRecoveryRecord[] {
+  if (!existsSync(recoveryDirectory)) return []
+  const records: StoredVolumeRecoveryRecord[] = []
+  for (const fileName of readdirSync(recoveryDirectory)) {
+    if (!fileName.endsWith(".json")) continue
+    const recordPath = path.join(recoveryDirectory, fileName)
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(readFileSync(recordPath, "utf8"))
+    } catch (error) {
+      throw new Error(
+        `Cannot read volume recovery record '${recordPath}': ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+    if (!isVolumeRecoveryRecord(parsed) || fileName !== `${parsed.id}.json`) {
+      throw new Error(`Invalid volume recovery record '${recordPath}'`)
+    }
+    records.push({ path: recordPath, record: parsed })
+  }
+  return records
+}
+
+/** 復旧記録を削除し、directory entry まで fsync する。 */
+export function removeVolumeRecoveryRecord(recordPath: string): void {
+  const directory = path.dirname(recordPath)
+  unlinkSync(recordPath)
+  fsyncDirectory(directory)
 }
 
 /** rsync の速度単位 → bytes/sec 倍率。未知の単位は「不明」(0) として扱い、勝手に bytes と誤認しない。 */
@@ -241,17 +1225,18 @@ export function parseRsyncProgress(
  * @param options - コピーオプション
  * @returns コピー結果のPromise
  */
-export async function copyVolumeWithRsync(
+async function copyVolumeWithRsync(
   sourceVolume: string,
   targetVolume: string,
-  options: VolumeCopyOptions = {}
+  options: OwnedVolumeCopyOptions,
+  targetLease: TargetVolumeLease
 ): Promise<void> {
+  if (!options?.ownership) {
+    throw new Error("Volume copy requires repo/project/branch ownership metadata")
+  }
   const { onProgress, incremental = true, compress = false } = options
 
-  // `docker volume create` は idempotent (既存 volume なら何もせず成功) なので
-  // 失敗 = 本当のエラー (daemon down / 不正な名前 / driver エラー)。握り潰さず
-  // 伝播させ、呼び出し側で copy 失敗として明確に扱う。
-  createVolume(targetVolume, "local", repoLabelArg(options.repoLabel))
+  assertTargetLeaseStillValid(targetLease)
 
   const totalBytes = getVolumeSize(sourceVolume) ?? 0
 
@@ -355,18 +1340,17 @@ export async function copyVolumeWithRsync(
  * セマンティクスを保つために必要。デフォルトは false (既存ファイル保持) で、
  * これは rsync の非 incremental 動作と等価。
  */
-export async function copyVolumeWithCp(
+async function copyVolumeWithCp(
   sourceVolume: string,
   targetVolume: string,
-  options: {
-    onProgress?: (progress: VolumeCopyProgress) => void
-    clearTarget?: boolean
-    repoLabel?: string
-  } = {}
+  options: OwnedVolumeCopyOptions & { clearTarget?: boolean },
+  targetLease: TargetVolumeLease
 ): Promise<void> {
+  if (!options?.ownership) {
+    throw new Error("Volume copy requires repo/project/branch ownership metadata")
+  }
   const { onProgress, clearTarget = false } = options
-  // idempotent: 既存なら no-op で成功。失敗は本当のエラーなので伝播させる。
-  createVolume(targetVolume, "local", repoLabelArg(options.repoLabel))
+  assertTargetLeaseStillValid(targetLease)
 
   const totalBytes = getVolumeSize(sourceVolume) ?? 0
 
@@ -417,6 +1401,136 @@ export async function copyVolumeWithCp(
   }
 }
 
+export type TargetVolumePreparationState = "missing" | "owned" | "recreated-empty"
+
+export interface TargetVolumePreflight {
+  state: TargetVolumePreparationState
+  /** Strictly measured bytes. Missing/recreated-empty targets report zero. */
+  size: number
+}
+
+/**
+ * Inspect and, only for an empty unused unmanaged target, prepare a destination before planning.
+ * This deliberately does not authorize overwriting an owned volume with data; callers use the
+ * returned size to classify it as skip/overwrite. `prepareTargetVolumeForCopy` applies that final
+ * authorization immediately before I/O as a TOCTOU safety net.
+ */
+export function preflightTargetVolumeForCopy(
+  targetVolume: string,
+  ownership: VolumeOwnership
+): TargetVolumePreflight {
+  assertNoUnresolvedTargetVolumeLease(targetVolume)
+  if (!volumeExistsOrThrow(targetVolume)) return { state: "missing", size: 0 }
+
+  const activeHolders = getContainersUsingVolumeOrThrow(targetVolume)
+  if (activeHolders.length > 0) {
+    throw new Error(
+      `Target volume '${targetVolume}' is in use by ${activeHolders.join(", ")} — refusing to copy into a live target`
+    )
+  }
+
+  // Validate the storage backend before mounting it for a size probe. A local volume with
+  // driver_opts can be a host bind mount, and a non-local driver can have arbitrary destructive
+  // semantics; neither may be adopted, written, or removed by wtb even when labels match.
+  const actual = inspectVolumeOwnership(targetVolume)
+  const size = getVolumeSize(targetVolume)
+  if (size === null) {
+    throw new Error(
+      `Cannot determine size of existing target volume '${targetVolume}' — refusing to overwrite`
+    )
+  }
+
+  if (!actual.managed) {
+    if (size > 0) {
+      throw new Error(
+        `Target volume '${targetVolume}' has data but is not wtb-managed — refusing to overwrite even with force`
+      )
+    }
+    removeVolumeOrThrow(targetVolume)
+    if (volumeExistsOrThrow(targetVolume)) {
+      throw new Error(`Could not remove empty unmanaged target volume '${targetVolume}'`)
+    }
+    return { state: "recreated-empty", size: 0 }
+  }
+
+  if (actual.temp || !volumeOwnershipMatches(actual, ownership)) {
+    const owner = `${actual.repo ?? "?"}/${actual.project ?? "?"}/${actual.branch ?? "?"}`
+    throw new Error(
+      `Target volume '${targetVolume}' is owned by another wtb target (${owner}) — refusing to overwrite`
+    )
+  }
+
+  return { state: "owned", size }
+}
+
+/**
+ * 所有者情報付きコピーの直前に既存 target を再検査する (TOCTOU safety net)。
+ *
+ * - データ入りの unmanaged/foreign volume は force 相当の clearTarget でも拒否
+ * - 空の unmanaged volume だけは、未使用を strict に確認して削除し、後続 create で
+ *   正しいラベル付き volume として作り直す
+ * - managed volume は repo/project/branch の完全一致を必須にする
+ */
+export function prepareTargetVolumeForCopy(
+  targetVolume: string,
+  ownership: VolumeOwnership,
+  options: { allowOverwrite: boolean }
+): TargetVolumePreparationState {
+  const preflight = preflightTargetVolumeForCopy(targetVolume, ownership)
+  if (preflight.size > 0 && !options.allowOverwrite) {
+    throw new Error(
+      `Target volume '${targetVolume}' already contains data — explicit overwrite was not authorized`
+    )
+  }
+  return preflight.state
+}
+
+async function persistIncompleteFreshCopyRecord(
+  sourceVolume: string,
+  targetVolume: string,
+  ownership: VolumeOwnership,
+  recoveryDirectory: string | undefined,
+  stagedBytes: number
+): Promise<StoredVolumeRecoveryRecord> {
+  if (!recoveryDirectory) {
+    throw new Error(
+      `Cannot persist incomplete-copy recovery marker for '${targetVolume}' because no recoveryDirectory was provided`
+    )
+  }
+  const commonGitDir = commonGitDirectoryFromRecoveryDirectory(recoveryDirectory)
+  const releaseRepositoryLock = await acquireRepositoryLock(commonGitDir)
+  try {
+    const id = makeRecoveryId()
+    const markerVolume = `${targetVolume}__wtbincomplete_${id}`
+    createVolume(markerVolume, "local", buildWtbVolumeLabels(ownership, { temp: true }))
+    assertVolumeOwnedBy(markerVolume, ownership, { temp: true })
+    const record: VolumeRecoveryRecord = {
+      version: 1,
+      kind: "incomplete-fresh-copy",
+      id,
+      createdAt: new Date().toISOString(),
+      sourceVolume,
+      targetVolume,
+      // A separate empty temp marker lets `prune --yes --discard-recovery` discard the record
+      // using its existing exact temp-ownership guard. The partial target itself remains pinned
+      // by the running deterministic lease until an operator resolves it.
+      tempVolume: markerVolume,
+      sourceBytes: getVolumeSize(sourceVolume) ?? 0,
+      stagedBytes,
+      ownership,
+    }
+    const expectedPath = path.join(recoveryDirectory, `${id}.json`)
+    try {
+      return writeVolumeRecoveryRecord(recoveryDirectory, record)
+    } catch (error) {
+      if (!existsSync(expectedPath)) removeVolume(markerVolume)
+      throw error
+    }
+  } finally {
+    await releaseRepositoryLock()
+  }
+}
+
 /**
  * 最適な方法でボリュームをコピー
  * rsyncが利用可能な場合はrsyncを使用、そうでなければcpを使用
@@ -431,32 +1545,144 @@ export async function copyVolumeWithCp(
 export async function copyVolume(
   sourceVolume: string,
   targetVolume: string,
-  options: VolumeCopyOptions & { clearTarget?: boolean } = {}
+  options: OwnedVolumeCopyOptions & { clearTarget?: boolean }
 ): Promise<void> {
-  // 既存データの上書き (clearTarget=true) は破壊的なので atomic 経路を使う。
-  // 「先に target を消してからコピー」だとコピー途中で失敗したとき target が空に
-  // なって復旧不能になるため、完全な staged コピーが出来てから初めて target を
-  // 置換する。
-  if (options.clearTarget === true) {
-    return copyVolumeAtomicOverwrite(sourceVolume, targetVolume, options)
+  assertValidVolumeName(sourceVolume)
+  assertValidVolumeName(targetVolume)
+  if (sourceVolume === targetVolume) {
+    throw new Error(`Refusing to copy Docker volume '${sourceVolume}' onto itself`)
   }
 
+  if (!options?.ownership) {
+    throw new Error("Volume copy requires repo/project/branch ownership metadata")
+  }
+  if (options.clearTarget === true && !options.recoveryDirectory) {
+    throw new Error(
+      "Destructive volume overwrite requires ownership and recoveryDirectory metadata"
+    )
+  }
+
+  const sourceLease = acquireSourceVolumeLease(sourceVolume)
+  let targetLease: TargetVolumeLease | undefined
+  let operationError: unknown
+  let targetWasFresh = false
+  let transferAttempted = false
+  let preserveTargetLease = false
   try {
-    await copyVolumeWithRsync(sourceVolume, targetVolume, {
-      ...options,
-      incremental: options.incremental,
+    const targetPreflight = preflightTargetVolumeForCopy(targetVolume, options.ownership)
+    if (targetPreflight.size > 0 && options.clearTarget !== true) {
+      throw new Error(
+        `Target volume '${targetVolume}' already contains data — explicit overwrite was not authorized`
+      )
+    }
+    targetWasFresh = options.clearTarget !== true && targetPreflight.size === 0
+    // A missing/recreated-empty target must exist with the expected labels before it can be
+    // leased. `volume create` is idempotent; acquireTargetVolumeLease rejects a concurrent
+    // foreign replacement by comparing strict ownership and full inspect snapshots.
+    createVolume(targetVolume, "local", volumeLabelArgs(options))
+    targetLease = acquireTargetVolumeLease(targetVolume, options.ownership, {
+      temp: options.tempVolume === true,
     })
+
+    // 既存データの上書き (clearTarget=true) は破壊的なので atomic 経路を使う。
+    if (options.clearTarget === true) {
+      await copyVolumeAtomicOverwrite(sourceVolume, targetVolume, options, targetLease)
+    } else {
+      transferAttempted = true
+      try {
+        await copyVolumeWithRsync(sourceVolume, targetVolume, {
+          ...options,
+          incremental: options.incremental,
+        }, targetLease)
+      } catch (error) {
+        console.warn("rsync copy failed, falling back to cp:", error)
+        // rsync may have left a partial fresh target; restart the fallback from empty.
+        try {
+          await copyVolumeWithCp(sourceVolume, targetVolume, {
+            ...options,
+            clearTarget: true,
+          }, targetLease)
+        } catch (fallbackError) {
+          throw new Error(
+            `rsync copy failed (${error instanceof Error ? error.message : String(error)}); cp fallback failed (${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)})`
+          )
+        }
+      }
+    }
   } catch (error) {
-    console.warn("rsync copy failed, falling back to cp:", error)
-    // rsync は途中まで書き込んでから失敗している可能性があり、target に中途半端な
-    // ツリーが残る。cp フォールバックはこの非 clearTarget 経路では常に fresh/空の
-    // target に対して呼ばれる (既存データの上書きは atomic 経路へ分岐済み) ので、
-    // rsync の部分出力を捨てて clean な状態からコピーし直す。これで rsync の
-    // --delete (incremental) 相当の置換セマンティクスをフォールバックでも保つ。
-    await copyVolumeWithCp(sourceVolume, targetVolume, {
-      onProgress: options.onProgress,
-      clearTarget: true,
-    })
+    operationError = error
+    if (targetLease && targetWasFresh && transferAttempted && options.clearTarget !== true) {
+      try {
+        // Keep the exact target pinned while removing any partial rsync/cp tree. Only a strict
+        // zero-byte re-probe turns it back into a reusable fresh target.
+        assertTargetLeaseStillValid(targetLease)
+        clearVolume(targetVolume)
+        assertTargetLeaseStillValid(targetLease)
+        const remainingBytes = getVolumeSize(targetVolume)
+        if (remainingBytes === null || remainingBytes !== 0) {
+          throw new Error(
+            remainingBytes === null
+              ? `Cannot verify cleanup of incomplete fresh target '${targetVolume}'`
+              : `Incomplete fresh target '${targetVolume}' still contains ${remainingBytes} bytes after cleanup`
+          )
+        }
+      } catch (cleanupError) {
+        preserveTargetLease = true
+        const stagedBytes = getVolumeSize(targetVolume) ?? 0
+        let marker: StoredVolumeRecoveryRecord | undefined
+        let markerError: unknown
+        try {
+          marker = await persistIncompleteFreshCopyRecord(
+            sourceVolume,
+            targetVolume,
+            options.ownership,
+            options.recoveryDirectory,
+            stagedBytes
+          )
+        } catch (error) {
+          markerError = error
+        }
+        const primaryMessage =
+          operationError instanceof Error ? operationError.message : String(operationError)
+        const cleanupMessage =
+          cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+        operationError = new AggregateError(
+          [operationError, cleanupError, ...(markerError === undefined ? [] : [markerError])],
+          marker
+            ? `Fresh volume copy failed (${primaryMessage}) and partial target cleanup failed (${cleanupMessage}). Recovery marker '${marker.path}' and running lease '${targetLease.containerName}' were preserved; resolve both before retrying`
+            : `Fresh volume copy failed (${primaryMessage}) and partial target cleanup failed (${cleanupMessage}). Running lease '${targetLease.containerName}' was preserved because a recovery marker could not be persisted; resolve it manually before retrying`
+        )
+      }
+    }
+  }
+
+  const cleanupErrors: Array<{ lease: "target" | "source"; error: unknown }> = []
+  if (targetLease && !preserveTargetLease) {
+    try {
+      releaseVolumeLease(targetLease)
+    } catch (error) {
+      cleanupErrors.push({ lease: "target", error })
+    }
+  }
+  try {
+    releaseVolumeLease(sourceLease)
+  } catch (error) {
+    cleanupErrors.push({ lease: "source", error })
+  }
+
+  if (operationError !== undefined) {
+    for (const cleanup of cleanupErrors) {
+      console.warn(`Failed to release ${cleanup.lease} volume lease:`, cleanup.error)
+    }
+    throw operationError
+  }
+  if (cleanupErrors.length === 1) throw cleanupErrors[0].error
+  if (cleanupErrors.length > 1) {
+    throw new Error(
+      `Failed to release target and source volume leases: ${cleanupErrors
+        .map(({ lease, error }) => `${lease}: ${error instanceof Error ? error.message : String(error)}`)
+        .join("; ")}`
+    )
   }
 }
 
@@ -477,14 +1703,25 @@ export async function copyVolume(
 async function copyVolumeAtomicOverwrite(
   sourceVolume: string,
   targetVolume: string,
-  options: VolumeCopyOptions
+  options: OwnedVolumeCopyOptions,
+  targetLease: TargetVolumeLease
 ): Promise<void> {
+  if (!options.recoveryDirectory) {
+    throw new Error(
+      "Destructive volume overwrite requires ownership and recoveryDirectory metadata"
+    )
+  }
+  const recoveryId = makeRecoveryId()
   const tmp = makeTempVolumeName(targetVolume)
   // commit (target の clear+refill) が始まったか / 完了したか。commit が始まった後に
   // 失敗した場合は target が空/中途半端で、検証済みの完全なコピーは tmp にしか無い。
   // この時 tmp を消すと唯一の正データを失うため、cleanup では tmp を残して復旧手順を出す。
   let commitStarted = false
   let commitDone = false
+  let storedRecovery: StoredVolumeRecoveryRecord | undefined
+  let stagedLease: SourceVolumeLease | undefined
+  let releaseRepositoryLock: ReleaseRepositoryLock | undefined
+  let operationError: unknown
 
   // mid-commit で失敗/中断した場合の復旧案内。SIGINT が finally をバイパスするため、
   // 通常の finally からも prepend した signal handler からも同じ文言を出せるよう関数化する。
@@ -502,11 +1739,14 @@ async function copyVolumeAtomicOverwrite(
   let onAbort: (() => void) | undefined
 
   try {
-    createVolume(tmp, "local", repoLabelArg(options.repoLabel))
     // 1. stage
     await copyVolume(sourceVolume, tmp, {
       onProgress: options.onProgress,
-      repoLabel: options.repoLabel,
+      incremental: options.incremental,
+      compress: options.compress,
+      ownership: options.ownership,
+      recoveryDirectory: options.recoveryDirectory,
+      tempVolume: true,
     })
     // 2. verify — この gate だけが破壊的な commit を守る。サイズを確定できない
     //    (getVolumeSize が null) 場合は「空かもしれない」を「空でない」と誤認して
@@ -518,30 +1758,180 @@ async function copyVolumeAtomicOverwrite(
         `Cannot verify staged copy of '${sourceVolume}' (volume size probe failed) — aborting overwrite to protect '${targetVolume}'`
       )
     }
-    if (sourceSize > 0 && stagedSize === 0) {
+    if (sourceSize !== stagedSize) {
       throw new Error(
-        `Staged copy of '${sourceVolume}' is empty — aborting overwrite to protect '${targetVolume}'`
+        `Staged copy size mismatch for '${sourceVolume}' (source=${sourceSize}, staged=${stagedSize}) — aborting overwrite to protect '${targetVolume}'`
       )
     }
-    // 3. commit (target を消すのはここが初めて)。この窓の間は SIGINT でも復旧案内を出す。
+    // Staging can be slow, so it deliberately happens without the repository lock. Only the
+    // publication -> destructive commit -> verification -> record/temp cleanup window must be
+    // serialized with `prune --yes`. The supported recovery path uniquely identifies the common
+    // Git directory and therefore the same lock used by prune/create.
+    const commonGitDir = commonGitDirectoryFromRecoveryDirectory(options.recoveryDirectory)
+    releaseRepositoryLock = await acquireRepositoryLock(commonGitDir)
+
+    // Revalidate both sides after acquiring the repository lock. The stopped target lease has
+    // pinned the exact target volume throughout staging; checking its snapshot and running users
+    // here prevents a stale pre-lock decision from entering the destructive window.
+    const activeTargetHolders = getRunningVolumeHoldersOrThrow(targetVolume).filter(
+      (holder) => holder.id !== targetLease.containerId
+    )
+    if (activeTargetHolders.length > 0) {
+      throw new Error(
+        `Target volume '${targetVolume}' is in use by ${activeTargetHolders.map((holder) => holder.name).join(", ")} — refusing to enter the atomic commit window`
+      )
+    }
+    assertTargetLeaseStillValid(targetLease)
+
+    const stagedOwnership = inspectVolumeOwnership(tmp)
+    if (
+      !stagedOwnership.temp ||
+      !volumeOwnershipMatches(stagedOwnership, options.ownership)
+    ) {
+      throw new Error(
+        `Staged volume '${tmp}' lost its expected temporary ownership before commit — refusing to overwrite '${targetVolume}'`
+      )
+    }
+    const activeStagedHolders = getContainersUsingVolumeOrThrow(tmp)
+    if (activeStagedHolders.length > 0) {
+      throw new Error(
+        `Staged volume '${tmp}' is unexpectedly in use by ${activeStagedHolders.join(", ")} — refusing to overwrite '${targetVolume}'`
+      )
+    }
+    stagedLease = acquireSourceVolumeLease(tmp)
+
+    // Re-probe after the lock (and after pinning the staged volume). A prune that completed just
+    // before our lock acquisition, or an external replacement, must not let pre-lock byte counts
+    // authorize target deletion.
+    const lockedSourceSize = getVolumeSize(sourceVolume)
+    const lockedStagedSize = getVolumeSize(tmp)
+    if (lockedSourceSize === null || lockedStagedSize === null) {
+      throw new Error(
+        `Cannot revalidate staged copy of '${sourceVolume}' after acquiring the repository lock — aborting overwrite to protect '${targetVolume}'`
+      )
+    }
+    if (lockedSourceSize !== lockedStagedSize) {
+      throw new Error(
+        `Staged copy changed before commit for '${sourceVolume}' (source=${lockedSourceSize}, staged=${lockedStagedSize}) — aborting overwrite to protect '${targetVolume}'`
+      )
+    }
+
+    // 3. destructive commit の直前に、検証済み temp から戻せる永続 record を common
+    //    Git directory 配下へ原子的に保存する。record 公開前には target を一切触らない。
+    const recoveryRecord: VolumeRecoveryRecord = {
+      version: 1,
+      kind: "atomic-overwrite",
+      id: recoveryId,
+      createdAt: new Date().toISOString(),
+      sourceVolume,
+      targetVolume,
+      tempVolume: tmp,
+      sourceBytes: lockedSourceSize,
+      stagedBytes: lockedStagedSize,
+      ownership: options.ownership,
+    }
+    const expectedRecoveryPath = path.join(options.recoveryDirectory, `${recoveryId}.json`)
+    try {
+      storedRecovery = writeVolumeRecoveryRecord(options.recoveryDirectory, recoveryRecord)
+    } catch (error) {
+      // rename 後の directory fsync だけが失敗した場合、record は既に可視になっている。
+      // その時は temp を削除せず、record が指す復旧データを必ず残す。
+      if (existsSync(expectedRecoveryPath)) {
+        storedRecovery = { path: expectedRecoveryPath, record: recoveryRecord }
+      }
+      throw error
+    }
+
+    // 4. commit (target を消すのはここが初めて)。この窓の間は SIGINT でも復旧案内を出す。
     onAbort = () => printRecovery()
     for (const sig of abortSignals) process.prependListener(sig, onAbort)
     commitStarted = true
-    await copyVolumeWithCp(tmp, targetVolume, { clearTarget: true, repoLabel: options.repoLabel })
+    await copyVolumeWithCp(
+      tmp,
+      targetVolume,
+      {
+        clearTarget: true,
+        ownership: options.ownership,
+      },
+      targetLease
+    )
+    const committedSize = getVolumeSize(targetVolume)
+    const verifiedStagedSize = getVolumeSize(tmp)
+    if (
+      committedSize === null ||
+      verifiedStagedSize === null ||
+      committedSize !== verifiedStagedSize
+    ) {
+      throw new Error(
+        `Committed volume size mismatch for '${targetVolume}' (target=${committedSize ?? "unknown"}, staged=${verifiedStagedSize ?? "unknown"}) — preserving recovery data`
+      )
+    }
     commitDone = true
+    // target の refill が完了した後だけ record を消す。ここが失敗したら record と temp を
+    // 保持し、prune が誤削除できない状態のまま呼び出し側へエラーを返す。
+    removeVolumeRecoveryRecord(storedRecovery.path)
+    storedRecovery = undefined
+  } catch (error) {
+    operationError = error
   } finally {
     if (onAbort) {
       for (const sig of abortSignals) process.removeListener(sig, onAbort)
     }
-    // 4. cleanup。commit 開始後に失敗した場合だけは tmp を残す (target が壊れていて
+
+    const cleanupErrors: Array<{ action: string; error: unknown }> = []
+    if (stagedLease) {
+      try {
+        releaseVolumeLease(stagedLease)
+      } catch (error) {
+        cleanupErrors.push({ action: "release staged volume lease", error })
+      }
+    }
+    // 5. cleanup。commit 開始後に失敗した場合だけは tmp を残す (target が壊れていて
     //    tmp が唯一の完全コピーのため)。それ以外 (staging/verify 失敗 = target 無傷、
     //    または commit 成功) では tmp は不要なので削除する。
     if (commitStarted && !commitDone) {
       printRecovery()
+    } else if (storedRecovery) {
+      // record が可視な状態では、それが指す temp を必ず残す。
+      out(
+        commitDone
+          ? `  ⚠️  Volume data was copied, but recovery record cleanup failed; preserving '${tmp}' for safety.`
+          : `  ⚠️  Recovery record persistence was incomplete; preserving staged volume '${tmp}' for safety.`
+      )
     } else {
       removeVolume(tmp)
     }
+
+    // Temp cleanup is part of the critical window: only now may destructive prune observe the
+    // repository again. A release failure is surfaced on an otherwise-successful copy, while an
+    // existing copy error remains the primary error.
+    if (releaseRepositoryLock) {
+      try {
+        await releaseRepositoryLock()
+      } catch (error) {
+        cleanupErrors.push({ action: "release repository lock", error })
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      if (operationError !== undefined) {
+        for (const cleanup of cleanupErrors) {
+          console.warn(`Failed to ${cleanup.action}:`, cleanup.error)
+        }
+      } else if (cleanupErrors.length === 1) {
+        operationError = cleanupErrors[0].error
+      } else {
+        operationError = new Error(
+          `Volume overwrite cleanup failed: ${cleanupErrors
+            .map(
+              ({ action, error }) =>
+                `${action}: ${error instanceof Error ? error.message : String(error)}`
+            )
+            .join("; ")}`
+        )
+      }
+    }
   }
+  if (operationError !== undefined) throw operationError
 }
 
 /**
@@ -751,6 +2141,36 @@ export function getContainersUsingVolumeWithProject(
   } catch {
     return []
   }
+}
+
+/** Strict variant used before copy/stop decisions; Docker errors are never treated as no holders. */
+export function getContainersUsingVolumeWithProjectOrThrow(
+  volumeName: string
+): Array<{ name: string; project: string | null }> {
+  assertValidVolumeName(volumeName)
+  const output = execDockerSafe(
+    [
+      "ps",
+      "--filter",
+      `volume=${volumeName}`,
+      "--format",
+      '{{.Names}}\t{{.Label "com.docker.compose.project"}}',
+    ],
+    {}
+  )
+  if (!output) return []
+  return output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const tabIndex = line.indexOf("\t")
+      if (tabIndex < 0) return { name: line, project: null }
+      const name = line.slice(0, tabIndex).trim()
+      const project = line.slice(tabIndex + 1).trim()
+      return { name, project: project || null }
+    })
+    .filter((entry) => entry.name.length > 0)
 }
 
 /**

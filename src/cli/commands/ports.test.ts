@@ -79,7 +79,11 @@ describe("ports command surface", () => {
   beforeEach(() => {
     writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
     consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
-    vi.mocked(repositoryModule.getGitRootOrThrow).mockReturnValue("/repo")
+    vi.mocked(repositoryModule.getRepositoryContext).mockReturnValue({
+      currentRoot: "/repo",
+      mainRoot: "/repo",
+      commonGitDir: "/repo/.git",
+    })
     vi.mocked(loaderModule.loadConfig).mockReturnValue(cfg())
     vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
       { path: "/repo", branch: "main", head: "abc" },
@@ -128,6 +132,20 @@ describe("ports command surface", () => {
     const parsed = JSON.parse(output)
     expect(parsed.branch).toBe("feature/x")
     expect(parsed.path).toBe("/repo/wt")
+  })
+
+  it("uses repository context to select the current linked worktree", async () => {
+    vi.mocked(repositoryModule.getRepositoryContext).mockReturnValue({
+      currentRoot: "/repo/wt",
+      mainRoot: "/repo",
+      commonGitDir: "/repo/.git",
+    })
+
+    await portsCommand().parseAsync([], { from: "user" })
+
+    const parsed = JSON.parse(writeSpy.mock.calls.map((c) => c[0]).join(""))
+    expect(parsed.branch).toBe("feature/x")
+    expect(loaderModule.loadConfig).toHaveBeenCalledWith("/repo")
   })
 
   it("exits GENERAL_ERROR and lists worktrees on stderr for an unknown branch", async () => {

@@ -36,18 +36,6 @@ function execDockerCommand(command: string, options?: ExecOptions): string {
 }
 
 /**
- * Docker のコンテナ ID / 名前として妥当な形式か検証する。
- * docker の命名規則は `[a-zA-Z0-9][a-zA-Z0-9_.-]*`、ID は 16 進数。シェルメタ文字は
- * 入り得ないが、`{containerId}` を文字列置換してシェル経由(execSync)に渡している以上、
- * 防御的に検証してインジェクション経路を断つ。
- */
-const CONTAINER_REF_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/
-
-function isValidContainerRef(ref: string): boolean {
-  return typeof ref === "string" && ref.length > 0 && CONTAINER_REF_PATTERN.test(ref)
-}
-
-/**
  * 実行中のDockerコンテナ一覧を取得
  *
  * @param options - 実行オプション
@@ -63,8 +51,7 @@ function isValidContainerRef(ref: string): boolean {
  */
 export function getRunningContainers(options?: ExecOptions): ContainerInfo[] {
   try {
-    const output = execDockerCommand(DOCKER_COMMANDS.CONTAINERS, options)
-    return parseContainerList(output)
+    return getRunningContainersOrThrow(options)
   } catch (error) {
     console.warn(
       "Failed to get running containers:",
@@ -72,6 +59,11 @@ export function getRunningContainers(options?: ExecOptions): ContainerInfo[] {
     )
     return []
   }
+}
+
+/** Strict variant for allocation/destructive callers that must not treat daemon failure as empty. */
+export function getRunningContainersOrThrow(options?: ExecOptions): ContainerInfo[] {
+  return parseContainerList(execDockerCommand(DOCKER_COMMANDS.CONTAINERS, options))
 }
 
 /**
@@ -109,83 +101,9 @@ function parseContainerList(output: string): ContainerInfo[] {
         .split(",")
         .map((p) => p.trim())
         .filter((p) => p.length > 0),
-      volumes: [] as string[], // 後で個別に取得
-      networks: [] as string[], // 後で個別に取得
     })
   }
   return containers
-}
-
-/**
- * 指定されたコンテナのボリュームマウント情報を取得
- *
- * @param containerId - コンテナID
- * @param options - 実行オプション
- * @returns ボリュームマウント情報の配列
- *
- * @example
- * ```typescript
- * const volumes = getContainerVolumes('abc123')
- * volumes.forEach(volume => {
- *   console.log(`Volume: ${volume}`)
- * })
- * ```
- */
-export function getContainerVolumes(containerId: string, options?: ExecOptions): string[] {
-  if (!isValidContainerRef(containerId)) {
-    console.warn(`Refusing to inspect container with invalid id/name: ${containerId}`)
-    return []
-  }
-  try {
-    const command = DOCKER_COMMANDS.CONTAINER_VOLUMES.replace("{containerId}", containerId)
-    const output = execDockerCommand(command, options)
-    return output
-      .split(",")
-      .map((v) => v.trim())
-      .filter((v) => v.length > 0 && v !== "<no value>")
-  } catch (error) {
-    console.warn(
-      `Failed to get volumes for container ${containerId}:`,
-      error instanceof Error ? error.message : String(error)
-    )
-    return []
-  }
-}
-
-/**
- * 指定されたコンテナのネットワーク情報を取得
- *
- * @param containerId - コンテナID
- * @param options - 実行オプション
- * @returns ネットワーク名の配列
- *
- * @example
- * ```typescript
- * const networks = getContainerNetworks('abc123')
- * networks.forEach(network => {
- *   console.log(`Network: ${network}`)
- * })
- * ```
- */
-export function getContainerNetworks(containerId: string, options?: ExecOptions): string[] {
-  if (!isValidContainerRef(containerId)) {
-    console.warn(`Refusing to inspect container with invalid id/name: ${containerId}`)
-    return []
-  }
-  try {
-    const command = DOCKER_COMMANDS.CONTAINER_NETWORKS.replace("{containerId}", containerId)
-    const output = execDockerCommand(command, options)
-    return output
-      .split(",")
-      .map((n) => n.trim())
-      .filter((n) => n.length > 0)
-  } catch (error) {
-    console.warn(
-      `Failed to get networks for container ${containerId}:`,
-      error instanceof Error ? error.message : String(error)
-    )
-    return []
-  }
 }
 
 /**
@@ -225,21 +143,33 @@ export function getDockerVolumes(options?: ExecOptions): VolumeInfo[] {
  */
 export function getWtbManagedVolumeNames(repoLabel?: string, options?: ExecOptions): string[] {
   try {
-    // repoLabel が渡されたら `wtb.repo=<hash>` でも絞る。これで prune は自リポジトリの
-    // volume だけを候補にし、同一ホスト上の別リポジトリの現役 volume を巻き込まない。
-    // 値は repoVolumeLabel が返す hex のみ許可 (シェル文字列に埋めるため念のため検証)。
-    const command =
-      repoLabel && /^[a-f0-9]+$/.test(repoLabel)
-        ? `docker volume ls --filter label=wtb.managed=true --filter label=wtb.repo=${repoLabel} --format "{{.Name}}"`
-        : DOCKER_COMMANDS.MANAGED_VOLUMES
-    const output = execDockerCommand(command, options)
-    return output
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0)
+    return getWtbManagedVolumeNamesOrThrow(repoLabel, options)
   } catch {
     return []
   }
+}
+
+/**
+ * wtb 管理 volume を列挙し、Docker へ問い合わせできない場合は例外を伝播する。
+ *
+ * status のような表示系は上の best-effort API を使える一方、prune は問い合わせ失敗を
+ * 「volume が 0 件」と誤認して成功扱いにしてはならないため、この strict API を使う。
+ */
+export function getWtbManagedVolumeNamesOrThrow(
+  repoLabel?: string,
+  options?: ExecOptions
+): string[] {
+  // repoLabel が渡されたら `wtb.repo=<hash>` でも絞る。値は repoVolumeLabel が返す
+  // hex のみ許可し、shell 経由の既存 client 実装へ任意文字列を渡さない。
+  const command =
+    repoLabel && /^[a-f0-9]+$/.test(repoLabel)
+      ? `docker volume ls --filter label=wtb.managed=true --filter label=wtb.repo=${repoLabel} --format "{{.Name}}"`
+      : DOCKER_COMMANDS.MANAGED_VOLUMES
+  const output = execDockerCommand(command, options)
+  return output
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
 }
 
 /**
@@ -285,23 +215,55 @@ function parseVolumeList(output: string): VolumeInfo[] {
  * ```
  */
 export function getUsedPorts(options?: ExecOptions): number[] {
-  const containers = getRunningContainers(options)
-  const ports: number[] = []
+  return collectUsedPorts(getRunningContainers(options))
+}
+
+/** Strict published-port query used when assigning repository-wide ports. */
+export function getUsedPortsOrThrow(options?: ExecOptions): number[] {
+  return collectUsedPorts(getRunningContainersOrThrow(options))
+}
+
+function collectUsedPorts(containers: ContainerInfo[]): number[] {
+  const ports = new Set<number>()
 
   containers.forEach((container) => {
     container.ports.forEach((portMapping) => {
-      // ポートマッピングの形式: "0.0.0.0:3000->80/tcp" または "3000:80"
-      const match = portMapping.match(/(?:[\d.]+:)?(\d+)(?:->\d+(?:\/\w+)?)?/)
-      if (match) {
-        const port = parseInt(match[1], 10)
-        if (!Number.isNaN(port) && !ports.includes(port)) {
-          ports.push(port)
-        }
+      for (const port of publishedPortsFromDockerMapping(portMapping)) {
+        ports.add(port)
       }
     })
   })
 
-  return ports.sort((a, b) => a - b)
+  return [...ports].sort((a, b) => a - b)
+}
+
+/** Parse Docker's IPv4/IPv6 published side and expand host port ranges. */
+function publishedPortsFromDockerMapping(mapping: string): number[] {
+  const withoutProtocol = mapping.trim().replace(/\/[A-Za-z][A-Za-z0-9]*$/, "")
+  const arrow = withoutProtocol.indexOf("->")
+  let publishedSide: string
+  if (arrow >= 0) {
+    const left = withoutProtocol.slice(0, arrow)
+    if (left.startsWith("[")) {
+      const bracketSeparator = left.lastIndexOf("]:")
+      publishedSide = bracketSeparator >= 0 ? left.slice(bracketSeparator + 2) : left
+    } else {
+      const separator = left.lastIndexOf(":")
+      publishedSide = separator >= 0 ? left.slice(separator + 1) : left
+    }
+  } else {
+    // Preserve the historical conservative handling of unpublished ports and
+    // tolerate the old short `HOST:CONTAINER` shape.
+    const separator = withoutProtocol.lastIndexOf(":")
+    publishedSide = separator >= 0 ? withoutProtocol.slice(0, separator) : withoutProtocol
+  }
+
+  const match = publishedSide.match(/^(\d+)(?:-(\d+))?$/)
+  if (!match) return []
+  const start = Number.parseInt(match[1], 10)
+  const end = match[2] === undefined ? start : Number.parseInt(match[2], 10)
+  if (start < 1 || end < start || end > 65535) return []
+  return Array.from({ length: end - start + 1 }, (_, index) => start + index)
 }
 
 /**

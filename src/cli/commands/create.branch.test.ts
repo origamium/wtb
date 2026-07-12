@@ -27,6 +27,11 @@ describe("create command branch resolution", () => {
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {})
     command = createCommand()
     vi.mocked(repositoryModule.getGitRootOrThrow).mockReturnValue("/repo")
+    vi.mocked(repositoryModule.getRepositoryContext).mockReturnValue({
+      currentRoot: "/repo",
+      mainRoot: "/repo",
+      commonGitDir: "/repo/.git",
+    })
     vi.mocked(repositoryModule.branchExists).mockReturnValue(false)
     vi.mocked(repositoryModule.remoteBranchExists).mockReturnValue(false)
     vi.mocked(repositoryModule.revisionExists).mockReturnValue(true)
@@ -55,7 +60,12 @@ describe("create command branch resolution", () => {
     expect(worktreeModule.createWorktree).toHaveBeenCalledWith(
       "feature/x",
       expect.stringContaining("worktree-feature"),
-      { useExistingBranch: false, baseBranch: undefined, trackFrom: "origin/feature/x" }
+      {
+        useExistingBranch: false,
+        baseBranch: undefined,
+        trackFrom: "origin/feature/x",
+        cwd: "/repo",
+      }
     )
     expect(logged()).toContain("exists on origin — creating local tracking branch")
   })
@@ -66,7 +76,7 @@ describe("create command branch resolution", () => {
     expect(worktreeModule.createWorktree).toHaveBeenCalledWith(
       "feature/x",
       expect.stringContaining("worktree-feature"),
-      { useExistingBranch: false, baseBranch: "main", trackFrom: undefined }
+      { useExistingBranch: false, baseBranch: "main", trackFrom: undefined, cwd: "/repo" }
     )
     expect(logged()).toContain("Creating new branch")
   })
@@ -80,7 +90,7 @@ describe("create command branch resolution", () => {
 
     await expect(command.parseAsync(["feature/x"], { from: "user" })).rejects.toThrow("exited")
 
-    expect(repositoryModule.revisionExists).toHaveBeenCalledWith("main")
+    expect(repositoryModule.revisionExists).toHaveBeenCalledWith("main", "/repo")
     expect(worktreeModule.createWorktree).not.toHaveBeenCalled()
     expect(exitSpy).toHaveBeenCalledWith(1)
     expect(errorSpy).toHaveBeenCalledWith(
@@ -109,7 +119,7 @@ describe("create command branch resolution", () => {
     expect(worktreeModule.createWorktree).toHaveBeenCalledWith(
       "feature/x",
       expect.stringContaining("worktree-feature"),
-      { useExistingBranch: true, baseBranch: undefined, trackFrom: undefined }
+      { useExistingBranch: true, baseBranch: undefined, trackFrom: undefined, cwd: "/repo" }
     )
   })
 })

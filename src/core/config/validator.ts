@@ -7,6 +7,7 @@ import { existsSync } from "node:fs"
 import * as path from "node:path"
 import { ENV_VAR_PATTERNS } from "../../constants/index.js"
 import type { WtbConfig } from "../../types/index.js"
+import { validateConfiguredPaths } from "./paths.js"
 
 /**
  * バリデーションエラー情報
@@ -28,6 +29,18 @@ interface ValidationError {
 export function validateConfig(config: WtbConfig, configFile: string): void {
   const errors: ValidationError[] = []
   const configDir = path.dirname(configFile)
+  // `.wtb/config.{yaml,yml}` is a supported config location, but every path in
+  // the config is repository-relative (not relative to the `.wtb` directory).
+  const repositoryDir = path.basename(configDir) === ".wtb" ? path.dirname(configDir) : configDir
+  const pathIssues = validateConfiguredPaths(config)
+  const invalidPathFields = new Set(pathIssues.map((issue) => issue.field))
+  errors.push(
+    ...pathIssues.map((issue) => ({
+      message: issue.message,
+      field: issue.field,
+      severity: "error" as const,
+    }))
+  )
 
   // base_branchの検証
   if (!config.base_branch || typeof config.base_branch !== "string") {
@@ -49,8 +62,8 @@ export function validateConfig(config: WtbConfig, configFile: string): void {
         severity: "error",
       })
     } else {
-      const composePath = path.resolve(configDir, config.docker_compose_file)
-      if (!existsSync(composePath)) {
+      const composePath = path.resolve(repositoryDir, config.docker_compose_file)
+      if (!invalidPathFields.has("docker_compose_file") && !existsSync(composePath)) {
         errors.push({
           message: `docker_compose_file not found: ${config.docker_compose_file}`,
           field: "docker_compose_file",
@@ -144,8 +157,8 @@ export function validateConfig(config: WtbConfig, configFile: string): void {
             severity: "error",
           })
         } else {
-          const envPath = path.resolve(configDir, envFile)
-          if (!existsSync(envPath)) {
+          const envPath = path.resolve(repositoryDir, envFile)
+          if (!invalidPathFields.has(`env.file[${index}]`) && !existsSync(envPath)) {
             errors.push({
               message: `env.file not found: ${envFile}`,
               field: `env.file[${index}]`,

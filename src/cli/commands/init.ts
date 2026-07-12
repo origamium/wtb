@@ -11,7 +11,7 @@ import {
   getConfigFilePath,
   hasConfigFile,
 } from "../../core/config/loader.js"
-import { getGitRootOrThrow } from "../../core/git/repository.js"
+import { getMainWorktreeRoot } from "../../core/git/repository.js"
 import { CLIError } from "../../utils/error.js"
 import { execGitSafe } from "../../utils/exec.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
@@ -46,7 +46,7 @@ export function detectDefaultBranch(cwd?: string): string {
 }
 
 async function executeInitCommand(options: InitOptions): Promise<void> {
-  const gitRoot = getGitRootOrThrow()
+  const gitRoot = getMainWorktreeRoot()
 
   if (hasConfigFile(gitRoot) && options.force !== true) {
     const existing = findConfigFile(gitRoot).path

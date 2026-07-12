@@ -1,0 +1,24 @@
+# A stack with a FIXED identity — the shape the Supabase CLI generates:
+# top-level `name:`, per-service `container_name:`, and a literal host port.
+# Without rewriting, two checkouts of this file cannot `up` at the same time.
+name: acme
+
+services:
+  api:
+    image: nginx:alpine
+    container_name: acme_api
+    ports:
+      - "8080:80" # literal host port — remapped per worktree by wtb
+
+  db:
+    image: postgres:16-alpine
+    container_name: acme_db
+    environment:
+      POSTGRES_PASSWORD: dev-only-password
+    ports:
+      - "${DB_PORT:-54322}:5432" # default follows DB_PORT's bump via propagation
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+volumes:
+  db_data:

@@ -5,6 +5,7 @@
 
 // Configuration
 export * from "./config/loader.js"
+export * from "./config/paths.js"
 export * from "./config/validator.js"
 // Docker operations
 export * from "./docker/client.js"

@@ -23,6 +23,7 @@ Git worktree をベースにした CLI ツールで、ブランチごとに独�
   - [`create`](#wtb-create-branch)
   - [`remove`](#wtb-remove-branch)
   - [`reclone`](#wtb-reclone-branch)
+  - [`up` / `down`](#wtb-up-branch--wtb-down-branch)
   - [`prune`](#wtb-prune)
   - [`ls` / `list`](#wtb-ls-alias-list)
   - [`path`](#wtb-path-branch)
@@ -89,15 +90,17 @@ worktree-feature-auth/          ← `wtb create feature/auth` で作成
 
 `wtb create <branch>` は以下のフェーズを順に実行します:
 
-1. **Worktree** — `git worktree add` で `../worktree-<sanitized-branch>/`(または `-p <path>`)に作成。新規ブランチは `base_branch` を起点に切り出し(origin にだけ存在するブランチは `origin/<branch>` からローカルのトラッキングブランチを作成)。
-2. **ファイルコピー** — `copy_files`(gitignore された設定や秘密鍵など)をコピー。`link_files` にも含まれるパスはここでスキップ。
-3. **シンボリックリンク** — `link_files` のエントリをソースリポジトリへ symlink(既存のファイル/ディレクトリ/symlink は安全に置き換え)。
-4. **環境変数ファイル** — `env.file` をコピーし、`env.adjust` が空でなければポート風の値を他 worktree とぶつからない次の空きポートまでずらす。
-5. **Docker Compose** — `docker_compose_file` 設定があれば、稼働中コンテナを避けつつ host ポートを再マッピングして worktree に書き出し。
+1. **Worktree** — main worktree 基準の `../worktree-<sanitized-branch>/`(または `-p <path>`)へ `git worktree add`。新規ブランチは `base_branch` を起点に切り出し(origin にだけ存在するブランチは `origin/<branch>` からローカルのトラッキングブランチを作成)。
+2. **ファイルコピー** — main worktree の `copy_files`(gitignore された設定や秘密鍵など)をコピー。`link_files` にも含まれるパスはここでスキップ。
+3. **シンボリックリンク** — `link_files` のエントリを main worktree へ symlink(既存 target は一時 link/退避/rename で安全に置換)。
+4. **環境変数ファイル** — `env.file` をコピーし、Docker と全兄弟 worktree の env/Compose が共有する予約集合から空きポートを採番。
+5. **Docker Compose** — 対象 branch に checkout 済みの Compose を優先し、存在しない場合だけ main 版へフォールバック。host ポートを再マッピングして atomic に書き出し。
 6. **Volume クローン** — Compose の `volumes:` セクションに定義された non-`external` な named volume を、新 worktree の project に自動コピー。これで例えば PostgreSQL の中身がそのまま新 worktree でも使える。**ソーススタックが稼働中(ライブ DB では通常そう)なら、wtb が自動で stop → コピー → restart する**ので破損なく手動操作ゼロでクローンできる。`--no-stop` で稼働中 volume を skip する旧挙動に、`--force-volume-copy` でライブコピーに切り替えられる。詳細は [Volume の自動クローン](#volume-の自動クローン)。
 7. **Start command** — `start_command` 設定があれば、新しい worktree 内で `/bin/sh` 経由で実行。
 
 `wtb remove <branch>` は逆順で動作: `docker compose down`(`--remove-volumes` で `down -v`、`end_command` 未設定時) → `end_command` → `git worktree remove`。
+
+`create` / `remove` / `init` / `init-claude` / `prune` / `status` / `ports` / `doctor` は current worktree、main worktree、共通 Git directory を一つの repository context として解決します。linked worktree から実行しても main 設定・コピー元・既定作成先・repository identity は変わりません。並行 `create` は worktree/ファイル/ポート採番の間、repository lock で直列化されます。
 
 ## クイックスタート
 
@@ -203,7 +206,7 @@ wtb create bugfix/urgent-fix
 | `--force-volume-copy` | 稼働中コンテナや既存 target volume があってもクローンを試行（dev のみ・データ破損リスクあり） |
 | `--no-stop` | クローン前にソース Compose スタックを自動 stop せず、稼働中 volume を skip する（旧挙動） |
 | `--seed` | クローンの代わりに seed する: volume クローンフェーズをスキップし、新 worktree 内で `volumes.seed_command` を実行する。ソース volume に一切触れないためソーススタックは止めない。`volumes.seed_command` の設定が必須で、`--force-volume-copy` とは排他。詳細は [Volume の自動クローン](#volume-の自動クローン) |
-| `--strict` | volume クローンまたは seed コマンドが 1 つでも失敗したら非ゼロ (`1`) で終了する(既定は exit `0` — worktree は作成済み)。データ分離の不完全さを検知したい CI / コーディングエージェント向け。詳細は [Volume の自動クローン](#volume-の自動クローン) |
+| `--strict` | copy/link/env/Compose/start の setup、volume clone、seed のいずれかが失敗したら exit `1`。未指定時は worktree を保持して exit `0` だが成功バナーは出さず、JSON は `ok: false` |
 | `--exists-ok` | ブランチの worktree が既に存在する場合、exit `6` で失敗する代わりにパスを表示して exit `0` |
 | `--json` | 機械可読な JSON オブジェクトを stdout にちょうど 1 つ出力する。人間向けの進捗は stderr へ。下記参照 |
 | `--dry-run` | 実際の変更を行わず、実行内容をプレビュー |
@@ -244,18 +247,28 @@ wtb create release/v2.0 --no-create-branch
   "dryRun": false,
   "env": { "APP_PORT": { "from": "3000", "to": "3001" } },
   "composePorts": { "web": [{ "from": 3000, "to": 3001 }] },
-  "volumes": { "cloned": ["db_data"], "skipped": [], "failed": [] },
-  "sourceStack": { "stopped": true, "restarted": true },
+  "composeIdentity": { "projectName": { "from": "app", "to": "app-feature-auth" }, "containerNames": [] },
+  "composeValueChanges": [],
+  "volumes": {
+    "cloned": ["db_data"], "skipped": [], "failed": [],
+    "sourceStack": { "stopped": true, "restarted": true }
+  },
+  "sourceRestartFailed": false,
   "seed": null,
   "startCommand": { "ran": true, "failed": false },
+  "composeFailed": false,
+  "setupWarnings": [],
+  "setupFailures": [],
   "ok": true
 }
 ```
 
 - `volumes.skipped` の各要素は `{ name, reason }`、`volumes.failed` は `{ name, error }`。`seed` は `--seed` 使用時に `{ ran, failed }`、未使用なら `null`(`startCommand` も `start_command` 設定時に同じ形)。
-- `sourceStack` は `{ stopped, restarted, restartError?, recoverCommand? }` — クローンのためにソーススタックを止めた場合に現れます。`restarted` が `false` のときは `restartError`/`recoverCommand` がソーススタックの復旧方法を示し、コマンドは `--strict` の有無に関わらず exit `5`(Docker エラー)で終了します。
-- volume クローンまたは seed が失敗すると `ok` は `false`。`--strict --json` でもその失敗で exit `1` になります — JSON を書き切ってから exit code が設定されます。
-- 既存 worktree に対する `--exists-ok` では `{ branch, path, created: false, existing: true, createdBranch: false, dryRun, ok: true }` に縮小されます。
+- `volumes.sourceStack` は `{ stopped, restarted, stopError?, restartError?, recoverCommand? }` — クローンのためにソーススタックの停止を試みた場合に現れます。stop の失敗・timeout は部分停止の可能性があるため必ず復旧を試み、`stopped: false` と `stopError`、対象 volume の failure として記録します。復旧にも失敗した場合 (`restarted: false`) はトップレベルの `sourceRestartFailed` が `true` になり、`restartError`/`recoverCommand` が復旧方法を示し、コマンドは `--strict` の有無に関わらず exit `5`(Docker エラー)で終了します。
+- `setupWarnings` / `setupFailures` は `{ phase, path?, message }`。未存在の任意 `copy_files` / `link_files` は warning として skip し、実 I/O/setup エラーは failure です。
+- `composeFailed` は worktree ごとの compose 書き換えが throw した場合に `true`(その worktree の compose は分離されていません)。
+- setup/start、volume クローン、seed、Compose 書き換え、source restart のいずれかが失敗すると `ok: false`。`--strict --json` は JSON を書き切ってから exit `1`、source restart 失敗は exit `5` です。
+- 既存 worktree に対する `--exists-ok` では `{ branch, path, created: false, existing: true, createdBranch: false, dryRun, setupWarnings: [], setupFailures: [], ok: true }` に縮小されます。
 
 ### `wtb remove <branch>`
 
@@ -274,14 +287,17 @@ wtb remove feature/new-feature
 
 | オプション | 説明 |
 |-----------|------|
-| `-f, --force` | dirty チェックをスキップし、`git worktree remove` に `--force` を渡して強制削除(未コミットの変更は失われる) |
+| `-f, --force` | dirty チェックをスキップし、cleanup 失敗後も削除を続行。未コミット変更は失われ、cleanup 失敗の exit code / `ok: false` は維持される |
 | `--no-docker` | Docker Composeの停止をスキップ（`docker compose down`） |
 | `--no-end` | `end_command` の実行をスキップ |
-| `--remove-volumes` | この worktree の Docker volume も削除 (`docker compose down -v`)。teardown が省略されるケース（`--no-docker` 時、または `end_command` 設定時）では**効果なし**（wtb が警告を出す。`end_command` 側で volume を削除すること) |
+| `--remove-volumes` | この worktree の Docker volume も削除 (`docker compose down -v`)。teardown が省略されるケースでは**効果なし**（wtb が警告を出す）— `--no-docker` 時、`end_command` 設定時（`end_command` 側で volume を削除すること）、worktree 内に compose ファイルのコピーが無く `down -v` を実行できない場合、`docker_compose_file` がそもそも未設定の場合 |
+| `--json` | 機械可読な JSON オブジェクトを stdout に 1 つ出力する。人間向けの進捗は stderr へ。下記参照 |
 
 `-f` なしの場合、未コミット/未追跡の変更がある worktree は exit `1` で即座に失敗します(`Worktree for '<branch>' has uncommitted or untracked changes; commit/stash them or pass -f to force removal`)。このチェックは Docker teardown や volume 削除の**前**に走るため、失敗が確定している削除がサービス停止や volume 削除だけ先に実行してしまうことはありません。
 
-自動 teardown は設定された Compose ファイルを明示的に渡して実行します(`docker compose -f <docker_compose_file> down [-v]`)。`compose.dev.yml` のような非デフォルト名でも正しく停止されます。
+順序: Docker teardown → `end_command` → `git worktree remove`。`end_command` が設定されていれば teardown はあなたの責任とみなし、自動の `docker compose down` は意図的にスキップされます。自動 teardown は設定された Compose ファイル**と** worktree で解決された Compose project の両方を明示して実行します(`docker compose -f <docker_compose_file> -p <worktree-project> down [-v]`)。
+
+cleanup 完了前には worktree を削除しません。`docker compose down` / `end_command` の失敗、target Compose の欠落/読取不能、source と安全に区別できない project は worktree を保持して非ゼロ終了します。`--force` はその部分失敗を承知で削除を続けますが、Docker teardown 失敗は exit `5`、end/その他 cleanup 失敗は exit `1`、JSON は `ok: false` のままです。明示的な `--no-docker` / `--no-end` は成功した意図的 skip です。
 
 **使用例:**
 
@@ -293,6 +309,25 @@ wtb remove feature/old-branch --no-docker
 wtb remove feature/abandoned -f --no-end
 ```
 
+**JSON 出力(`--json`):** 未知 branch、main/locked worktree ガード、破損 manifest、dirty worktree などのハードエラーを含め、stdout に常にオブジェクトをちょうど 1 つ出力します。人間向け出力は stderr です。
+
+```json
+{
+  "branch": "feature/old",
+  "path": "/Users/me/worktree-feature-old",
+  "removed": true,
+  "forced": false,
+  "composeDown": { "ran": true, "failed": false, "volumesRemoved": false, "skippedReason": null },
+  "endCommand": null,
+  "cleanupErrors": [],
+  "ok": true
+}
+```
+
+- `composeDown` は `docker_compose_file` 未設定なら `null`。`"no-docker-flag"` / `"end-command"` は成功した skip、`"same-project"` / `"unresolvable-project"` / `"compose-file-missing"` は `failed: true` で通常 worktree を保持します。
+- `endCommand` は `end_command` 未設定なら `null`、設定時は `{ ran, failed }`(`--no-end` 時は `ran: false`)。
+- `cleanupErrors` が非空なら通常 `removed: false, ok: false`。`--force` 時だけ `removed: true, ok: false` になり、exit は非ゼロのままです。
+
 ### `wtb reclone [branch]`
 
 既存 worktree の **volume クローンフェーズだけ**を再実行します。クローンが失敗/skip された(volume が空/古い)ときに、worktree を作り直さずに(=未コミットの作業を失わずに)データを復旧できます。デフォルトは現在の worktree、branch 指定で別の worktree を対象にできます。
@@ -302,7 +337,7 @@ wtb remove feature/abandoned -f --no-end
 | `--force-volume-copy` | source 稼働中・target に既存データがあってもクローン(上書きは atomic) |
 | `--no-stop` | source Compose スタックを自動 stop せず、稼働中 volume を skip |
 | `--strict` | volume が 1 つでもクローン失敗したら非ゼロ (`1`) で終了(既定は exit `0`)。データ分離の不完全さを検知したい CI / コーディングエージェント向け |
-| `--json` | 機械可読な JSON オブジェクトを stdout に 1 つ出力(`{ branch, path, dryRun, volumes: { cloned, skipped, failed }, ok }` — volume ごとの形は `create --json` と同じ)。人間向けの進捗は stderr へ |
+| `--json` | 機械可読な JSON オブジェクトを stdout に 1 つ出力(`{ branch, path, dryRun, volumes: { cloned, skipped, failed, sourceStack? }, sourceRestartFailed, ok }` — volume ごとの形は `create --json` と同じで、クローンのためにソーススタックを止めた場合は `volumes.sourceStack` も含む)。人間向けの進捗は stderr へ |
 | `--dry-run` | クローン対象をプレビューし、変更しない |
 
 ```bash
@@ -311,24 +346,67 @@ wtb reclone feature/auth          # 特定の worktree
 wtb reclone feature/auth --force-volume-copy   # 古い target データを上書き
 ```
 
-`create` と同じ `N cloned, N skipped, N failed` サマリを出力します。既定では failure があっても exit `0` で、`⚠️  … data is NOT fully isolated` を明示します(解消して再実行。`--strict` を渡すと exit `1`)。`--json` では `ok: false` が失敗を示し、`--strict` でも JSON を書き切ってから exit `1` になります。main リポジトリ worktree は対象にできません(source と target が同一 project になるため)。`docker_compose_file` 未設定なら no-op(メッセージのみ)。再クローンではなく再 seed したい場合は worktree 内で `volumes.seed_command` を実行してください。
+`create` と同じ `N cloned, N skipped, N failed` サマリを出力します。既定では failure があっても exit `0` で、`⚠️  … data is NOT fully isolated` を明示します(解消して再実行。`--strict` を渡すと exit `1`)。`--json` では `ok: false` が失敗を示し、`--strict` でも JSON を書き切ってから exit `1` になります。ハードな失敗の契約も `create` と同じです: クローンのためにソーススタックを止めたのに **restart に失敗した** 場合、`reclone` は `--strict` の有無に関わらず exit `5`(Docker エラー)で終了します — トップレベルの `sourceRestartFailed: true` と `volumes.sourceStack` が詳細を持ち、復旧コマンドが出力されます。main リポジトリ worktree は対象にできません(source と target が同一 project になるため)。`docker_compose_file` 未設定なら no-op(メッセージのみ)。再クローンではなく再 seed したい場合は worktree 内で `volumes.seed_command` を実行してください。
+
+### `wtb up [branch]` / `wtb down [branch]`
+
+**既存の** worktree の Compose スタックを後から起動(`docker compose up -d`)/停止(`docker compose down`)します — worktree の作成・削除は一切伴いません。デフォルトは現在のディレクトリを含む worktree です。常に worktree 自身のファイルと project を明示し、シェルの `COMPOSE_PROJECT_NAME` は拒否します。安定した値が必要なら worktree の `.env` に設定してください。
+
+| オプション | 説明 |
+|-----------|------|
+| `--json` | 機械可読な JSON オブジェクトを stdout に 1 つ出力する。人間向けの進捗は stderr へ |
+| `--remove-volumes` | (`down` のみ) この worktree の Docker volume も削除 (`docker compose down -v`) |
+
+ガード — 以下はすべて **Docker を呼び出す前に** exit `1` で失敗します:
+
+- **worktree 専用。** main リポジトリ worktree への実行は拒否されます(ソースリポジトリでは直接 `docker compose up`/`down` を実行してください)。
+- compose ファイルは **worktree 内に** 存在しなければなりません — ソースリポジトリのコピーへのフォールバックはありません(それをやるとソースのリテラルなポートを worktree の project で `up` してしまうため)。
+- シェルの `COMPOSE_PROJECT_NAME` は拒否します。安定した `.env` / `name:` を使っても source や sibling と**同じ** project に解決される場合もハードに拒否します。
+- 対象 project が解決できない場合(compose が読めない)は拒否。未知のブランチは stderr に `Available worktrees:` を出します。
+
+**Exit code:** `docker_compose_file` が未設定なら `4`、Docker の project ownership 問い合わせまたは `docker compose up`/`down` が失敗したら `5`、設定・ownership 衝突ガードは `1`。
+
+**JSON 出力(`--json`):**
+
+```json
+{
+  "branch": "feature/auth",
+  "path": "/Users/me/worktree-feature-auth",
+  "composeFile": "/Users/me/worktree-feature-auth/docker-compose.yml",
+  "project": "app-feature-auth",
+  "action": "up",
+  "ok": true
+}
+```
+
+`down` では `"volumesRemoved": true|false` が加わります。`project` フィールドは、その worktree のスタックに対する以降のあらゆる Compose 操作へのハンドルです — `docker compose -p <project> logs -f`、`docker compose -p <project> exec db psql` など。
+
+`reclone` と組み合わせると、worktree も未コミットの作業も一切触らずにデータを完全リセットできます:
+
+```bash
+wtb down feature/auth --remove-volumes && wtb reclone feature/auth
+```
 
 ### `wtb prune`
 
-**孤児になった wtb 管理 Docker volume** — もう存在しない worktree 用に wtb がクローンした volume(`wtb remove` はデフォルトで volume を残すため)— と、中断された `--force-volume-copy` 上書きの**残骸 temp volume** を削除します。create/remove を繰り返すと溜まるので、その掃除用です。`wtb.managed=true` ラベル付き volume のみが対象で、このリポジトリの**どの worktree にも属さない** volume だけを削除します。
+**孤児になった wtb 管理 Docker volume** と、保護対象でない中断 overwrite の temp volume を削除します。新しい volume は `wtb.managed=true`、`wtb.repo=<repo-hash>`、`wtb.project=<compose-project>`、`wtb.branch=<branch>` を持ち、stage はさらに `wtb.temp=true` を持ちます。`prune` は repo で絞り、project または branch のどちらかが live worktree に残っていれば保守的に保持します（設定/project名やbranch名の変更直後にデータを消さないため）。両方とも live でない場合だけ孤児です。owner label の無い旧形式だけ project prefix へフォールバックし、repo label の無い旧 volume は候補になりません。
+
+破壊的 overwrite の commit 中断時には、共通 Git directory に recovery record と、唯一の検証済みコピーになりうる temp volume が残ります。これは通常の `prune --yes` では削除されず、`protected` として別表示されます。
 
 | オプション | 説明 |
 |-----------|------|
 | `-y, --yes` | 実際に削除する。**指定しなければ dry-run**(候補の表示のみ) |
-| `--json` | 機械可読出力: `{ dryRun, candidates, removed, failed }` — 各 candidate は `{ name, reason, inUse, inUseBy }` で、`inUseBy` はブロックしているコンテナ名の一覧。`removed`/`failed` は volume 名の配列 |
+| `--discard-recovery` | recovery-protected temp と record も破棄する。`--yes` 必須で、復旧不要と判断した場合だけ使用 |
+| `--json` | `{ dryRun, candidates, protected, removed, failed }`。`protected` は recovery temp volume 名の一覧 |
 
 ```bash
 wtb prune            # 削除対象をプレビュー(安全・何も消さない)
 wtb prune --yes      # 孤児 + 残骸 temp volume を削除
 wtb prune --json     # スクリプト/agent 向けの機械可読プレビュー
+wtb prune --yes --discard-recovery  # recovery data を明示的に破棄
 ```
 
-安全策: **デフォルトは dry-run**(削除は `--yes` 必須)、コンテナ使用中の volume はスキップ、worktree の volume は Compose プロジェクト名の前方一致(`<project>_…`)で厳密判定するため稼働中 worktree のデータは消しません。live 判定は `git worktree list`(このリポジトリ)に基づきます。
+安全策: **デフォルトは dry-run**、使用中 volume は skip、recovery 破棄は二重確認、削除直前に ownership label を再検証します。main 設定の正確な `docker_compose_file` を各 worktree に使い、設定/Compose/project/recovery record/Docker/worktree 列挙のどれかを解決できなければ、1 件も削除せず fail-closed します。
 
 `--yes` 指定時、volume の削除に 1 つでも失敗すると exit `5`(Docker エラー — 部分的な prune として扱うこと)になります。`--json` なしではエラーは stderr に `Error: Failed to remove N volume(s): <names>` として出ます。`--json` ありでは JSON ペイロード全体が stdout に書き出され(失敗した volume は `failed` に列挙)、その後に exit code が設定されるため JSON は壊れません。
 
@@ -432,7 +510,7 @@ wtb status
 | `--docker-only` | Docker関連の情報のみ表示 |
 | `--json` | 機械可読な JSON(worktree + Docker 状態)を stdout に出力 — スクリプト / agent 向け |
 
-`--json` は 1 つの構造化オブジェクト(`{ worktrees: [...], docker: {...} }`)を返し、Docker が止まっていても valid JSON のまま(`docker.available: false`)です。`docker.volumes.wtb` の各エントリには `labelled` boolean が付きます: `true` は `wtb.managed=true` ラベル付き(真のソース)、`false` はレガシーな `wtb`/`worktree` 名前ヒューリスティックでのみマッチしたもの — wtb 管理 volume として扱う前に `labelled` を確認してください。`wtb ls --json`、`wtb ports`(JSON がデフォルト)、`wtb create --json` / `wtb reclone --json` と合わせて、wtb の読み取りと変更操作の両方が機械可読になります。
+`--json` は 1 つの構造化オブジェクト(`{ worktrees: [...], docker: {...} }`)を返し、Docker が止まっていても valid JSON のまま(`docker.available: false`)です。`docker.volumes.wtb` の各エントリには `labelled` boolean が付きます: `true` は `wtb.managed=true` ラベル付き(真のソース)、`false` はレガシーな `wtb`/`worktree` 名前ヒューリスティックでのみマッチしたもの — wtb 管理 volume として扱う前に `labelled` を確認してください。`wtb ls --json`、`wtb ports`(JSON がデフォルト)、`create` / `remove` / `reclone` / `up` / `down` の `--json` と合わせて、wtb の読み取りと変更操作のすべてが機械可読になります。
 
 出力例:
 ```
@@ -466,7 +544,7 @@ wtb doctor --json | jq .   # 機械可読
 wtb doctor --strict        # CI ステップをクリーンなレポートでゲートする
 ```
 
-各 finding は `{ id, severity, message, suggestion }` で、`severity` は `info` / `warning` / `error`。finding id: `fixed-project-name`、`container-name`、`literal-env-port`、`literal-compose-port`、`unresolved-port-variable`、`compose-project-name-env`、`no-compose-file`。**該当する自動処理が有効なとき finding は `info` に格下げ** されます — project name / container name 系のチェックは identity rewrite(`compose.isolate_name`)、リテラルポートのチェックは port propagation(`env.port_propagation`)で、どちらもデフォルト ON。無効化していると `warning` になります。
+各 finding は `{ id, severity, message, suggestion?, service?, variable? }`(`service` はサービス単位のポート所見、`variable` は変数単位の env 所見に付く)で、`severity` は `info` / `warning` / `error`。finding id: `fixed-project-name`、`container-name`、`literal-env-port`、`literal-compose-port`、`unsupported-compose-port`(安全に採番できない range/形式)、`unresolved-port-variable`、`compose-project-name-env`、`compose-file-env`(シェルの `COMPOSE_FILE`)、`compose-override-file`(wtb が書き換えない隣接の `docker-compose.override.yml`)、`fixed-volume-name` / `fixed-network-name`(worktree 間で共有されてしまう non-external な `name:`)、`no-compose-file`。**該当する自動処理が実際に適用されるとき、finding は `info` に格下げ** されます。fixed-project-name のチェックでは identity rewrite(`compose.isolate_name`)、container-name のチェックでは container-name 書き換え(`compose.container_name` ≠ `keep`)がそれに当たります — どちらも **`docker_compose_file` が設定されている場合のみ** です。未設定なら wtb は compose ファイルを一切書き換えないためです。env 埋め込みのチェック(`literal-env-port`)はポート伝播(`env.port_propagation`)が有効かどうかだけでゲートされます — env ファイルは compose ファイルの設定有無に関係なく書き換えられるためです。リテラルな `HOST:CONTAINER` 形式の compose ポートは常に `warning` のままです(伝播が書き換えるのは `${VAR:-default}` 形式の host ポートだけ)。
 
 **Exit code:** デフォルトは **warning があっても exit `0`**(agent/CI フレンドリー — JSON の `ok` と `summary` が結果を持つので、ラッパー側で判断できる)。`--strict` を渡すと warning か error があるとき exit `1`。`--json` はちょうど 1 つの JSON オブジェクト(`{ composeFile, findings, summary: { info, warning, error }, ok }`)を stdout に出します。
 
@@ -497,6 +575,10 @@ wtb doctor --strict        # CI ステップをクリーンなレポートでゲ
 - `.wtb/config.yml`
 
 どれも見つからない場合でも wtb はデフォルト設定で動作します — stderr にデフォルトの内容(`base_branch: main`、`./.env` を無調整コピー、ポート remap なし)を明示した警告を出し、[`wtb init`](#wtb-init) での雛形生成を案内します。
+
+設定内の全ファイルパス(`docker_compose_file`、`copy_files`、`link_files`、`env.file`、`env.port_propagation.files`)は **main リポジトリルート相対**です。設定が `.wtb/` 配下でも基準は変わりません。絶対パス、`..`、`.`、`.git` 配下、正規化後の重複、nested link、`link_files` が他の書込先の親になる構成は exit `4` の設定エラーです。実 I/O 直前にも包含と symlink 祖先を再検査します。
+
+移行方法: `/home/me/project-local/.env` や `../shared/.env` のような参照は、ファイルを main worktree 内の gitignore 済みパス(例 `local/.env`)へ移し、`local/.env` を指定してください。repository 外を source にする symlink は意図的に非対応です。
 
 ### 基本設定
 
@@ -542,7 +624,7 @@ end_command: ./scripts/cleanup.sh
 
 `start_command` と `end_command` は worktree のルートを `cwd` として `/bin/sh` 経由で実行されます。`start_command` は最初に worktree からの相対パスとして解決を試み(`./scripts/setup.sh` のような形)、ファイルが無ければシェルに文字列として渡されます(`npm install && npm run dev` も動く)。
 
-スクリプトの失敗は **致命的ではありません** — wtb は警告を出して worktree をそのまま残すので、手で続きを完了できます。
+`start_command` 失敗は worktree を保持し、成功バナーを出さず `create --json` を `ok: false` にします(既定 exit `0`、`--strict` は `1`)。`remove` の `end_command` 失敗も worktree を保持して exit `1`。`--force` なら削除を続けますが exit `1` と部分失敗は維持されます。
 
 ### 環境変数の自動調整
 
@@ -590,17 +672,18 @@ env:
 ### Docker Compose 連携
 
 `docker_compose_file` を設定すると、wtbが自動的に:
-- Composeファイルを各worktreeにコピー
-- 実行中コンテナとのポート衝突を回避してリマップ
+- 対象 branch に checkout 済みの Compose を入力にし、存在しない場合だけ main 版へフォールバック
+- IPv4/IPv6 short form と単一値 `published` の long form を、Docker 公開ポート・全兄弟 env・全兄弟 Compose・同一 create の既割当が共有する予約集合からリマップ
+- 既存 mode を保ち、同一 directory の temp file を fsync + rename して atomic に書き出し
 - worktree削除前に `docker compose -f <docker_compose_file> down` を実行(設定したファイルを明示的に渡すので `compose.dev.yml` のような非デフォルト名でも正しく停止)
 
-なお、コピーされる Compose ファイルはパースして再シリアライズされるため、YAML のコメント・アンカー・元の整形は保持されません(wtb が書き出すすべての Compose ファイルに当てはまります)。Docker が未インストール/デーモン停止中でも Compose ファイルはパース・書き出しされますが、避けるべき稼働中コンテナが無いため host ポートは元の値のままになります(警告が出ます)。
+port range、whole-scalar の可変 port mapping、`network_mode: host`、`network_mode: container:...`、可変 `network_mode` は安全に分離できないため、黙って残さず Compose setup failure にします。予約対象の main/兄弟 Compose にも同じ network-mode 検査を行い、`wtb up` でも古い/手編集された worktree を再検査します。worktree は保持、JSON は `ok: false`、`--strict` は exit `1`。Docker 公開ポートや既存 project の所有権を問い合わせられない場合も fail-closed です。Docker を明示的に扱わない作成では `--no-docker` を使ってください。
 
 #### worktree ごとの identity 書き換え(`compose:`)
 
 デフォルト(`compose.isolate_name: true`)では、wtb は worktree の Compose コピーを書き換えて、各 worktree が 1 つの Compose プロジェクトを共有するのではなく **それぞれ独自の** プロジェクトを持つようにします。これは、トップレベルの `name:` や `container_name:` をハードコードするスタック(例: Supabase CLI の出力)に対する修正です: これが無いと、2 回目の `wtb create` で作られるスタックは 1 つ目のコンテナ/volume にアタッチまたは上書きしてしまいます。書き換えは **デフォルト ON** で、worktree の compose ファイルをその場で書き換えます:
 
-- **project name** — トップレベルの `name:` を `<original>-<branch-slug>` にする。
+- **project name** — トップレベルの `name:` を `<original>-<branch-slug>` にする。安定した worktree `.env` の値は尊重しますが、shell-only の `COMPOSE_PROJECT_NAME` は拒否します。2 つのブランチが **同じ slug** に正規化される場合は、生のブランチ名の短いハッシュを付加します。
 - **container name** — 各サービスの `container_name:` を `compose.container_name` に従って処理。
 
 ```yaml
@@ -613,7 +696,7 @@ compose:
                             #   keep   — そのまま(2 つ目の worktree の `up` が衝突する; wtb が警告)
 ```
 
-`container_name: keep` のとき、wtb は固定 `container_name:` を持つサービスを名指しで警告します(2 つ目の worktree の `docker compose up` が衝突するため)。これらの問題は事前に `wtb doctor` で検出できます。
+`container_name: keep` のとき、wtb は固定 `container_name:` を持つサービスを名指しで警告します(2 つ目の worktree の `docker compose up` が衝突するため)。これらの問題は事前に `wtb doctor` で検出できます。固定 `name:` / `container_name:` を持つ実行可能なスタックで書き換え全体を確かめたい場合は [`examples/compose-identity`](examples/compose-identity/) を参照してください。
 
 #### 書き換えたファイルと git `skip-worktree`
 
@@ -663,7 +746,7 @@ env:
 | 項目 | 型 | デフォルト | 説明 |
 |------|------|-----------|------|
 | `base_branch` | string | `"main"` | 新しいworktreeブランチのベースブランチ名 |
-| `docker_compose_file` | string | `""` | Docker Composeファイルのパス（省略または空文字でDockerスキップ） |
+| `docker_compose_file` | string | `""` | repository-relative な Docker Composeファイルのパス（省略または空文字でDockerスキップ） |
 | `copy_files` | string[] | `[]` | 新しいworktreeにコピーするファイル/ディレクトリ |
 | `link_files` | string[] | `[]` | symlinkを作成するファイル/ディレクトリ（`copy_files` より優先） |
 | `start_command` | string | — | worktree作成後に実行するコマンド |
@@ -680,7 +763,7 @@ env:
 
 設定読み込み時に wtb は以下を検証します:
 
-- **エラー** (exit code `4` で失敗): 型違反、`base_branch` 欠落/不正、`copy_files`/`link_files` が配列でない、`env.adjust` の値型違反 など。
+- **エラー** (exit code `4` で失敗): 型違反、`base_branch` 欠落/不正、`copy_files`/`link_files` が配列でない、`env.adjust` の値型違反、または上記の危険/競合パス。
 - **警告** (stderr に出力、処理は続行): `docker_compose_file` / `env.file` で参照したパスがディスク上に存在しない場合。`env.adjust` のキーが POSIX env var 名として不正な場合(どの `.env` 行ともマッチしない — wtb が修正案を提示する)。
 
 ## Volume の自動クローン
@@ -698,10 +781,11 @@ Compose ファイルが remap された後、wtb は **Compose の `volumes:` �
 5. 各 volume について:
    - **ソーススタックを stop した場合**(または `--force-volume-copy`、もしくは何も稼働していない場合)はクローンします。
    - **`--no-stop` 指定かつ稼働中コンテナがソース volume を使用中** なら skip + 警告 (Postgres/MySQL/Redis などはライブコピーで破損する可能性があるため)。`docker compose stop` してから、`--no-stop` を外して、または `--force-volume-copy` で実行してください。
-   - **ターゲット volume が既に中身を持っていれば** skip (二度走らせて上書きしないため)。`--force-volume-copy` で上書きできます。この上書きは **atomic** です: 新しいデータを一時 volume にステージングし、検証してから target を置換するため、コピーが途中で失敗しても target が空になることはありません。
+   - **ターゲット volume が既に中身を持っていれば** skip。`--force-volume-copy` でも `wtb.repo` / `wtb.project` / `wtb.branch` の完全一致が必須で、foreign またはデータ入り unmanaged volume は上書きしません。空の unmanaged volume だけ、未使用を確認後に正しい label で再作成します。
+   - destructive overwrite は `wtb.temp=true` volume へ stage し、source/stage の byte 数一致を必須にします。target clear 前に共通 Git directory へ target/temp/ownership/size の recovery record を atomic 保存し、refill 成功後だけ削除します。commit 中断時は検証済み temp と復旧コマンドを残します。
    - それ以外は `instrumentisto/rsync-ssh` の使い捨てサイドカーコンテナで再帰コピー (rsync が無ければ Alpine の `cp -a` にフォールバック)。
 
-wtb が作成する volume には必ず **`wtb.managed=true`** ラベルが付くため、project/パスの命名に依存せず自己識別できます。`wtb status` はこのラベルで wtb 管理 volume を正確に列挙し (カスタム `-p` パスでも)、`docker volume ls --filter label=wtb.managed=true` で自分でも一覧できます。
+wtb が作成する target volume は **`wtb.managed=true`**、**`wtb.repo=<repo-hash>`**、**`wtb.project=<compose-project>`**、**`wtb.branch=<branch>`** を持ち、stage volume は **`wtb.temp=true`** も持ちます。これにより custom `-p` でも所有権を厳密に判定できます。
 
 特定の volume を除外したい (例: 再生成可能なキャッシュ):
 
@@ -715,9 +799,9 @@ volumes:
 
 その実行回だけスキップしたいときは `wtb create <branch> --no-volume-copy`、ソーススタックを止めずに稼働中 volume を skip したいときは `--no-stop`、稼働中ソースを止めずに強制ライブコピーしたい (dev のみ・データ破損リスクあり) ときは `--force-volume-copy`。
 
-volume ごとのサマリは `N cloned, N skipped, N failed` の形式で出力されます。いずれかの volume のクローンが **failed** になった場合、worktree 自体は作成されますが、最後のバナーが `🎉 Worktree created successfully!` から `⚠️  Worktree created, but N volume(s) FAILED to clone — this worktree's data is NOT fully isolated` に変わり、不完全な状態が明示されます。既定では終了コードは `0` のまま(worktree は存在するため)ですが、**`--strict`** を渡すとクローン(または `--seed`)失敗時に exit `1` になり、CI やコーディングエージェントがデータ分離の不完全さを検知できます。*skip* は意図的なものです — source 不在、稼働中 (in-use。`--no-stop` 時のほか、ソーススタック停止後も別の Compose project が同名 volume を掴んでいる場合にも起こる)、target に既存データ、の 3 ケース。external/`exclude` 指定の volume は集計前にクローン対象から外れるためサマリには現れません。*failure* はコピー自体がエラーになったことを意味します。
+volume ごとのサマリは `N cloned, N skipped, N failed` の形式です。failed でも worktree は保持し、成功バナーを出しません。既定 exit は `0`、**`--strict`** では clone/seed/その他 setup failure を exit `1` にします。*skip* は source 不在や `--no-stop` での in-use など意図的なものです。既存 target を skip/overwrite できるのは repository/project/branch の完全な所有権を証明できる場合だけで、foreign またはデータ入りの未管理 volume は force でも failure になります。
 
-`wtb remove <branch>` はデフォルトでは clone した volume を削除しません(`docker compose down` のデフォルト挙動と整合)。`wtb remove <branch> --remove-volumes` で `docker compose down -v` 相当に切り替わり volume も削除されます。これは自動 teardown 経由で動くため、teardown が省略される場合(`--no-docker` 時、または `end_command` 設定時)は no-op になり警告が出ます(その場合は `end_command` 側で volume を削除してください)。こうして残った volume は時間とともに孤児として溜まるので、[`wtb prune`](#wtb-prune) でまとめて掃除できます(wtb が作る volume には `wtb.managed=true` ラベルが付きます)。
+`wtb remove <branch>` はデフォルトでは clone した volume を削除しません。`--remove-volumes` (および `wtb down --remove-volumes`) は、既存の非 external named volume がすべて repository/project/branch の完全な所有権検査を通った場合だけ `down -v` を実行します。fixed/shared、未管理、foreign、temporary、inspect 不能な volume は削除しません。自動 teardown が省略される場合(`--no-docker` または `end_command`)は no-op の warning です。残った管理済み volume は [`wtb prune`](#wtb-prune) で掃除できます。
 
 ### クローンの代わりに seed する(`--seed`)
 
@@ -746,7 +830,7 @@ wtb create feature/clean-db --seed
 ```
 src/
 ├── cli/
-│   ├── commands/      init, create, remove, reclone, prune, ls, path, ports, status, init-claude
+│   ├── commands/      init, create, remove, reclone, up, down, prune, ls, path, ports, status, doctor, init-claude
 │   ├── utils/         worktree/ports レンダラ、共通エラーラッパー、Claude Skill インストーラ
 │   └── index.ts       commander の組み立て + グローバルエラーハンドラ
 ├── core/
@@ -778,8 +862,8 @@ src/
 | `1` | 一般エラー |
 | `2` | CLI 引数エラー — 引数不足、未知のオプション/コマンド、不正/過剰な引数、排他オプションの併用(例: `wtb ports --json --pretty`、branch 引数と `--all` の併用)。`--help`/`--version` は exit `0` のまま |
 | `3` | git リポジトリ外 |
-| `4` | 設定エラー(設定ファイルのパース失敗・バリデーション失敗) |
-| `5` | Docker エラー — `wtb prune --yes` で volume 削除に失敗したとき(部分的な prune)、および `wtb create` / `wtb reclone` でクローンのためにソース Compose スタックを止めたものの **restart できなかった**とき(`docker compose start` と `up -d` フォールバックの両方が失敗 — これは `--strict` 無しでも exit `5`。ソース環境が壊れたまま残るため。復旧コマンドが出力される)。それ以外の Docker の問題は従来どおり graceful に degrade する(警告して継続)か、`1` として表面化する |
+| `4` | 設定エラー(設定ファイルのパース失敗・バリデーション失敗) — `docker_compose_file` 未設定での `wtb up` / `wtb down` もこれ |
+| `5` | Docker エラー — `remove` の実行済み Compose teardown 失敗、`prune --yes` の部分削除、`create` / `reclone` の source restart 失敗、`up` / `down` の Compose 失敗 |
 | `6` | worktree が既に存在 — 既に worktree を持つブランチへの `wtb create`(`--exists-ok` なし) |
 | `130` / `143` | SIGINT (Ctrl-C) / SIGTERM による中断。中断扱いにすること — 中断された `create` は途中状態の可能性がある |
 
@@ -807,9 +891,11 @@ npm run format                 # biome format --write
 npm run check                  # biome check --write (lint + format)
 ```
 
+`npm test` / `npm run test:run` / `npm run test:e2e` は先に `dist/` を build するため、E2E が古い CLI を実行しません。`test:ui` は対話用途として独立しています。
+
 E2E テスト(`e2e/`)は一時 git リポジトリを作ってビルド済み CLI を実行します。`sample/` には Next.js + Postgres ベースの動作するプレイグラウンドがあり、実際の `wtb.yaml` / `.env` / `docker-compose.yml` が同梱されています。
 
-より幅広い構成 — フルスタック Compose・最小 Compose・seed/exclude/external volume・Docker なしの Node プロジェクト・最小構成 — は [`examples/`](examples/) を参照してください。各ディレクトリが自己完結したプロジェクトで、`examples/try.sh <example> [branch] [--real]` が使い捨ての git リポジトリ上で実際の CLI を実行します(既定は dry-run):
+より幅広い構成 — フルスタック Compose・最小 Compose・seed/exclude/external volume・固定 identity(Supabase スタイル)のスタック(`compose-identity`)・Docker なしの Node プロジェクト・最小構成 — は [`examples/`](examples/) を参照してください。各ディレクトリが自己完結したプロジェクトで、`examples/try.sh <example> [branch] [--real]` が使い捨ての git リポジトリ上で実際の CLI を実行します(既定は dry-run):
 
 ```bash
 examples/try.sh                                   # 一覧を表示
@@ -821,7 +907,7 @@ examples/try.sh compose-minimal feature/db --real # 実行(DB volume をクロ�
 
 - **大きなツリーは copy より symlink。** `node_modules`、`.cache`、`.next/cache` は基本的に `link_files` 行き。1 つのソース、ディスク重複ゼロ、即座の worktree 作成。トレードオフ: ある worktree でネイティブモジュールを別プラットフォーム向けに再ビルドすると他にも波及する — そういうものは `copy_files` で。
 - **ブランチ名のサニタイズ。** `/` はデフォルトパスでは `-` に置換: `feature/auth` → `worktree-feature-auth`。完全制御したいときは `-p <path>`。
-- **Docker は全フェーズでオプション。** `docker_compose_file` を省略、Docker 未インストール、`--no-docker` のいずれでも wtb は優雅に degrade し、Docker 関連の出力は Docker が到達可能なときだけ出る。
+- **Docker 連携は opt-in。** `docker_compose_file` を省略、または `--no-docker` で意図的に skip できます。設定済み teardown を実行して Docker が失敗した場合、`remove` は cleanup 成功を装わず worktree を保持します。
 - **`wtb ls` vs `wtb status`。** `ls` は高速・スクリプト用途(デフォルト形式は git 呼び出し 1 回)。`status` は人間向けで Docker コンテキスト含む。スクリプトでは `ls -l --json` を推奨。
 - **dry-run は嘘をつかない。** `--dry-run` は全フェーズを歩いて *実行されたら何が起こるか* を表示する。スキップ対象の不在ファイルも報告する。
 
@@ -912,21 +998,21 @@ Skill の `description` は `wtb.yaml` を含むリポジトリで自動発火�
 
 ### "Not in a git repository"
 
-Gitリポジトリ内からwtbを実行してください。ツールはGitルートを自動検出します。
+main または linked worktree 内から実行してください。current と canonical main を Git の共通 directory から解決します。
 
 ### ポートの衝突
 
-ポート調整が期待通りに動作しない場合、wtbは以下をスキャンしています:
-1. 他のworktreeの`.env`ファイルで使用中のポート
-2. 実行中のDockerコンテナが占有しているポート
+wtb は *既知の* ソースに対してのみ調整します:
 
-`wtb status -a` で各worktreeに割り当てられているポートを確認できます。
+- env と Compose は同じ予約集合を使用: Docker 公開ポート、全兄弟 worktree の configured env、全兄弟 Compose(**停止中**も含む)、同一 create で既に割り当てたポート。
+
+OS レベルの任意の listen ソケットは調べません。Docker 外の何か(手で起動したネイティブの dev サーバー、同じマシン上の別プロジェクトなど)がポートを掴んでいる場合は、それを止めるか `env.adjust` を手で編集する必要があります。`wtb status -a` で wtb が把握している状態を確認できます。
 
 2 つの worktree のスタックが分離されずに衝突する場合、よくある原因は固定された Compose の `name:` / `container_name:`、または `env.adjust` で bump される変数経由ではなくリテラルに公開されたポートです。[`wtb doctor`](#wtb-doctor) を実行してください — まさにこれらの relocatability の問題を指摘し、どの設定キー(`compose.isolate_name`、`env.port_propagation`)が各問題を処理するか教えてくれます。
 
 ### Dockerが利用できない
 
-Dockerがインストールされていない、またはデーモンが起動していない場合、wtbはDocker操作を優雅にスキップします。`--no-docker` を使うとDocker関連の警告を完全に抑制できます。
+Docker daemon が停止して `remove` の `docker compose down` が失敗すると、worktree を保持して exit `5` になります。teardown 済みなら意図的な `--no-docker`、失敗を承知で削除するなら `--force` を使います(`--force` でも exit `5`)。`create` で Docker の公開ポートを問い合わせられない場合は、未知の衝突を避けるため env/Compose の採番を fail-closed にし、worktree を保持して `ok: false` にします(`--strict` は exit `1`)。Compose setup・volume clone・Docker port query をすべて意図的に省略する場合だけ `--no-docker` を使ってください。その場合も残る env 採番は兄弟 env/Compose の予約を避けます。
 
 ### Worktreeが既に存在する (exit 6)
 
@@ -953,12 +1039,11 @@ wtb は内部で `git worktree add` を使い、その上に git 単体ではカ
 
 以下は **今後の予定であり、まだ実装されていません**。意図する方向性を記録するために記載しています。
 
-- _現在リストにある項目はありません — 予定していた項目はすべて実装済みです(下記参照)。次に欲しい機能があれば issue を立ててください。_
+- **`wtb await [branch]`** — worktree の Compose サービスが healthy になるまで待機する(`docker compose -p <project> ps` をポーリング。`--timeout` / `--json` 付き)。`wtb up` / `create` の「起動した」と「使える」の間のギャップを埋め、エージェントが今書いている `sleep && curl` ループを置き換える。
+- **`wtb ls --full`** — worktree ごとの `base_branch` に対する ahead/behind と dirty フラグを 1 コールで出す。「どの worktree が放置されていて消してよいか」を N 回の git 実行なしに判定できるようにする。
+- **`wtb env <branch>`** — worktree の調整済み env を `KEY=VALUE` 行で出力し、`eval "$(wtb env X)"` できるようにする(`wtb ports --json` のパースが面倒だという声が実際に出たら追加)。
 
-最近実装済み(このリストにあった項目):
-
-- **コピーの代わりに seed(オプション)。** ✅ `wtb create --seed` は volume データのクローンではなく、新 worktree 内で `volumes.seed_command` を実行します。main のクローンではなく新規に seed した DB が欲しいときに。稼働中 volume からのコピーが発生しないため、この経路では stop しません。詳細は [Volume の自動クローン → クローンの代わりに seed する](#クローンの代わりに-seed-する--seed)。
-- **DB の完全性のための stop-then-copy。** ✅ `create` は稼働中のソース Compose スタックを自動で stop してから volume をクローンし、その後 restart します(クラッシュセーフ)。稼働中のライブ DB も手動操作ゼロでクローンできます。`--no-stop` で従来挙動にできます。
+以前ここに載っていたものはすべて実装済みです(seed-instead-of-copy、stop-then-copy、worktree ごとの identity 分離、`up`/`down`、全コマンドの機械可読出力)。次に欲しい機能があれば issue を立ててください。
 
 ## Changelog
 

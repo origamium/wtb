@@ -7,12 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Canonical repository context (`currentRoot`, main worktree, shared Git directory) and an
+  atomic per-repository create lock. Linked-worktree invocation now uses the same main config,
+  copy source, default destination, Compose source fallback, and volume repository identity.
+- `create --json` now includes `setupWarnings` / `setupFailures`; `prune --json` includes
+  recovery `protected` temp volumes. Added `prune --discard-recovery`, which requires `--yes`.
+- Versioned managed-file manifests (with legacy flat-map reads) and versioned, atomically
+  persisted volume-overwrite recovery records under the shared Git directory.
+
+### Changed
+- All configured file paths are repository-relative. Absolute paths, `..`, repository-root or
+  `.git` targets, normalized duplicates, nested links, and link/write ancestor conflicts now
+  fail as configuration errors (exit `4`). Move external inputs under a gitignored path in the
+  main worktree and reference that relative path.
+- Existing-branch Compose setup starts from the target checkout and only falls back to the main
+  copy when absent. Port allocation supports IPv4/IPv6 short syntax and single-value long-form
+  `published`, shares Docker + every sibling env/Compose reservation, and fails on ranges,
+  host networking, or exhaustion instead of silently retaining an unsafe mapping.
+- Real copy/link/env/Compose/start failures keep the created worktree, suppress the success
+  banner, and make JSON `ok:false`; default exit remains `0`, while `--strict` exits `1`.
+- `remove --json` always emits one object and includes `cleanupErrors`. Cleanup failure now keeps
+  the worktree and exits non-zero; `--force` may remove it but still reports
+  `removed:true, ok:false` (Docker teardown exit `5`, end/other cleanup exit `1`). Explicit `--no-docker` and
+  `--no-end` remain successful skips.
+- `npm test`, `npm run test:run`, and `npm run test:e2e` build first so E2E never runs stale
+  `dist`; the package-lock root version now matches `1.2.0`.
+
 ### Fixed
+- File replacement is transactional, and Compose/env/managed manifests use same-directory
+  write + fsync + rename while preserving existing modes. Corrupt manifests fail closed;
+  skip-worktree bits are restored on every retained-worktree path when file content still
+  matches the recorded SHA; locked worktrees are rejected before cleanup.
+- Volume targets now require matching `wtb.repo`, `wtb.project`, and `wtb.branch` ownership;
+  foreign or data-bearing unmanaged targets are never overwritten, even with force. Destructive
+  overwrite requires exact source/stage byte counts and preserves verified temp data through a
+  recovery record before clearing the target.
+- `prune` uses the main config's exact Compose path and new ownership labels, conservatively
+  retains a volume while either its project or branch is still live, protects recovery temp
+  volumes, and fails closed if config, worktrees, Compose ownership, recovery records, or Docker
+  inspection cannot be resolved. Legacy owner-less volumes alone use the old project-prefix
+  fallback.
+
+## [1.2.0] - 2026-07-07
+
+### Added
+- **`wtb up [branch]` / `wtb down [branch] [--remove-volumes] [--json]`** — start/stop a
+  worktree's Compose stack with the worktree's own compose file (`-f`) and project name
+  (`-p`) always explicit. Shell-only `COMPOSE_PROJECT_NAME` is rejected; stable worktree `.env`
+  values are supported, and same-project resolution still hard-fails. Refuses the
+  main repository worktree. `--json` emits one object
+  (`{ branch, path, composeFile, project, action, ok }`; `down` adds `volumesRemoved`) —
+  the `project` field is the handle for follow-up `docker compose -p <project>` commands.
+- **`wtb remove --json`** — one machine-readable object on stdout
+  (`{ branch, path, removed, forced, composeDown, endCommand, ok }`), with
+  `composeDown.skippedReason` naming why teardown didn't run. Exit code is unchanged;
+  `ok: false` signals a failed teardown/end command.
+- **`examples/compose-identity`** — runnable example of per-worktree Compose identity
+  isolation (fixed `name:`/`container_name:` stacks).
+
+### Fixed
+- **`wtb reclone` (and the new `up`/`down`) now work from inside a linked worktree.**
+  They previously resolved the "source repository" via `git rev-parse --show-toplevel`,
+  which inside a worktree returns the worktree itself — so the main-repo guard always
+  fired and the documented "default: the current worktree" could never succeed. They now
+  resolve the main worktree root via `--git-common-dir`. cwd-based worktree resolution
+  also canonicalizes paths (symlinked `/tmp` etc.) and picks the deepest match when a
+  worktree is nested under the main repository directory.
 - **`wtb remove` no longer risks tearing down the SOURCE stack.** `docker compose down`
-  now passes an explicit `-p <worktree-project>` and refuses teardown when the worktree
-  resolves to the same Compose project as the source (e.g. `COMPOSE_PROJECT_NAME` set or a
-  fixed `name:`), which previously could stop — and with `--remove-volumes` delete the
-  volumes of — the source project.
+  now passes an explicit `-p <worktree-project>`. It rejects shell-only
+  `COMPOSE_PROJECT_NAME` and refuses teardown when stable `.env`/`name:` still resolves to
+  the source project, which previously could stop — and with `--remove-volumes` delete —
+  the source project's volumes.
 - **Port propagation no longer corrupts container ports in compose `ports:`.** A mapping
   like `"5432:5432"` (or `${VAR:-5432}:5432`) is no longer rewritten on its container side;
   parseable literal mappings are left to the port-adjuster, and only `${VAR:-default}`
@@ -45,6 +111,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hardening: recovery/lifecycle commands are shell-quoted; `git` operands are protected with
   `--end-of-options`; a blocked `wtb remove` restores managed-file skip-worktree bits; and
   non-ASCII managed paths no longer permanently block `wtb remove`.
+- **YAML 1.1 danger-quoting now also protects sequence items** — a rewritten compose value
+  like `command: [yes, on]` is quoted, so Docker's YAML 1.1 parser no longer coerces the
+  items to booleans.
+
+### Removed
+- Dead exports: `generateProjectName`, `validateComposeConfig`,
+  `backupEnvFile`/`restoreEnvFile`, `getContainerVolumes`/`getContainerNetworks`,
+  `isWorktree`/`getWorktreeRelationship`, and the unused `ContainerInfo.volumes`/`.networks`
+  fields.
 
 ## [1.1.0] - 2026-06-13
 
@@ -163,8 +238,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then falls back to `up -d`; **if both fail, `wtb create` / `wtb reclone` now exit with
   code `5` (DOCKER_ERROR) even without `--strict`** and print the exact recovery command,
   because a failed restart leaves the user's running source environment broken. JSON
-  output gains a `sourceStack: { stopped, restarted, restartError?, recoverCommand? }`
-  object.
+  output gains a
+  `sourceStack: { stopped, restarted, stopError?, restartError?, recoverCommand? }`
+  object. A failed or timed-out `compose stop` is treated as potentially partial: wtb
+  always attempts to restore the source stack and reports the affected volume clones as
+  failures instead of successful skips.
 - Centralized command error handling via new `withErrorHandling` wrapper
   (`src/cli/utils/command-helpers.ts`); all six commands now share the same
   CLIError-aware exit path.
@@ -221,11 +299,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DB_PORT=3001`) a new worktree's `APP_PORT` could bump to 3001 and collide with
   main's running DB. The main worktree's ports are now included in the
   collision-avoidance set. (Configs with well-separated ports were unaffected.)
-- **Docker Compose project-name precedence** in `resolveComposeProjectName`:
-  `COMPOSE_PROJECT_NAME` now correctly beats the compose file's `name:` attribute
-  (matching Docker Compose v2). The previous inversion silently resolved the wrong
-  project when both were set, making volume cloning skip with a misleading
-  "source volume does not exist".
+- The low-level Compose resolver follows `COMPOSE_PROJECT_NAME > name: > basename`, but wtb
+  setup/lifecycle commands reject a shell-only override; stable worktree `.env` values remain supported.
 - **SIGTERM safety for stop-then-copy**: a `kill` (not just Ctrl-C/SIGINT) during a
   volume clone now restarts the stopped source Compose stack before exiting.
 - rsync copy failures now include the captured rsync stderr in the thrown error
@@ -274,6 +349,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 7-phase create pipeline with `--no-docker`, `--no-env`, `--no-copy`, `--no-link`,
   `--no-start`, and `--dry-run` flags.
 
-[Unreleased]: https://github.com/origamium/wtb/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/origamium/wtb/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/origamium/wtb/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/origamium/wtb/compare/v1.0.2...v1.1.0
+[1.0.2]: https://github.com/origamium/wtb/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/origamium/wtb/releases/tag/v1.0.1
 [1.0.0]: https://github.com/origamium/wtb/releases/tag/v1.0.0

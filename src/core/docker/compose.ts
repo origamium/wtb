@@ -3,8 +3,9 @@
  * Docker Composeファイルの読み込み、書き込み、ポート調整を担当
  */
 
-import { createHash } from "node:crypto"
-import { existsSync } from "node:fs"
+import { createHash, randomUUID } from "node:crypto"
+import { existsSync, unlinkSync } from "node:fs"
+import * as path from "node:path"
 import fs from "fs-extra"
 import { parse, parseDocument, stringify, visit } from "yaml"
 import {
@@ -14,13 +15,16 @@ import {
   PORT_RANGE,
 } from "../../constants/index.js"
 import type { ComposeConfig, FileOperationOptions } from "../../types/index.js"
+import { atomicWriteFileSync } from "../../utils/atomic-file.js"
 import { execDockerSafe } from "../../utils/exec.js"
 import { out } from "../../utils/output.js"
+import { parseEnvContent } from "../environment/processor.js"
 import {
   type PortMap,
   propagateComposeDefaults,
   propagatePortsInValue,
 } from "../environment/propagate.js"
+import { containsVariableReference, interpolateComposeValue } from "./interpolation.js"
 
 /**
  * Docker Composeファイルを読み込んでパース
@@ -63,6 +67,25 @@ export function readComposeFile(filePath: string, options?: FileOperationOptions
       throw new Error("Docker Compose file must contain a services section")
     }
 
+    // wtb transforms and ownership-checks one self-contained Compose model. The
+    // Compose CLI resolves `include` and service `extends` from additional files;
+    // silently ignoring them would leave ports/identity/volumes unisolated and
+    // could let `down -v` delete data that never passed our ownership checks.
+    if ((parsed as { include?: unknown }).include !== undefined) {
+      throw new Error(
+        "Docker Compose include is not supported safely; merge the included file into docker_compose_file"
+      )
+    }
+    const extendedServices = Object.entries(parsed.services)
+      .filter(([, service]) => service && typeof service === "object" && "extends" in service)
+      .map(([serviceName]) => serviceName)
+    if (extendedServices.length > 0) {
+      throw new Error(
+        `Docker Compose service extends is not supported safely (services: ${extendedServices.join(", ")}); inline the inherited service definitions`
+      )
+    }
+    assertComposeStorageDefinitionsSafe(parsed)
+
     return parsed
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
@@ -71,6 +94,63 @@ export function readComposeFile(filePath: string, options?: FileOperationOptions
     }
     throw new Error(`Failed to parse Docker Compose file: ${message}`)
   }
+}
+
+/**
+ * Validate storage/network declarations whose backing resource would escape
+ * Compose's per-project namespace. Explicit sharing is only accepted through
+ * `external`, where Compose also guarantees `down -v` will not delete it.
+ */
+export function assertComposeStorageDefinitionsSafe(config: ComposeConfig): void {
+  const volumesFromServices = Object.entries(config.services ?? {})
+    .filter(([, service]) => service?.volumes_from !== undefined)
+    .map(([serviceName]) => serviceName)
+  if (volumesFromServices.length > 0) {
+    throw new Error(
+      `Docker Compose volumes_from is not supported safely (services: ${volumesFromServices.join(", ")}); declare per-project named volumes explicitly instead`
+    )
+  }
+
+  for (const [key, rawEntry] of Object.entries(config.volumes ?? {})) {
+    if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) continue
+    const entry = rawEntry as Record<string, unknown>
+    if (isExternalResourceEntry(entry)) continue
+    if (typeof entry.name === "string" && entry.name.length > 0) {
+      throw new Error(
+        `Non-external volume '${key}' has an explicit name; remove name for per-project isolation or mark it external for intentional sharing`
+      )
+    }
+    if (typeof entry.driver === "string" && entry.driver !== "local") {
+      throw new Error(
+        `Non-external volume '${key}' uses driver '${entry.driver}', whose backing data wtb cannot prove is isolated`
+      )
+    }
+    if (
+      entry.driver_opts !== undefined &&
+      (typeof entry.driver_opts !== "object" ||
+        entry.driver_opts === null ||
+        Object.keys(entry.driver_opts as Record<string, unknown>).length > 0)
+    ) {
+      throw new Error(
+        `Non-external volume '${key}' uses driver_opts, whose backing data wtb cannot prove is isolated`
+      )
+    }
+  }
+
+  for (const [key, rawEntry] of Object.entries(config.networks ?? {})) {
+    if (!rawEntry || typeof rawEntry !== "object" || Array.isArray(rawEntry)) continue
+    const entry = rawEntry as Record<string, unknown>
+    if (isExternalResourceEntry(entry)) continue
+    if (typeof entry.name === "string" && entry.name.length > 0) {
+      throw new Error(
+        `Non-external network '${key}' has an explicit name; remove name for per-project isolation or mark it external for intentional sharing`
+      )
+    }
+  }
+}
+
+function isExternalResourceEntry(entry: Record<string, unknown>): boolean {
+  return entry.external === true || (entry.external !== null && typeof entry.external === "object")
 }
 
 /**
@@ -107,8 +187,9 @@ export function writeComposeFile(
 
     // YAML 1.1 danger set: strings that Docker's Go YAML 1.1 parser would
     // misinterpret as booleans, nulls, sexagesimal integers, or octal numbers.
-    // We parse into a Document, visit all scalar string VALUES (not keys) in
-    // mapping nodes, and force double-quote on any that are in the danger set.
+    // We parse into a Document, visit all plain string scalars — mapping
+    // VALUES and SEQUENCE items alike (mapping keys are excluded) — and
+    // force double-quote on any that are in the danger set.
     const YAML11_DANGEROUS = /^(y|yes|n|no|true|false|on|off|null|~)$/i
     const SEXAGESIMAL = /^\d+(:\d+)+$/          // e.g. 00:00, 1:30:00
     const LEADING_ZERO_INT = /^0\d+$/            // e.g. 0755, 0123
@@ -128,26 +209,17 @@ export function writeComposeFile(
     )
 
     visit(doc, {
-      Pair(_, pair) {
-        // Only force-quote the VALUE side of mapping pairs, not keys
-        const val = pair.value
-        if (
-          val !== null &&
-          typeof val === "object" &&
-          "type" in val &&
-          (val as { type: unknown }).type === "PLAIN" &&
-          "value" in val &&
-          typeof (val as { value: unknown }).value === "string" &&
-          isDangerous((val as { value: string }).value)
-        ) {
-          ;(val as { type: string }).type = "QUOTE_DOUBLE"
+      Scalar(key, node) {
+        if (key === "key") return // マッピングのキーはプレーンのまま
+        if (node.type === "PLAIN" && typeof node.value === "string" && isDangerous(node.value)) {
+          node.type = "QUOTE_DOUBLE"
         }
       },
     })
 
     const yamlContent = String(doc)
 
-    fs.writeFileSync(filePath, yamlContent, {
+    atomicWriteFileSync(filePath, yamlContent, {
       encoding: options?.encoding || FILE_ENCODING,
     })
 
@@ -155,6 +227,28 @@ export function writeComposeFile(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new Error(`Failed to write Docker Compose file: ${message}`)
+  }
+}
+
+/**
+ * Run Docker Compose against immutable, already-validated bytes rather than
+ * re-opening a mutable worktree file after ownership checks. The snapshot is
+ * placed beside the source so Compose-relative paths retain their directory.
+ */
+export function withComposeSnapshot<T>(
+  sourceFilePath: string,
+  config: ComposeConfig,
+  operation: (snapshotPath: string) => T
+): T {
+  const snapshotPath = path.join(
+    path.dirname(sourceFilePath),
+    `.${path.basename(sourceFilePath)}.wtb-snapshot-${process.pid}-${randomUUID()}.yml`
+  )
+  writeComposeFile(snapshotPath, config)
+  try {
+    return operation(snapshotPath)
+  } finally {
+    unlinkSync(snapshotPath)
   }
 }
 
@@ -179,8 +273,8 @@ export function writeComposeFile(
  * ```
  */
 /**
- * Docker Compose のポートマッピング文字列を解析
- * 対応形式: "3000:80", "0.0.0.0:3000:80", "3000:80/tcp"
+ * Docker Compose のポートマッピング文字列を解析。
+ * IPv4/IPv6 の host IP、単一 host/container port、protocol suffix に対応する。
  *
  * @returns { hostPort, containerPort } または null (解析不能)
  */
@@ -191,51 +285,177 @@ export function parsePortMapping(portMapping: string): {
   proto?: string
 } | null {
   if (typeof portMapping !== "string") return null
-  // Capture: optional IP prefix, host port, container port, optional /proto suffix
-  const match = portMapping.match(/^([\d.]+:)?(\d+):(\d+)(\/\w+)?$/)
-  if (!match) return null
-  const hostPort = parseInt(match[2], 10)
-  const containerPort = parseInt(match[3], 10)
-  if (Number.isNaN(hostPort) || Number.isNaN(containerPort)) return null
+
+  const protocolMatch = portMapping.match(/^(.*?)(\/[A-Za-z][A-Za-z0-9]*)?$/)
+  if (!protocolMatch) return null
+  const mapping = protocolMatch[1]
+  const proto = protocolMatch[2]
+
+  // Parse from the right so both bracketed (`[::1]`) and Compose's accepted
+  // unbracketed IPv6 host form (`::1`) retain every address colon.
+  const simple = mapping.match(/^(\d+):(\d+)$/)
+  const withHostIp = simple ? null : mapping.match(/^(.+):(\d+):(\d+)$/)
+  if (!simple && !withHostIp) return null
+
+  const hostPort = Number.parseInt(simple?.[1] ?? withHostIp?.[2] ?? "", 10)
+  const containerPort = Number.parseInt(simple?.[2] ?? withHostIp?.[3] ?? "", 10)
+  if (!isTcpPort(hostPort) || !isTcpPort(containerPort)) return null
+
+  const hostIp = withHostIp?.[1]
+  if (hostIp?.startsWith("[") !== hostIp?.endsWith("]")) return null
   return {
     hostPort,
     containerPort,
-    ip: match[1],      // e.g. "0.0.0.0:" or undefined
-    proto: match[4],   // e.g. "/tcp" or undefined
+    ip: hostIp === undefined ? undefined : `${hostIp}:`,
+    proto,
   }
 }
 
-export function adjustPortsInCompose(config: ComposeConfig, usedPorts: number[]): ComposeConfig {
+export function adjustPortsInCompose(
+  config: ComposeConfig,
+  usedPorts: number[],
+  isolatedPublishedVariables: ReadonlySet<string> = new Set()
+): ComposeConfig {
+  assertComposeNetworkingSafe(config)
   // 深いコピーを作成して元のオブジェクトを変更しない
   const newConfig = structuredClone(config) as ComposeConfig
   const currentlyUsed = [...usedPorts]
 
-  Object.entries(newConfig.services).forEach(([, service]) => {
+  Object.entries(newConfig.services).forEach(([serviceName, service]) => {
     if (service.ports && Array.isArray(service.ports)) {
-      service.ports = service.ports.map((portMapping) => {
-        if (typeof portMapping !== "string") {
+      service.ports = service.ports.map((portMapping, index) => {
+        if (typeof portMapping === "number") {
+          // Container-only short syntax asks Docker to choose the host port.
           return portMapping
         }
 
-        const parsed = parsePortMapping(portMapping)
-        if (!parsed) {
-          return portMapping // 解析できない形式はそのまま
+        if (typeof portMapping === "string") {
+          if (containsPortRange(portMapping)) {
+            throw new Error(
+              `Service '${serviceName}' ports[${index}] uses an unsupported port range: ${portMapping}`
+            )
+          }
+
+          const parsed = parsePortMapping(portMapping)
+          if (!parsed) {
+            // Container-only declarations do not publish a fixed host port. An
+            // omitted short-form host port (e.g. `127.0.0.1::80`) is likewise
+            // delegated to Docker's dynamic allocator.
+            if (
+              /^\d+(?:\/[A-Za-z][A-Za-z0-9]*)?$/.test(portMapping) ||
+              /^(?:\[[^\]]+\]|[^:]+)?::\d+(?:\/[A-Za-z][A-Za-z0-9]*)?$/.test(portMapping)
+            ) {
+              return portMapping
+            }
+
+            // A variable in the published (host) position is safe only when the
+            // env phase allocated that variable from the same repository-wide
+            // reservation set. Otherwise Compose will resolve a fixed port after
+            // this pass and can silently collide with a sibling worktree.
+            const variable = publishedVariableInShortMapping(portMapping)
+            if (variable && isolatedPublishedVariables.has(variable)) {
+              return portMapping
+            }
+            throw new Error(
+              `Service '${serviceName}' ports[${index}] has an unsupported or unresolved published port: ${portMapping}`
+            )
+          }
+
+          const newHostPort = findAvailablePort(parsed.hostPort, currentlyUsed)
+          currentlyUsed.push(newHostPort)
+
+          // Reconstruct from parsed components to avoid corrupting IP octets
+          // that happen to contain the host-port digits.
+          return `${parsed.ip ?? ""}${newHostPort}:${parsed.containerPort}${parsed.proto ?? ""}`
         }
 
-        const newHostPort = findAvailablePort(parsed.hostPort, currentlyUsed)
+        if (!portMapping || typeof portMapping !== "object") return portMapping
 
-        // 新しいポートを使用中リストに追加
+        const published = portMapping.published
+        const target = portMapping.target
+        if (
+          (typeof published === "string" && containsPortRange(published)) ||
+          (typeof target === "string" && containsPortRange(target))
+        ) {
+          throw new Error(
+            `Service '${serviceName}' ports[${index}] uses an unsupported long-form port range`
+          )
+        }
+
+        // Omitted/dynamic published ports are allocated by Docker and cannot
+        // collide as a fixed declaration. Variable forms remain for Compose's
+        // interpolation and are handled by env propagation.
+        if (published === undefined) return portMapping
+        const publishedPort = parseSinglePublishedPort(published)
+        if (publishedPort === null) {
+          if (
+            typeof published === "string" &&
+            publishedVariable(published) !== null &&
+            isolatedPublishedVariables.has(publishedVariable(published) as string)
+          ) {
+            return portMapping
+          }
+          throw new Error(
+            `Service '${serviceName}' ports[${index}] has an unsupported or unresolved long-form published port: ${String(published)}`
+          )
+        }
+
+        const newHostPort = findAvailablePort(publishedPort, currentlyUsed)
         currentlyUsed.push(newHostPort)
 
-        // Reconstruct from parsed components to avoid corrupting IP octets
-        // that share digits with the host port (H3 fix).
-        // e.g. "192.168.100.100:100:80/tcp" → "192.168.100.100:999:80/tcp"
-        return `${parsed.ip ?? ""}${newHostPort}:${parsed.containerPort}${parsed.proto ?? ""}`
+        return {
+          ...portMapping,
+          published: typeof published === "number" ? newHostPort : String(newHostPort),
+        }
       })
     }
   })
 
   return newConfig
+}
+
+/**
+ * Reject networking modes whose host-port usage cannot be enumerated or whose
+ * namespace belongs to a fixed external container. This must be applied both
+ * to the target Compose and to every sibling used to build the reservation set.
+ */
+export function assertComposeNetworkingSafe(config: ComposeConfig): void {
+  for (const [serviceName, service] of Object.entries(config.services ?? {})) {
+    if (typeof service.network_mode !== "string") continue
+    if (containsVariableReference(service.network_mode)) {
+      throw new Error(
+        `Service '${serviceName}' has a variable network_mode that may resolve to host or container networking and cannot be isolated safely`
+      )
+    }
+    const mode = service.network_mode.trim().toLowerCase()
+    if (mode === "host") {
+      throw new Error(
+        `Service '${serviceName}' uses network_mode: host; its host ports cannot be isolated per worktree`
+      )
+    }
+    if (mode.startsWith("container:")) {
+      throw new Error(
+        `Service '${serviceName}' uses network_mode: container:..., which shares another container's network namespace and cannot be isolated per worktree`
+      )
+    }
+  }
+}
+
+/** Extract a single Compose variable reference used as a scalar. */
+function publishedVariable(raw: string): string | null {
+  const match = raw.match(
+    /^\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(?::-|-)[^}]*)?\}$|^\$([A-Za-z_][A-Za-z0-9_]*)$/
+  )
+  return match?.[1] ?? match?.[2] ?? null
+}
+
+/** Extract the variable occupying the host-published position in short syntax. */
+function publishedVariableInShortMapping(raw: string): string | null {
+  const withoutProtocol = raw.replace(/\/[A-Za-z][A-Za-z0-9]*$/, "")
+  const match = withoutProtocol.match(
+    /(?:^|:)(\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(?::-|-)[^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*)):\d+$/
+  )
+  return match?.[2] ?? match?.[3] ?? null
 }
 
 /**
@@ -344,7 +564,10 @@ export function propagatePortsInComposeValues(
  * ```
  */
 export function findAvailablePort(basePort: number, usedPorts: number[]): number {
-  const used = new Set(usedPorts)
+  if (!isTcpPort(basePort)) {
+    throw new Error(`Invalid TCP port: ${basePort}`)
+  }
+  const used = new Set(usedPorts.filter(isTcpPort))
 
   // README どおり「元の host port をまず試し、空いていればそのまま使う」。
   // 80 や 443、あるいは 9999 超の有効ポートを、空いているのに wtb のレンジ
@@ -362,15 +585,28 @@ export function findAvailablePort(basePort: number, usedPorts: number[]): number
   for (let p = start; p <= MAX_TCP_PORT; p++) {
     if (!used.has(p)) return p
   }
-  for (let p = PORT_RANGE.MIN; p < start; p++) {
+  for (let p = PORT_RANGE.MIN; p < Math.min(start, MAX_TCP_PORT + 1); p++) {
     if (!used.has(p)) return p
   }
 
-  // 全ポートが埋まっている場合のみ警告して basePort を返す（事実上到達しない）。
-  console.warn(
-    `⚠️  No free port available in range ${PORT_RANGE.MIN}-${MAX_TCP_PORT}; keeping original port ${basePort}`
+  throw new Error(
+    `No free TCP port available in range ${PORT_RANGE.MIN}-${MAX_TCP_PORT} for ${basePort}`
   )
-  return basePort
+}
+
+function isTcpPort(value: number): boolean {
+  return Number.isInteger(value) && value >= 1 && value <= MAX_TCP_PORT
+}
+
+function containsPortRange(value: string): boolean {
+  return /\d+\s*-\s*\d+/.test(value)
+}
+
+function parseSinglePublishedPort(value: number | string): number | null {
+  if (typeof value === "number") return isTcpPort(value) ? value : null
+  if (!/^\d+$/.test(value)) return null
+  const parsed = Number.parseInt(value, 10)
+  return isTcpPort(parsed) ? parsed : null
 }
 
 /**
@@ -400,32 +636,6 @@ export function findComposeFile(projectDir: string): string | null {
 }
 
 /**
- * Docker Composeプロジェクト名を生成
- * 通常はディレクトリ名にworktreeの識別子を追加
- *
- * @param projectDir - プロジェクトディレクトリパス
- * @param branchName - ブランチ名（オプション）
- * @returns プロジェクト名
- *
- * @example
- * ```typescript
- * const projectName = generateProjectName('/path/to/my-app', 'feature-branch')
- * console.log(projectName) // "my-app-feature-branch"
- * ```
- */
-export function generateProjectName(projectDir: string, branchName?: string): string {
-  const baseName = projectDir.split("/").pop() || "wtb-project"
-  const cleanBaseName = baseName.replace(/[^a-zA-Z0-9]/g, "-").toLowerCase()
-
-  if (branchName) {
-    const cleanBranchName = branchName.replace(/[^a-zA-Z0-9]/g, "-").toLowerCase()
-    return `${cleanBaseName}-${cleanBranchName}`
-  }
-
-  return cleanBaseName
-}
-
-/**
  * Docker Compose v2 が実際に算出するプロジェクト名を解決する
  *
  * 優先順位 (Compose v2 の実挙動に整合 — `docker compose config --format json`
@@ -437,9 +647,6 @@ export function generateProjectName(projectDir: string, branchName?: string): st
  *    - `[a-z0-9_-]` 以外の文字を **削除** (置換ではなく除去)
  *    - 先頭が letter/digit でなければ `wtb` を prepend
  *    - 結果が空なら "wtb-project" にフォールバック
- *
- * `generateProjectName` は非英数を `-` に置換するため、underscore や dot を含む
- * ディレクトリ名で Compose の実挙動と乖離する。Volume 名解決には必ずこちらを使うこと。
  *
  * @param composeConfig - parse 済みの compose 設定
  * @param workdir - compose ファイルがあるディレクトリの絶対パス
@@ -453,13 +660,13 @@ export function resolveComposeProjectName(
 ): string {
   const fromEnv = env.COMPOSE_PROJECT_NAME
   if (typeof fromEnv === "string" && fromEnv.length > 0) {
-    return fromEnv
+    return resolveProjectNameScalar(fromEnv, env, "COMPOSE_PROJECT_NAME")
   }
   const explicit = (composeConfig as { name?: unknown }).name
   if (typeof explicit === "string" && explicit.length > 0) {
-    return explicit
+    return resolveProjectNameScalar(explicit, env, "Compose name")
   }
-  const baseName = workdir.split("/").pop() || ""
+  const baseName = path.basename(workdir)
   const stripped = baseName.toLowerCase().replace(/[^a-z0-9_-]/g, "")
   if (stripped.length === 0) {
     return "wtb-project"
@@ -471,58 +678,116 @@ export function resolveComposeProjectName(
 }
 
 /**
- * Docker Compose設定の妥当性をチェック
- *
- * @param config - チェックする設定オブジェクト
- * @returns 妥当性チェック結果
- *
- * @example
- * ```typescript
- * const result = validateComposeConfig(config)
- * if (result.isValid) {
- *   console.log('Configuration is valid')
- * } else {
- *   console.error('Validation errors:', result.errors)
- * }
- * ```
+ * Resolve a project-name scalar using Compose interpolation rules. Returning a
+ * literal `${VAR}` here would make every same-project safety guard reason about
+ * a different name than Docker, so unresolved references fail closed.
  */
-export function validateComposeConfig(config: ComposeConfig): {
-  isValid: boolean
-  errors: string[]
-  warnings: string[]
-} {
-  const errors: string[] = []
-  const warnings: string[] = []
-
-  // バージョンチェック（Docker Compose v2 では version フィールドは任意）
-  if (!config.version) {
-    warnings.push("Missing version field (optional in Docker Compose v2)")
+function resolveProjectNameScalar(
+  raw: string,
+  env: NodeJS.ProcessEnv,
+  label: string
+): string {
+  const values: Record<string, string> = {}
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === "string") values[key] = value
   }
-
-  // サービスチェック
-  if (!config.services || Object.keys(config.services).length === 0) {
-    errors.push("No services defined")
-  } else {
-    Object.entries(config.services).forEach(([serviceName, service]) => {
-      if (!service.image && !service.build) {
-        errors.push(`Service '${serviceName}' must have either 'image' or 'build' specified`)
-      }
-
-      if (service.ports && Array.isArray(service.ports)) {
-        service.ports.forEach((port, index: number) => {
-          if (typeof port !== "string" && typeof port !== "number") {
-            warnings.push(`Service '${serviceName}' port[${index}] should be a string or number`)
-          }
-        })
-      }
-    })
+  const interpolated = interpolateComposeValue(raw, values)
+  if (
+    interpolated.unresolved.length > 0 ||
+    containsVariableReference(interpolated.value) ||
+    interpolated.value.length === 0
+  ) {
+    throw new Error(
+      `${label} cannot be resolved safely${interpolated.unresolved.length > 0 ? ` (missing: ${interpolated.unresolved.join(", ")})` : ""}`
+    )
   }
+  return interpolated.value
+}
 
-  return {
-    isValid: errors.length === 0,
-    errors,
-    warnings,
+/**
+ * Resolve the environment Docker Compose loads for project identity.
+ *
+ * Compose reads `<workdir>/.env` for interpolation/project variables, while the
+ * invoking process environment has higher precedence. Parsing errors are
+ * intentionally propagated: destructive callers must not guess an identity.
+ */
+export function loadComposeInterpolationEnvironment(
+  workdir: string,
+  env: NodeJS.ProcessEnv = process.env
+): Record<string, string> {
+  const merged: Record<string, string> = {}
+  const dotEnvPath = path.join(workdir, ".env")
+  if (existsSync(dotEnvPath)) {
+    const content = fs.readFileSync(dotEnvPath, { encoding: FILE_ENCODING })
+    for (const line of content.split(/\r?\n/)) {
+      // Compose accepts leading whitespace and an optional `export` prefix in
+      // dotenv files. Normalize the assignment, then reuse the canonical value
+      // parser for quotes and inline comments.
+      const assignment = line.match(
+        /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/
+      )
+      if (!assignment) continue
+      const parsed = parseEnvContent(`${assignment[1]}=${assignment[2]}`)
+      const entry = parsed.entries[0]
+      if (entry) merged[entry.key] = entry.value
+    }
   }
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === "string") merged[key] = value
+  }
+  return merged
+}
+
+const COMPOSE_SOURCE_OVERRIDE_KEYS = [
+  "COMPOSE_FILE",
+  "COMPOSE_ENV_FILES",
+  "COMPOSE_PATH_SEPARATOR",
+  "COMPOSE_DISABLE_ENV_FILE",
+] as const
+
+/**
+ * Reject Compose pre-defined variables that change which files/environment a
+ * later bare `docker compose` lifecycle command loads. They can come from the
+ * target `.env` as well as the shell and would bypass wtb's rewritten file.
+ */
+export function assertNoComposeSourceOverrides(
+  environment: Readonly<Record<string, string>>
+): void {
+  const active = COMPOSE_SOURCE_OVERRIDE_KEYS.filter(
+    (key) => environment[key]?.trim().length > 0
+  )
+  if (active.length > 0) {
+    throw new Error(
+      `${active.join(", ")} must be unset; Compose source/env overrides can bypass wtb's isolated file`
+    )
+  }
+}
+
+/**
+ * A shell-only project override is transient and can redirect lifecycle
+ * commands to an unrelated existing project. Worktree `.env` remains
+ * supported because it is inspected per worktree and checked for uniqueness.
+ */
+export function assertNoTransientComposeProjectOverride(
+  env: NodeJS.ProcessEnv = process.env
+): void {
+  if (env.COMPOSE_PROJECT_NAME?.trim()) {
+    throw new Error(
+      "Shell COMPOSE_PROJECT_NAME must be unset for wtb; define a stable per-worktree value in .env or Compose name instead"
+    )
+  }
+}
+
+/** Resolve a Compose project exactly enough for create/remove/prune safety guards. */
+export function resolveComposeProjectNameForWorktree(
+  composeConfig: ComposeConfig,
+  workdir: string,
+  env: NodeJS.ProcessEnv = process.env,
+  projectDirectory: string = workdir
+): string {
+  const environment = loadComposeInterpolationEnvironment(workdir, env)
+  assertNoComposeSourceOverrides(environment)
+  return resolveComposeProjectName(composeConfig, projectDirectory, environment)
 }
 
 /**
@@ -614,9 +879,9 @@ export interface ComposeIdentityRewrite {
  * 内訳 ({@link ComposeIdentityRewrite}) を返す。
  *
  * 規則:
- * - top-level `name:` あり AND isolateName=true → `sanitizeProjectSlug(`${name}-${slug}`)`
- *   (結合後を再 sanitize して常に valid にする)。`name:` 無し → そのまま (worktree dir
- *   basename が既に一意な project を生むので、注入は port/down 挙動を無駄に変える)。
+ * - isolateName=true → resolved/base project に slug を付けた top-level `name:` を設定。
+ *   `name:` が無い場合も注入する。Compose file がネストされている場合や同じ basename の
+ *   custom worktree path では directory fallback がsourceと衝突し得るため、省略できない。
  *   isolateName=false → `name:` 不変。
  * - service ごとの `container_name:`:
  *   - suffix (default): `sanitizeContainerName(`${original}-${slug}`)`
@@ -625,18 +890,27 @@ export interface ComposeIdentityRewrite {
  */
 export function rewriteComposeIdentity(
   config: ComposeConfig,
-  opts: { slug: string; isolateName: boolean; containerNameMode: "suffix" | "strip" | "keep" }
+  opts: {
+    slug: string
+    isolateName: boolean
+    containerNameMode: "suffix" | "strip" | "keep"
+    /** Interpolation/.envを解決済みのsource project。name未指定時の注入にも使う。 */
+    baseProjectName?: string
+  }
 ): { config: ComposeConfig; rewrite: ComposeIdentityRewrite } {
   const newConfig = structuredClone(config) as ComposeConfig
   const rewrite: ComposeIdentityRewrite = { containerNames: [] }
 
   // top-level project name (`name:`)
   const originalName = (newConfig as { name?: unknown }).name
-  if (opts.isolateName && typeof originalName === "string" && originalName.length > 0) {
-    const next = sanitizeProjectSlug(`${originalName}-${opts.slug}`)
+  const baseProjectName =
+    opts.baseProjectName ??
+    (typeof originalName === "string" && originalName.length > 0 ? originalName : undefined)
+  if (opts.isolateName && baseProjectName) {
+    const next = sanitizeProjectSlug(`${baseProjectName}-${opts.slug}`)
     if (next !== originalName) {
       ;(newConfig as { name?: string }).name = next
-      rewrite.projectName = { from: originalName, to: next }
+      rewrite.projectName = { from: baseProjectName, to: next }
     }
   }
 
@@ -707,4 +981,55 @@ export function composeStart(composeFilePath: string, projectName: string, cwd: 
  */
 export function composeUp(composeFilePath: string, projectName: string, cwd: string): void {
   execDockerSafe(["compose", "-f", composeFilePath, "-p", projectName, "up", "-d"], { cwd })
+}
+
+/**
+ * Compose スタックを破棄する (`docker compose down`)。
+ *
+ * `-f` / `-p` を明示して、env(COMPOSE_PROJECT_NAME) や固定 `name:` による
+ * project 誤解決 (source スタックの巻き込み down) を防ぐ。呼び出し側は
+ * {@link safeResolveComposeProjectName} で target project を解決し、source と
+ * 一致しないことを確認してから渡すこと。
+ *
+ * @param composeFilePath - Compose ファイルの絶対パス
+ * @param projectName - この worktree の Compose プロジェクト名
+ * @param cwd - 実行ディレクトリ (通常は worktree のルート)
+ * @param removeVolumes - true なら `down -v` で named volume も削除
+ * @throws {Error} docker 呼び出しが失敗した場合 (呼び出し側でハンドリングする想定)
+ */
+export function composeDown(
+  composeFilePath: string,
+  projectName: string,
+  cwd: string,
+  removeVolumes = false
+): void {
+  const args = ["compose", "-f", composeFilePath, "-p", projectName, "down"]
+  if (removeVolumes) {
+    args.push("-v")
+  }
+  execDockerSafe(args, { cwd })
+}
+
+/**
+ * compose ファイルを読んで Compose プロジェクト名を解決する。読めなければ null。
+ *
+ * remove / up / down の same-project ガード用: throw せず null を返すことで、
+ * 「compose が読めない = project を特定できない」を安全側 (docker 呼び出し拒否)
+ * に倒せる。
+ */
+export function safeResolveComposeProjectName(
+  composePath: string,
+  workdir: string
+): string | null {
+  try {
+    assertNoTransientComposeProjectOverride(process.env)
+    return resolveComposeProjectNameForWorktree(
+      readComposeFile(composePath),
+      workdir,
+      process.env,
+      path.dirname(composePath)
+    )
+  } catch {
+    return null
+  }
 }

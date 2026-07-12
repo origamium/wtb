@@ -10,7 +10,7 @@ import { readComposeFile } from "../../core/docker/compose.js"
 import { resolveComposePath } from "../../core/docker/locate.js"
 import { type AnalyzeOptions, analyzeRelocatability } from "../../core/docker/relocatability.js"
 import { buildWorktreeEnvMap } from "../../core/environment/env-map.js"
-import { getGitRootOrThrow } from "../../core/git/repository.js"
+import { getMainWorktreeRoot } from "../../core/git/repository.js"
 import type { DoctorCommandOptions, WtbConfig } from "../../types/index.js"
 import { CLIError } from "../../utils/error.js"
 import { setJsonOutputMode } from "../../utils/output.js"
@@ -65,11 +65,9 @@ function discoverOverrideFiles(composePath: string | null): string[] {
 }
 
 async function executeDoctorCommand(options: DoctorCommandOptions): Promise<void> {
-  if (options.json) {
-    setJsonOutputMode(true)
-  }
+  setJsonOutputMode(options.json === true)
 
-  const gitRoot = getGitRootOrThrow()
+  const gitRoot = getMainWorktreeRoot()
   const config = loadConfig(gitRoot)
   const envMap = buildWorktreeEnvMap(gitRoot, config)
 

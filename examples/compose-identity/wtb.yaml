@@ -1,0 +1,43 @@
+# compose-identity — the Supabase-collision case: a compose file with a FIXED
+# identity (top-level `name:` + per-service `container_name:`) plus a literal
+# host port. wtb rewrites the worktree's compose copy so every worktree gets
+# its own project name, container names, and ports.
+#
+# NOTE: everything below `env.port_propagation` and `compose` spells out the
+# DEFAULTS explicitly, as teaching material — omit both blocks and you get the
+# exact same behavior.
+
+base_branch: main
+docker_compose_file: ./docker-compose.yml
+
+copy_files:
+  - .env
+
+env:
+  file:
+    - ./.env
+  adjust:
+    DB_PORT: 1 # 54322 → next free port
+
+  # Port propagation (default: ON). After DB_PORT is bumped, the old → new
+  # port is propagated into other values that embed it and into the compose
+  # copy's `${VAR:-default}` / string ports. Boolean shorthand also works:
+  # `port_propagation: true`.
+  port_propagation:
+    enabled: true # master switch
+    files: [] # extra files (beyond env.file) to propagate ports into
+    compose: true # also rewrite ${VAR:-default}/string ports in the compose copy
+
+# Docker Compose identity isolation (default: ON).
+compose:
+  # Rewrite the top-level project name → <original>-<branch-slug>
+  # (acme → acme-feature-demo). Set false to share ONE Compose project across
+  # worktrees — a second `docker compose up` then hijacks the first stack.
+  isolate_name: true
+  # How to handle services' fixed `container_name:`:
+  #   suffix — append -<branch-slug> (default): acme_api → acme_api-feature-demo
+  #   strip  — remove it (compose auto-generates a unique name)
+  #   keep   — leave as-is (a 2nd worktree's `up` WILL collide)
+  container_name: suffix
+
+# db_data is cloned into each new worktree by default (no config needed).

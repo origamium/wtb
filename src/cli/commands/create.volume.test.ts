@@ -21,11 +21,27 @@ import { createCommand, setupVolumeCopy } from "./create.js"
 vi.mock("../../core/docker/compose.js")
 vi.mock("../../core/docker/volume.js")
 vi.mock("../../core/docker/client.js")
+vi.mock("../../core/docker/project-ownership.js")
 vi.mock("../../core/config/loader.js")
 vi.mock("../../core/git/repository.js")
 vi.mock("../../core/git/worktree.js")
+vi.mock("fs-extra", () => ({
+  default: {
+    ensureDir: vi.fn().mockResolvedValue(undefined),
+  },
+}))
 vi.mock("node:fs", () => ({
-  existsSync: vi.fn(() => true),
+  existsSync: vi.fn((value: string) => {
+    const normalized = value.replace(/\\/g, "/")
+    if (
+      /\/(?:compose\.ya?ml|docker-compose\.yaml|compose\.override\.ya?ml|docker-compose\.override\.ya?ml)$/.test(
+        normalized
+      )
+    ) {
+      return false
+    }
+    return true
+  }),
   // create.ts also imports lstatSync/readlinkSync/statSync/symlinkSync —
   // not used by setupVolumeCopy but must be exported by the mock.
   lstatSync: vi.fn(),
@@ -65,7 +81,7 @@ describe("setupVolumeCopy orchestration", () => {
     vi.mocked(composeModule.readComposeFile).mockReturnValue(
       composeFixture({ postgres_data: null })
     )
-    vi.mocked(composeModule.resolveComposeProjectName).mockImplementation((_cfg, dir) =>
+    vi.mocked(composeModule.resolveComposeProjectNameForWorktree).mockImplementation((_cfg, dir) =>
       dir.endsWith("worktree") ? "target_proj" : "source_proj"
     )
     vi.mocked(volumeModule.discoverCloneableVolumes).mockImplementation((cfg, exclude) =>
@@ -76,13 +92,32 @@ describe("setupVolumeCopy orchestration", () => {
       external: false,
     }))
     vi.mocked(volumeModule.volumeExists).mockReturnValue(true)
+    vi.mocked(volumeModule.volumeExistsOrThrow).mockReturnValue(true)
     vi.mocked(volumeModule.getVolumeSize).mockReturnValue(0)
-    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue([])
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue([])
+    vi.mocked(volumeModule.getContainersUsingVolumeOrThrow).mockReturnValue([])
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue([])
     vi.mocked(volumeModule.copyVolume).mockResolvedValue(undefined)
+    vi.mocked(volumeModule.acquireVolumeCloneOperationLock).mockReturnValue({
+      containerName: "wtb-volume-clone-lock-test",
+      release: vi.fn(),
+    })
+    vi.mocked(volumeModule.readVolumeRecoveryRecords).mockReturnValue([])
+    vi.mocked(volumeModule.preflightTargetVolumeForCopy).mockReset()
+    vi.mocked(volumeModule.preflightTargetVolumeForCopy).mockImplementation((name) => {
+      if (!volumeModule.volumeExistsOrThrow(name)) return { state: "missing", size: 0 }
+      const size = volumeModule.getVolumeSize(name)
+      if (size === null) {
+        throw new Error(`Cannot determine size of existing target volume '${name}'`)
+      }
+      return { state: "owned", size }
+    })
     // Default: pre-existing targets are wtb-managed (so a force overwrite is allowed).
     vi.mocked(volumeModule.volumeIsWtbManaged).mockReturnValue(true)
     vi.mocked(volumeModule.repoVolumeLabel).mockReturnValue("repohash")
+    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+      { path: "/repo", branch: "main", head: "main-sha" },
+      { path: "/repo/worktree", branch: "feature/test", head: "feature-sha" },
+    ])
   })
 
   /** holders を sourceProject 所属として返す helper (planVolumeClones 用)。 */
@@ -93,7 +128,12 @@ describe("setupVolumeCopy orchestration", () => {
   })
 
   const run = (force = false, config: WtbConfig = baseConfig(), stop?: boolean) =>
-    setupVolumeCopy("/repo", "/repo/worktree", config, { force, stop })
+    setupVolumeCopy("/repo", "/repo/worktree", config, {
+      force,
+      stop,
+      branch: "feature/test",
+      commonGitDir: "/repo/.git",
+    })
 
   it("returns silently when docker_compose_file is empty", async () => {
     await run(false, baseConfig({ docker_compose_file: "" }))
@@ -109,8 +149,41 @@ describe("setupVolumeCopy orchestration", () => {
     expect(logSpy).not.toHaveBeenCalled()
   })
 
+  it("reports an unreadable source Compose as a volume setup failure", async () => {
+    vi.mocked(composeModule.readComposeFile).mockImplementation(() => {
+      throw new Error("invalid source yaml")
+    })
+
+    const result = await run()
+
+    expect(result.failed).toEqual([
+      expect.objectContaining({
+        name: "./docker-compose.yml",
+        error: expect.stringContaining("invalid source yaml"),
+      }),
+    ])
+    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when the authoritative target Compose is unreadable", async () => {
+    vi.mocked(composeModule.readComposeFile)
+      .mockImplementationOnce(() => {
+        throw new Error("invalid target yaml")
+      })
+
+    const result = await run()
+
+    expect(result.failed).toEqual([
+      expect.objectContaining({
+        name: "./docker-compose.yml",
+        error: expect.stringContaining("invalid target yaml"),
+      }),
+    ])
+    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+  })
+
   it("skips a volume whose source does not exist (first-time setup)", async () => {
-    vi.mocked(volumeModule.volumeExists).mockImplementation(
+    vi.mocked(volumeModule.volumeExistsOrThrow).mockImplementation(
       (name) => name !== "source_proj_postgres_data"
     )
     await run()
@@ -120,14 +193,82 @@ describe("setupVolumeCopy orchestration", () => {
     expect(messages).toContain("0 volume(s) cloned, 1 skipped")
   })
 
+  it("fails before source-missing skip when the target is foreign or has unmanaged data", async () => {
+    vi.mocked(volumeModule.volumeExistsOrThrow).mockImplementation(
+      (name) => name !== "source_proj_postgres_data"
+    )
+    vi.mocked(volumeModule.preflightTargetVolumeForCopy).mockImplementationOnce(() => {
+      throw new Error(
+        "Target volume 'target_proj_postgres_data' has data but is not wtb-managed"
+      )
+    })
+
+    const result = await run(true)
+
+    expect(result.skipped).toEqual([])
+    expect(result.failed).toEqual([
+      expect.objectContaining({
+        name: "postgres_data",
+        error: expect.stringContaining("not wtb-managed"),
+      }),
+    ])
+    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+  })
+
+  it("preflights and safely recreates an empty unmanaged target even when source is absent", async () => {
+    vi.mocked(volumeModule.volumeExistsOrThrow).mockImplementation(
+      (name) => name !== "source_proj_postgres_data"
+    )
+    vi.mocked(volumeModule.preflightTargetVolumeForCopy).mockReturnValueOnce({
+      state: "recreated-empty",
+      size: 0,
+    })
+
+    const result = await run()
+
+    expect(volumeModule.preflightTargetVolumeForCopy).toHaveBeenCalledWith(
+      "target_proj_postgres_data",
+      {
+        repo: "repohash",
+        project: "target_proj",
+        branch: "feature/test",
+      }
+    )
+    expect(result).toEqual({
+      cloned: [],
+      skipped: [{ name: "postgres_data", reason: "source volume does not exist yet" }],
+      failed: [],
+    })
+  })
+
+  it("preflights every target before checking whether any source exists", async () => {
+    vi.mocked(composeModule.readComposeFile).mockReturnValue(
+      composeFixture({ postgres_data: null, cache: null })
+    )
+    vi.mocked(volumeModule.preflightTargetVolumeForCopy).mockReturnValue({
+      state: "missing",
+      size: 0,
+    })
+    vi.mocked(volumeModule.volumeExistsOrThrow).mockReturnValue(false)
+
+    await run()
+
+    expect(volumeModule.preflightTargetVolumeForCopy).toHaveBeenCalledTimes(4)
+    const secondTargetCheckOrder = vi.mocked(volumeModule.preflightTargetVolumeForCopy).mock
+      .invocationCallOrder[1]
+    const firstSourceCheckOrder = vi.mocked(volumeModule.volumeExistsOrThrow).mock
+      .invocationCallOrder[0]
+    expect(secondTargetCheckOrder).toBeLessThan(firstSourceCheckOrder)
+  })
+
   it("stops the source stack, clones, then restarts when source is running (default)", async () => {
     // Plan step sees a running container owned by sourceProject → clone-after-stop.
     // After composeStop the post-stop re-check (getContainersUsingVolume) is empty,
     // so the clone proceeds.
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue(
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
       ownHolders("pg-main")
     )
-    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue([])
+    vi.mocked(volumeModule.getContainersUsingVolumeOrThrow).mockReturnValue([])
     await run(false)
     // Default (no --force, no --no-stop): stop-then-copy makes the running DB safe to clone.
     expect(composeModule.composeStop).toHaveBeenCalledTimes(1)
@@ -155,11 +296,47 @@ describe("setupVolumeCopy orchestration", () => {
     expect(messages).toContain("Source stack restarted")
   })
 
-  it("restarts the source stack even when copyVolume throws (crash-safe finally)", async () => {
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue(
+  it("holds the deterministic source clone lock through the final source restart", async () => {
+    const release = vi.fn()
+    vi.mocked(volumeModule.acquireVolumeCloneOperationLock).mockReturnValue({
+      containerName: "wtb-volume-clone-lock-test",
+      release,
+    })
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
       ownHolders("pg-main")
     )
-    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue([])
+
+    await run(false)
+
+    expect(volumeModule.acquireVolumeCloneOperationLock).toHaveBeenCalledWith(
+      "repohash",
+      "source_proj"
+    )
+    expect(composeModule.composeStart).toHaveBeenCalled()
+    expect(vi.mocked(composeModule.composeStart).mock.invocationCallOrder[0]).toBeLessThan(
+      release.mock.invocationCallOrder[0]
+    )
+  })
+
+  it("fails before planning or stopping when the source clone lock is already held", async () => {
+    vi.mocked(volumeModule.acquireVolumeCloneOperationLock).mockImplementation(() => {
+      throw new Error("another clone is running")
+    })
+
+    const result = await run(false)
+
+    expect(result.failed).toEqual([
+      expect.objectContaining({ error: expect.stringContaining("another clone is running") }),
+    ])
+    expect(composeModule.composeStop).not.toHaveBeenCalled()
+    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+  })
+
+  it("restarts the source stack even when copyVolume throws (crash-safe finally)", async () => {
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
+      ownHolders("pg-main")
+    )
+    vi.mocked(volumeModule.getContainersUsingVolumeOrThrow).mockReturnValue([])
     vi.mocked(volumeModule.copyVolume).mockRejectedValue(new Error("rsync exploded"))
     await run(false)
     expect(composeModule.composeStop).toHaveBeenCalledTimes(1)
@@ -174,10 +351,10 @@ describe("setupVolumeCopy orchestration", () => {
     // Plan classifies it as clone-after-stop (own-project holder), so we stop. But the
     // post-stop re-check still finds a holder (e.g. a stray container our composeStop
     // didn't catch) — wtb must NOT live-copy it; it must skip, but still restart our stack.
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue(
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
       ownHolders("pg-main")
     )
-    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue(["pg-main"])
+    vi.mocked(volumeModule.getContainersUsingVolumeOrThrow).mockReturnValue(["pg-main"])
     await run(false)
     expect(composeModule.composeStop).toHaveBeenCalledTimes(1)
     expect(volumeModule.copyVolume).not.toHaveBeenCalled()
@@ -189,7 +366,7 @@ describe("setupVolumeCopy orchestration", () => {
   it("foreign-project holder → skip WITHOUT stopping the source stack", async () => {
     // The volume is held by ANOTHER Compose project. Stopping OUR source stack would
     // not free it, so wtb must skip the volume and never call composeStop.
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue([
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue([
       { name: "other-proj-db", project: "other_proj" },
     ])
     await run(false)
@@ -205,12 +382,12 @@ describe("setupVolumeCopy orchestration", () => {
       composeFixture({ postgres_data: null, shared_cache: null })
     )
     // postgres_data held by sourceProject (clone-after-stop); shared_cache held by foreign.
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockImplementation((name) =>
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockImplementation((name) =>
       name === "source_proj_postgres_data"
         ? ownHolders("pg-main")
         : [{ name: "other-db", project: "other_proj" }]
     )
-    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue([]) // post-stop recheck clean
+    vi.mocked(volumeModule.getContainersUsingVolumeOrThrow).mockReturnValue([]) // post-stop recheck clean
     const result = await run(false)
     expect(composeModule.composeStop).toHaveBeenCalledTimes(1)
     expect(result.cloned).toEqual(["postgres_data"])
@@ -223,8 +400,8 @@ describe("setupVolumeCopy orchestration", () => {
     ])
   })
 
-  it("when composeStop throws, falls back to per-volume skip and does NOT restart", async () => {
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue(
+  it("when composeStop throws, marks affected volumes failed and restores a possibly partial stop", async () => {
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
       ownHolders("pg-main")
     )
     vi.mocked(composeModule.composeStop).mockImplementation(() => {
@@ -232,20 +409,65 @@ describe("setupVolumeCopy orchestration", () => {
     })
     const result = await run(false)
     expect(volumeModule.copyVolume).not.toHaveBeenCalled()
-    // Nothing was stopped, so nothing must be (re)started.
-    expect(composeModule.composeStart).not.toHaveBeenCalled()
-    expect(result.skipped).toEqual([
+    // A failed/timeout stop may have already stopped some services, so recovery is mandatory.
+    expect(composeModule.composeStart).toHaveBeenCalledTimes(1)
+    expect(composeModule.composeUp).not.toHaveBeenCalled()
+    expect(result.skipped).toEqual([])
+    expect(result.failed).toEqual([
       {
         name: "postgres_data",
-        reason: "could not stop source stack to clone a live source volume",
+        error: "could not safely stop source stack: docker daemon down",
       },
     ])
+    expect(result.sourceStack).toEqual({
+      stopped: false,
+      restarted: true,
+      stopError: "docker daemon down",
+    })
     const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
-    expect(messages).toContain("Could not stop source stack")
+    expect(messages).toContain("Could not safely stop source stack")
+    expect(messages).toContain("Source stack restored")
+  })
+
+  it("records both stop and recovery failures when a partial stop cannot be restored", async () => {
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
+      ownHolders("pg-main")
+    )
+    vi.mocked(composeModule.composeStop).mockImplementation(() => {
+      throw new Error("stop timed out")
+    })
+    vi.mocked(composeModule.composeStart).mockImplementation(() => {
+      throw new Error("start failed")
+    })
+    vi.mocked(composeModule.composeUp).mockImplementation(() => {
+      throw new Error("up failed")
+    })
+
+    const result = await run(false)
+
+    expect(composeModule.composeStart).toHaveBeenCalledTimes(1)
+    expect(composeModule.composeUp).toHaveBeenCalledTimes(1)
+    expect(result.failed).toEqual([
+      {
+        name: "postgres_data",
+        error: "could not safely stop source stack: stop timed out",
+      },
+      expect.objectContaining({
+        name: "source_proj",
+        error: expect.stringContaining("intentionally retained"),
+      }),
+    ])
+    expect(result.sourceStack).toEqual({
+      stopped: false,
+      restarted: false,
+      stopError: "stop timed out",
+      restartError: "up failed",
+      recoverCommand: "docker compose -f '/repo/docker-compose.yml' -p 'source_proj' up -d",
+    })
   })
 
   it("with --no-stop, skips a running source volume (preserves old behavior)", async () => {
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue(
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
       ownHolders("pg-main")
     )
     await run(false, baseConfig(), false)
@@ -264,7 +486,7 @@ describe("setupVolumeCopy orchestration", () => {
   })
 
   it("clones live without stopping when force=true (live-copy path preserved)", async () => {
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue(
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
       ownHolders("pg-main")
     )
     await run(true)
@@ -282,28 +504,26 @@ describe("setupVolumeCopy orchestration", () => {
     expect(messages).toContain("target volume already has data")
   })
 
-  it("skips when target volume size cannot be determined and force=false", async () => {
-    // getVolumeSize returns null on a probe failure — must NOT be treated as empty
-    // (which would silently overwrite). Skip instead.
+  it("fails closed when target volume size cannot be determined and force=false", async () => {
     vi.mocked(volumeModule.getVolumeSize).mockImplementation((name) =>
       name === "target_proj_postgres_data" ? null : 0
     )
-    await run(false)
+    const result = await run(false)
     expect(volumeModule.copyVolume).not.toHaveBeenCalled()
-    const messages = logSpy.mock.calls.map((c) => c[0]).join("\n")
-    expect(messages).toContain("target volume size could not be determined")
+    expect(result.failed).toEqual([
+      expect.objectContaining({ error: expect.stringContaining("Cannot determine size") }),
+    ])
   })
 
-  it("overwrites when target size is unknown and force=true", async () => {
+  it("fails closed when target size is unknown even with force=true", async () => {
     vi.mocked(volumeModule.getVolumeSize).mockImplementation((name) =>
       name === "target_proj_postgres_data" ? null : 0
     )
-    await run(true)
-    expect(volumeModule.copyVolume).toHaveBeenCalledWith(
-      "source_proj_postgres_data",
-      "target_proj_postgres_data",
-      expect.objectContaining({ clearTarget: true })
-    )
+    const result = await run(true)
+    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+    expect(result.failed).toEqual([
+      expect.objectContaining({ error: expect.stringContaining("Cannot determine size") }),
+    ])
   })
 
   it("clears target and clones when target has data and force=true", async () => {
@@ -353,7 +573,9 @@ describe("setupVolumeCopy orchestration", () => {
     vi.mocked(composeModule.readComposeFile).mockReturnValue(
       composeFixture({ postgres_data: null, cache: null })
     )
-    vi.mocked(volumeModule.volumeExists).mockImplementation((name) => name !== "source_proj_cache")
+    vi.mocked(volumeModule.volumeExistsOrThrow).mockImplementation(
+      (name) => name !== "source_proj_cache"
+    )
     const result = await run()
     expect(result).toEqual({
       cloned: ["postgres_data"],
@@ -375,7 +597,7 @@ describe("setupVolumeCopy orchestration", () => {
   })
 
   it("records the --no-stop skip reason for an in-use source volume", async () => {
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue(
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
       ownHolders("pg-main")
     )
     const result = await run(false, baseConfig(), false)
@@ -412,7 +634,7 @@ describe("setupVolumeCopy orchestration", () => {
     // has data, the old code stopped the source stack first. plan-before-stop must
     // classify all as skip and never stop.
     vi.mocked(volumeModule.getVolumeSize).mockReturnValue(1024) // every target has data
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue(
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
       ownHolders("pg-main")
     )
     await run(false)
@@ -422,10 +644,10 @@ describe("setupVolumeCopy orchestration", () => {
   })
 
   it("falls back to composeUp when composeStart throws on restart", async () => {
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue(
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
       ownHolders("pg-main")
     )
-    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue([])
+    vi.mocked(volumeModule.getContainersUsingVolumeOrThrow).mockReturnValue([])
     vi.mocked(composeModule.composeStart).mockImplementation(() => {
       throw new Error("no such container to start")
     })
@@ -437,10 +659,10 @@ describe("setupVolumeCopy orchestration", () => {
   })
 
   it("both composeStart AND composeUp throw → sourceStack.restarted=false + recoverCommand", async () => {
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue(
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue(
       ownHolders("pg-main")
     )
-    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue([])
+    vi.mocked(volumeModule.getContainersUsingVolumeOrThrow).mockReturnValue([])
     vi.mocked(composeModule.composeStart).mockImplementation(() => {
       throw new Error("start failed")
     })
@@ -461,9 +683,11 @@ describe("setupVolumeCopy orchestration", () => {
     vi.mocked(volumeModule.getVolumeSize).mockImplementation((name) =>
       name === "target_proj_postgres_data" ? 1024 : 0
     )
-    vi.mocked(volumeModule.volumeIsWtbManaged).mockReturnValue(false)
+    vi.mocked(volumeModule.copyVolume).mockRejectedValue(
+      new Error("target volume has data but is not wtb-managed — refusing to overwrite")
+    )
     const result = await run(true)
-    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+    expect(volumeModule.copyVolume).toHaveBeenCalledTimes(1)
     expect(result.failed).toHaveLength(1)
     expect(result.failed[0].error).toContain("not wtb-managed")
   })
@@ -471,7 +695,7 @@ describe("setupVolumeCopy orchestration", () => {
   it("GUARD: source project === target project → all-failed, no stop, no copy", async () => {
     // Fixed `name:` / COMPOSE_PROJECT_NAME makes both project names identical. Cloning
     // would overwrite the source volume with itself — must refuse before stopping.
-    vi.mocked(composeModule.resolveComposeProjectName).mockReturnValue("same_proj")
+    vi.mocked(composeModule.resolveComposeProjectNameForWorktree).mockReturnValue("same_proj")
     const result = await run(false)
     expect(composeModule.composeStop).not.toHaveBeenCalled()
     expect(volumeModule.copyVolume).not.toHaveBeenCalled()
@@ -482,7 +706,7 @@ describe("setupVolumeCopy orchestration", () => {
     expect(result.failed[0].error).toContain("identical")
   })
 
-  it("GUARD: per-volume fixed name shared across projects (source.name===target.name) → skipped", async () => {
+  it("GUARD: per-volume non-external fixed name shared across projects is a failure", async () => {
     // resolveVolumeName returns the SAME fixed name regardless of project.
     vi.mocked(volumeModule.resolveVolumeName).mockReturnValue({
       name: "shared_fixed_volume",
@@ -490,11 +714,12 @@ describe("setupVolumeCopy orchestration", () => {
     })
     const result = await run(false)
     expect(volumeModule.copyVolume).not.toHaveBeenCalled()
-    expect(result.skipped).toEqual([
-      {
+    expect(result.skipped).toEqual([])
+    expect(result.failed).toEqual([
+      expect.objectContaining({
         name: "postgres_data",
-        reason: "volume has a fixed name shared across projects — not cloned",
-      },
+        error: expect.stringContaining("Mark it external"),
+      }),
     ])
   })
 })
@@ -517,14 +742,21 @@ describe("executeCreateCommand — source-restart-failure exit code (H5)", () =>
 
     // git / config plumbing for the full create flow.
     vi.mocked(repositoryModule.getGitRootOrThrow).mockReturnValue("/repo")
+    vi.mocked(repositoryModule.getRepositoryContext).mockReturnValue({
+      currentRoot: "/repo",
+      mainRoot: "/repo",
+      commonGitDir: "/repo/.git",
+    })
     vi.mocked(repositoryModule.branchExists).mockReturnValue(false)
     vi.mocked(repositoryModule.remoteBranchExists).mockReturnValue(false)
     vi.mocked(repositoryModule.revisionExists).mockReturnValue(true)
     vi.mocked(worktreeModule.getWorktreePath).mockReturnValue(null)
-    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([])
+    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+      { path: "/repo", branch: "main", head: "main-sha" },
+    ])
     vi.mocked(worktreeModule.createWorktree).mockReturnValue(undefined as never)
     vi.mocked(worktreeModule.markWtbManagedFile).mockReturnValue(undefined)
-    vi.mocked(clientModule.getUsedPorts).mockReturnValue([])
+    vi.mocked(clientModule.getUsedPortsOrThrow).mockReturnValue([])
     vi.mocked(loaderModule.loadConfig).mockReturnValue({
       base_branch: "main",
       docker_compose_file: "./docker-compose.yml",
@@ -533,6 +765,7 @@ describe("executeCreateCommand — source-restart-failure exit code (H5)", () =>
       // empty env to skip the env phase (real fs reads); volume phase is what we exercise.
       env: { file: [], adjust: {} },
       volumes: { exclude: [] },
+      compose: { isolate_name: false, container_name: "keep" },
     } as unknown as WtbConfig)
 
     // setupVolumeCopy plumbing: one own-project-held volume → clone-after-stop, then
@@ -542,21 +775,40 @@ describe("executeCreateCommand — source-restart-failure exit code (H5)", () =>
       services: { db: { image: "postgres" } },
       volumes: { postgres_data: null },
     } as ComposeConfig)
-    vi.mocked(composeModule.resolveComposeProjectName).mockImplementation((_cfg, dir) =>
-      dir.endsWith("worktree-feature-x") ? "target_proj" : "source_proj"
+    vi.mocked(composeModule.rewriteComposeIdentity).mockImplementation((cfg) => ({
+      config: { ...cfg, name: "target_proj" },
+      rewrite: {
+        projectName: { from: "source_proj", to: "target_proj" },
+        containerNames: [],
+      },
+    }))
+    vi.mocked(composeModule.adjustPortsInCompose).mockImplementation((cfg) => cfg)
+    vi.mocked(composeModule.resolveComposeProjectNameForWorktree).mockImplementation(
+      (_cfg, dir) => (dir.endsWith("worktree-feature-x") ? "target_proj" : "source_proj")
     )
+    vi.mocked(composeModule.safeResolveComposeProjectName).mockReturnValue("source_proj")
     vi.mocked(volumeModule.discoverCloneableVolumes).mockReturnValue(["postgres_data"])
     vi.mocked(volumeModule.resolveVolumeName).mockImplementation((_cfg, key, project) => ({
       name: `${project}_${key}`,
       external: false,
     }))
     vi.mocked(volumeModule.volumeExists).mockReturnValue(true)
+    vi.mocked(volumeModule.volumeExistsOrThrow).mockReturnValue(true)
     vi.mocked(volumeModule.getVolumeSize).mockReturnValue(0)
-    vi.mocked(volumeModule.getContainersUsingVolumeWithProject).mockReturnValue([
+    vi.mocked(volumeModule.preflightTargetVolumeForCopy).mockReturnValue({
+      state: "owned",
+      size: 0,
+    })
+    vi.mocked(volumeModule.readVolumeRecoveryRecords).mockReturnValue([])
+    vi.mocked(volumeModule.getContainersUsingVolumeWithProjectOrThrow).mockReturnValue([
       { name: "pg-main", project: "source_proj" },
     ])
-    vi.mocked(volumeModule.getContainersUsingVolume).mockReturnValue([])
+    vi.mocked(volumeModule.getContainersUsingVolumeOrThrow).mockReturnValue([])
     vi.mocked(volumeModule.copyVolume).mockResolvedValue(undefined)
+    vi.mocked(volumeModule.acquireVolumeCloneOperationLock).mockReturnValue({
+      containerName: "wtb-volume-clone-lock-test",
+      release: vi.fn(),
+    })
     vi.mocked(composeModule.composeStart).mockImplementation(() => {
       throw new Error("start failed")
     })
@@ -587,6 +839,27 @@ describe("executeCreateCommand — source-restart-failure exit code (H5)", () =>
     exit.mockRestore()
   })
 
+  it("holds the repository lock through Compose setup and releases it before volume cloning", async () => {
+    const release = vi.fn().mockResolvedValue(undefined)
+    vi.mocked(repositoryModule.acquireRepositoryLock).mockResolvedValue(release)
+
+    await command.parseAsync(["feature/x"], { from: "user" })
+
+    // The long create allocation lock is released before cloning. Because this
+    // fixture deliberately leaves the source stack down, lifecycle target
+    // preparation is skipped and no second short repository lock is acquired.
+    expect(release).toHaveBeenCalledTimes(1)
+    expect(volumeModule.copyVolume).toHaveBeenCalled()
+    const composeReadOrder = vi.mocked(composeModule.readComposeFile).mock.invocationCallOrder
+    // setupDockerCompose reads the selected branch file plus main for the source-identity
+    // guard while the lock is held. Volume planning starts with the next source/target reads.
+    expect(composeReadOrder[0]).toBeLessThan(release.mock.invocationCallOrder[0])
+    expect(composeReadOrder[1]).toBeLessThan(release.mock.invocationCallOrder[0])
+    expect(release.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(volumeModule.copyVolume).mock.invocationCallOrder[0]
+    )
+  })
+
   it("--json still flushes its payload and sets exitCode=5", async () => {
     const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
     const exit = vi.spyOn(process, "exit").mockImplementation(() => {
@@ -605,5 +878,60 @@ describe("executeCreateCommand — source-restart-failure exit code (H5)", () =>
     expect(payload.ok).toBe(false)
     writeSpy.mockRestore()
     exit.mockRestore()
+  })
+
+  it("fails closed without rewriting Compose when the Docker port reservation query fails", async () => {
+    vi.mocked(clientModule.getUsedPortsOrThrow).mockImplementation(() => {
+      throw new Error("daemon unavailable")
+    })
+    const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
+
+    await command.parseAsync(["feature/x", "--json"], { from: "user" })
+
+    const jsonCall = writeSpy.mock.calls.find((call) => String(call[0]).trim().startsWith("{"))
+    const payload = JSON.parse(jsonCall?.[0] as string)
+    expect(payload.ok).toBe(false)
+    expect(payload.composeFailed).toBe(true)
+    expect(payload.setupFailures).toEqual([
+      expect.objectContaining({ message: expect.stringContaining("daemon unavailable") }),
+    ])
+    expect(composeModule.writeComposeFile).not.toHaveBeenCalled()
+    expect(volumeModule.copyVolume).not.toHaveBeenCalled()
+    writeSpy.mockRestore()
+  })
+
+  it("treats recovery failure after a timed-out partial stop as exit 5 and reports both errors", async () => {
+    vi.mocked(composeModule.composeStop).mockImplementation(() => {
+      throw new Error("stop timed out")
+    })
+    const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
+
+    await command.parseAsync(["feature/x", "--json"], { from: "user" })
+
+    expect(process.exitCode).toBe(EXIT_CODES.DOCKER_ERROR)
+    const jsonCall = writeSpy.mock.calls.find((c) => String(c[0]).trim().startsWith("{"))
+    expect(jsonCall).toBeDefined()
+    const payload = JSON.parse(jsonCall?.[0] as string)
+    expect(payload.sourceRestartFailed).toBe(true)
+    expect(payload.ok).toBe(false)
+    expect(payload.volumes.failed).toEqual([
+      expect.objectContaining({
+        name: "postgres_data",
+        error: expect.stringContaining("stop timed out"),
+      }),
+      expect.objectContaining({
+        name: "source_proj",
+        error: expect.stringContaining("intentionally retained"),
+      }),
+    ])
+    expect(payload.volumes.sourceStack).toEqual(
+      expect.objectContaining({
+        stopped: false,
+        restarted: false,
+        stopError: "stop timed out",
+        restartError: "up failed",
+      })
+    )
+    writeSpy.mockRestore()
   })
 })

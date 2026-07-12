@@ -2,22 +2,29 @@ import * as os from "node:os"
 import * as path from "node:path"
 import fs from "fs-extra"
 import { parse } from "yaml"
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { ComposeConfig } from "../../types/index.js"
+import { execDockerSafe } from "../../utils/exec.js"
 import { buildPortMap } from "../environment/propagate.js"
 import {
   adjustPortsInCompose,
+  composeDown,
   findAvailablePort,
   parsePortMapping,
   propagatePortsInComposeValues,
   readComposeFile,
   resolveComposeProjectName,
+  resolveComposeProjectNameForWorktree,
   rewriteComposeIdentity,
+  safeResolveComposeProjectName,
   sanitizeContainerName,
   sanitizeProjectSlug,
   uniqueProjectSlug,
   writeComposeFile,
 } from "./compose"
+
+// composeDown の引数検証用。この test file の他の対象関数は exec を使わない純関数。
+vi.mock("../../utils/exec.js")
 
 let tmpDir: string
 
@@ -121,6 +128,49 @@ describe("resolveComposeProjectName", () => {
   })
 })
 
+describe("resolveComposeProjectNameForWorktree", () => {
+  it("honors COMPOSE_PROJECT_NAME from the worktree .env", () => {
+    fs.writeFileSync(path.join(tmpDir, ".env"), "COMPOSE_PROJECT_NAME=from_dotenv\n")
+    expect(resolveComposeProjectNameForWorktree(empty(), tmpDir, {})).toBe("from_dotenv")
+  })
+
+  it("honors Compose dotenv export syntax and leading whitespace", () => {
+    fs.writeFileSync(
+      path.join(tmpDir, ".env"),
+      "  export COMPOSE_PROJECT_NAME='from_export' # comment\n"
+    )
+    expect(resolveComposeProjectNameForWorktree(empty(), tmpDir, {})).toBe("from_export")
+  })
+
+  it("lets the invoking environment override the worktree .env", () => {
+    fs.writeFileSync(path.join(tmpDir, ".env"), "COMPOSE_PROJECT_NAME=from_dotenv\n")
+    expect(
+      resolveComposeProjectNameForWorktree(empty(), tmpDir, {
+        COMPOSE_PROJECT_NAME: "from_shell",
+      })
+    ).toBe("from_shell")
+  })
+
+  it("interpolates top-level name from the worktree .env", () => {
+    fs.writeFileSync(path.join(tmpDir, ".env"), "APP_PROJECT=resolved_name\n")
+    const config = empty({
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal Compose interpolation
+      name: "${APP_PROJECT}",
+    } as ComposeConfig)
+    expect(resolveComposeProjectNameForWorktree(config, tmpDir, {})).toBe("resolved_name")
+  })
+
+  it("fails closed when top-level name interpolation is unresolved", () => {
+    const config = empty({
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal Compose interpolation
+      name: "${MISSING_PROJECT}",
+    } as ComposeConfig)
+    expect(() => resolveComposeProjectNameForWorktree(config, tmpDir, {})).toThrow(
+      /cannot be resolved safely/
+    )
+  })
+})
+
 describe("parsePortMapping", () => {
   it("parses HOST:CONTAINER", () => {
     expect(parsePortMapping("3000:80")).toEqual({ hostPort: 3000, containerPort: 80 })
@@ -139,6 +189,20 @@ describe("parsePortMapping", () => {
     expect(parsePortMapping("6379:6379/udp")).toMatchObject({ hostPort: 6379, containerPort: 6379 })
   })
 
+  it("parses bracketed and unbracketed IPv6 host addresses", () => {
+    expect(parsePortMapping("[::1]:3000:80/tcp")).toEqual({
+      hostPort: 3000,
+      containerPort: 80,
+      ip: "[::1]:",
+      proto: "/tcp",
+    })
+    expect(parsePortMapping("::1:5432:5432")).toMatchObject({
+      hostPort: 5432,
+      containerPort: 5432,
+      ip: "::1:",
+    })
+  })
+
   it("returns null for non-string input", () => {
     // @ts-expect-error intentional misuse
     expect(parsePortMapping(3000)).toBeNull()
@@ -152,11 +216,8 @@ describe("parsePortMapping", () => {
     expect(parsePortMapping("")).toBeNull()
   })
 
-  it("returns null for documented-unsupported forms (ranges, IPv6) — left unmapped", () => {
-    // These are valid Compose syntax but NOT in wtb's supported set; parsePortMapping
-    // returns null so adjustPortsInCompose leaves them unchanged (no silent corruption).
+  it("returns null for port ranges", () => {
     expect(parsePortMapping("5000-6000:5000-6000")).toBeNull()
-    expect(parsePortMapping("[::1]:3000:80")).toBeNull()
   })
 })
 
@@ -208,6 +269,14 @@ describe("findAvailablePort", () => {
     // Fast-path: original is free, return it unchanged.
     expect(findAvailablePort(54321, [])).toBe(54321)
   })
+
+  it("throws rather than returning an occupied port when the allocation range is exhausted", () => {
+    const used = Array.from(
+      { length: 65535 - 3000 + 1 },
+      (_, index) => 3000 + index
+    )
+    expect(() => findAvailablePort(3000, used)).toThrow(/No free TCP port/)
+  })
 })
 
 describe("adjustPortsInCompose", () => {
@@ -243,9 +312,138 @@ describe("adjustPortsInCompose", () => {
     expect(all).toEqual(["3000:80", "3001:80"])
   })
 
-  it("leaves unparseable mappings (e.g. ranges) untouched rather than corrupting them", () => {
-    const out = adjustPortsInCompose(cfg(["5000-6000:5000-6000"]), [5000])
-    expect(out.services.web.ports).toEqual(["5000-6000:5000-6000"])
+  it("preserves an IPv6 host while adjusting its published port", () => {
+    const out = adjustPortsInCompose(cfg(["[::1]:3000:80/tcp"]), [3000])
+    expect(out.services.web.ports).toEqual(["[::1]:3001:80/tcp"])
+  })
+
+  it("adjusts single numeric long-form published ports and preserves their scalar type", () => {
+    const input: ComposeConfig = {
+      services: {
+        web: {
+          image: "x",
+          ports: [
+            { target: 80, published: 3000, protocol: "tcp", mode: "host" },
+            { target: "81", published: "3000", protocol: "udp" },
+          ],
+        },
+      },
+    }
+    const out = adjustPortsInCompose(input, [3000])
+    expect(out.services.web.ports).toEqual([
+      { target: 80, published: 3001, protocol: "tcp", mode: "host" },
+      { target: "81", published: "3002", protocol: "udp" },
+    ])
+    expect(input.services.web.ports?.[0]).toMatchObject({ published: 3000 })
+  })
+
+  it("fails closed for short- and long-form port ranges", () => {
+    expect(() => adjustPortsInCompose(cfg(["5000-6000:5000-6000"]), [5000])).toThrow(
+      /unsupported port range/
+    )
+    expect(() =>
+      adjustPortsInCompose(
+        {
+          services: {
+            web: { image: "x", ports: [{ target: 80, published: "5000-6000" }] },
+          },
+        },
+        []
+      )
+    ).toThrow(/unsupported long-form port range/)
+  })
+
+  it("fails closed when a service uses host networking", () => {
+    expect(() =>
+      adjustPortsInCompose(
+        {
+          services: {
+            web: { image: "x", network_mode: "host", ports: ["3000:80"] },
+          },
+        },
+        []
+      )
+    ).toThrow(/network_mode: host/)
+  })
+
+  it("fails closed when a service joins a fixed container network namespace", () => {
+    expect(() =>
+      adjustPortsInCompose(
+        {
+          services: {
+            web: { image: "x", network_mode: "container:source-db" },
+          },
+        },
+        []
+      )
+    ).toThrow(/network_mode: container:/)
+  })
+
+  it("fails closed when network_mode is variable and could resolve to host", () => {
+    expect(() =>
+      adjustPortsInCompose(
+        {
+          services: {
+            web: {
+              image: "x",
+              // biome-ignore lint/suspicious/noTemplateCurlyInString: literal Compose interpolation
+              network_mode: "${NETWORK_MODE:-bridge}",
+            },
+          },
+        },
+        []
+      )
+    ).toThrow(/variable network_mode/)
+  })
+
+  it("fails closed for unresolved variable published ports", () => {
+    expect(() =>
+      adjustPortsInCompose(
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: literal Compose interpolation
+        cfg(["${WEB_PORT}:80"]),
+        []
+      )
+    ).toThrow(/unresolved published port/)
+    expect(() =>
+      adjustPortsInCompose(
+        {
+          services: {
+            web: {
+              image: "x",
+              ports: [
+                {
+                  target: 80,
+                  // biome-ignore lint/suspicious/noTemplateCurlyInString: literal Compose interpolation
+                  published: "${WEB_PORT}",
+                },
+              ],
+            },
+          },
+        },
+        []
+      )
+    ).toThrow(/unresolved long-form published port/)
+    expect(() =>
+      adjustPortsInCompose(
+        // Whole-scalar values may resolve to a fixed HOST:CONTAINER mapping.
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: literal Compose interpolation
+        cfg(["${PORT_SPEC}", "${PORT_SPEC:-3000:80}"]),
+        []
+      )
+    ).toThrow(/unsupported or unresolved published port/)
+  })
+
+  it("accepts a variable published port allocated by env.adjust", () => {
+    const isolated = new Set(["WEB_PORT"])
+    expect(
+      adjustPortsInCompose(
+        // biome-ignore lint/suspicious/noTemplateCurlyInString: literal Compose interpolation
+        cfg(["${WEB_PORT:-3000}:80"]),
+        [3001],
+        isolated
+      ).services.web.ports
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal Compose interpolation
+    ).toEqual(["${WEB_PORT:-3000}:80"])
   })
 })
 
@@ -403,6 +601,55 @@ describe("readComposeFile — YAML merge keys (H7)", () => {
   })
 })
 
+describe("readComposeFile — external composition safety", () => {
+  it("fails closed for top-level include", () => {
+    const filePath = path.join(tmpDir, "compose.yml")
+    fs.writeFileSync(filePath, "include:\n  - shared.yml\nservices: {}\n")
+    expect(() => readComposeFile(filePath)).toThrow(/include is not supported safely/)
+  })
+
+  it("fails closed for service extends", () => {
+    const filePath = path.join(tmpDir, "compose.yml")
+    fs.writeFileSync(
+      filePath,
+      "services:\n  web:\n    extends:\n      file: shared.yml\n      service: base\n"
+    )
+    expect(() => readComposeFile(filePath)).toThrow(/extends is not supported safely/)
+  })
+
+  it("fails closed for volumes_from storage inheritance", () => {
+    const filePath = path.join(tmpDir, "compose.yml")
+    fs.writeFileSync(
+      filePath,
+      "services:\n  web:\n    image: app\n    volumes_from:\n      - container:main-db:rw\n"
+    )
+    expect(() => readComposeFile(filePath)).toThrow(/volumes_from is not supported safely/)
+  })
+
+  it("fails closed for non-external fixed volume/network names and custom backing storage", () => {
+    const fixtures = [
+      "services: {}\nvolumes:\n  db:\n    name: prod_db\n",
+      "services: {}\nvolumes:\n  db:\n    driver: nfs\n",
+      "services: {}\nvolumes:\n  db:\n    driver_opts:\n      type: none\n      device: /srv/prod-db\n",
+      "services: {}\nnetworks:\n  app:\n    name: prod_network\n",
+    ]
+    for (const [index, yaml] of fixtures.entries()) {
+      const filePath = path.join(tmpDir, `unsafe-${index}.yml`)
+      fs.writeFileSync(filePath, yaml)
+      expect(() => readComposeFile(filePath)).toThrow(/per-project isolation|cannot prove is isolated/)
+    }
+  })
+
+  it("allows explicitly external shared storage", () => {
+    const filePath = path.join(tmpDir, "external.yml")
+    fs.writeFileSync(
+      filePath,
+      "services: {}\nvolumes:\n  db:\n    external: true\n    name: prod_db\nnetworks:\n  app:\n    external: true\n    name: prod_network\n"
+    )
+    expect(readComposeFile(filePath).volumes?.db.external).toBe(true)
+  })
+})
+
 describe("uniqueProjectSlug", () => {
   it("returns the plain slug when there is no collision", () => {
     expect(uniqueProjectSlug("feature/x", ["main", "other"])).toBe("feature-x")
@@ -492,7 +739,7 @@ describe("rewriteComposeIdentity", () => {
     expect((input as { name?: string }).name).toBe("myapp")
   })
 
-  it("leaves name absent when the source has no name:", () => {
+  it("leaves name absent when neither YAML nor a resolved base project is supplied", () => {
     const { config, rewrite } = rewriteComposeIdentity(cfg(), {
       slug: "feature-x",
       isolateName: true,
@@ -500,6 +747,20 @@ describe("rewriteComposeIdentity", () => {
     })
     expect((config as { name?: string }).name).toBeUndefined()
     expect(rewrite.projectName).toBeUndefined()
+  })
+
+  it("injects a worktree-specific name when YAML name is absent but base project is resolved", () => {
+    const { config, rewrite } = rewriteComposeIdentity(cfg(), {
+      slug: "feature-x",
+      isolateName: true,
+      containerNameMode: "keep",
+      baseProjectName: "source-app",
+    })
+    expect((config as { name?: string }).name).toBe("source-app-feature-x")
+    expect(rewrite.projectName).toEqual({
+      from: "source-app",
+      to: "source-app-feature-x",
+    })
   })
 
   it("leaves name untouched when isolateName=false", () => {
@@ -609,6 +870,20 @@ describe("writeComposeFile — YAML 1.1 dangerous-value quoting (H1)", () => {
     return (parsed.services.svc.environment as Record<string, string>) ?? {}
   }
 
+  it("atomically replaces an existing compose file while preserving its mode", () => {
+    const filePath = path.join(tmpDir, "docker-compose.yml")
+    fs.writeFileSync(filePath, "services: {}\n")
+    fs.chmodSync(filePath, 0o640)
+
+    writeComposeFile(filePath, { services: { svc: { image: "x" } } })
+
+    expect(readComposeFile(filePath).services.svc.image).toBe("x")
+    if (process.platform !== "win32") {
+      expect(fs.statSync(filePath).mode & 0o777).toBe(0o640)
+    }
+    expect(fs.readdirSync(tmpDir)).toEqual(["docker-compose.yml"])
+  })
+
   it('TZ: "00:00" stays a string (not sexagesimal 0)', () => {
     const result = roundTrip({ TZ: "00:00" })
     expect(result.TZ).toBe("00:00")
@@ -651,6 +926,33 @@ describe("writeComposeFile — YAML 1.1 dangerous-value quoting (H1)", () => {
   it('"on" stays a string (YAML 1.1 boolean)', () => {
     const result = roundTrip({ FEATURE: "on" })
     expect(result.FEATURE).toBe("on")
+  })
+
+  it("sequence items (command list) stay strings after re-parse", () => {
+    const filePath = path.join(tmpDir, "docker-compose.yml")
+    const config: ComposeConfig = {
+      services: { svc: { image: "x", command: ["yes", "on", "0755", "00:00"] } },
+    }
+    writeComposeFile(filePath, config)
+    const parsed = parse(fs.readFileSync(filePath, "utf-8")) as ComposeConfig
+    const command = parsed.services.svc.command as unknown[]
+    expect(command).toEqual(["yes", "on", "0755", "00:00"])
+    for (const item of command) {
+      expect(typeof item).toBe("string")
+    }
+  })
+
+  it("mapping keys are NOT quoted in the raw YAML", () => {
+    const filePath = path.join(tmpDir, "docker-compose.yml")
+    const config: ComposeConfig = {
+      services: { svc: { image: "x", environment: { on: "value", no: "value" } } },
+    }
+    writeComposeFile(filePath, config)
+    const raw = fs.readFileSync(filePath, "utf-8")
+    expect(raw).toContain("on: ")
+    expect(raw).toContain("no: ")
+    expect(raw).not.toContain('"on"')
+    expect(raw).not.toContain('"no"')
   })
 
   it("normal non-dangerous strings are NOT quoted (readability preserved)", () => {
@@ -713,5 +1015,70 @@ describe("adjustPortsInCompose — IP prefix not corrupted when port digits appe
     }
     const out = adjustPortsInCompose(cfg, [8080])
     expect(out.services.web.ports[0]).toBe("127.0.0.1:8081:80/tcp")
+  })
+})
+
+// =============================================================================
+// composeDown — docker 引数の組み立て
+// =============================================================================
+
+describe("composeDown", () => {
+  it("runs 'docker compose -f <file> -p <project> down' without -v by default", () => {
+    composeDown("/wt/compose.yml", "wtproj", "/wt")
+    expect(execDockerSafe).toHaveBeenCalledWith(
+      ["compose", "-f", "/wt/compose.yml", "-p", "wtproj", "down"],
+      { cwd: "/wt" }
+    )
+  })
+
+  it("appends -v when removeVolumes=true", () => {
+    composeDown("/wt/compose.yml", "wtproj", "/wt", true)
+    expect(execDockerSafe).toHaveBeenCalledWith(
+      ["compose", "-f", "/wt/compose.yml", "-p", "wtproj", "down", "-v"],
+      { cwd: "/wt" }
+    )
+  })
+})
+
+// =============================================================================
+// safeResolveComposeProjectName — 読めない compose は null
+// =============================================================================
+
+describe("safeResolveComposeProjectName", () => {
+  // resolveComposeProjectName は process.env.COMPOSE_PROJECT_NAME を見るため、
+  // テスト環境の値に左右されないよう一時的に外す。
+  const savedEnv = process.env.COMPOSE_PROJECT_NAME
+  beforeEach(() => {
+    delete process.env.COMPOSE_PROJECT_NAME
+  })
+  afterEach(() => {
+    if (savedEnv !== undefined) {
+      process.env.COMPOSE_PROJECT_NAME = savedEnv
+    } else {
+      delete process.env.COMPOSE_PROJECT_NAME
+    }
+  })
+
+  it("returns null when the compose file does not exist", () => {
+    expect(safeResolveComposeProjectName(path.join(tmpDir, "missing.yml"), tmpDir)).toBeNull()
+  })
+
+  it("returns null when the compose file is invalid (no services section)", () => {
+    const file = path.join(tmpDir, "broken.yml")
+    fs.writeFileSync(file, "just: a scalar\n")
+    expect(safeResolveComposeProjectName(file, tmpDir)).toBeNull()
+  })
+
+  it("resolves the project name from a readable compose", () => {
+    const file = path.join(tmpDir, "compose.yml")
+    fs.writeFileSync(file, "name: myproj\nservices: {}\n")
+    expect(safeResolveComposeProjectName(file, tmpDir)).toBe("myproj")
+  })
+
+  it("fails closed for a transient shell COMPOSE_PROJECT_NAME override", () => {
+    const file = path.join(tmpDir, "compose-shell-override.yml")
+    fs.writeFileSync(file, "name: stable-project\nservices: {}\n")
+    process.env.COMPOSE_PROJECT_NAME = "production"
+    expect(safeResolveComposeProjectName(file, tmpDir)).toBeNull()
   })
 })

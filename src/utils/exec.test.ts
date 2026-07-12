@@ -16,6 +16,13 @@ describe("execSafeSync error formatting", () => {
     expect(out).toBe("hello")
   })
 
+  it("can preserve leading whitespace for machine-readable output", () => {
+    const out = execSafeSync("node", ["-e", "process.stdout.write(' M file.txt\\n')"], {
+      preserveLeadingWhitespace: true,
+    })
+    expect(out).toBe(" M file.txt")
+  })
+
   it("captures the command's stderr into the thrown error", () => {
     try {
       execSafeSync("node", ["-e", "process.stderr.write('boom-detail'); process.exit(3)"])

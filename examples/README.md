@@ -1,6 +1,6 @@
 # wtb examples
 
-Five self-contained projects that exercise different slices of wtb, plus a runner
+Six self-contained projects that exercise different slices of wtb, plus a runner
 that drives the real CLI against any of them in a throwaway git repo — so you can
 judge production-readiness on realistic configs, not just docs.
 
@@ -11,12 +11,14 @@ judge production-readiness on realistic configs, not just docs.
 | [`compose-fullstack`](compose-fullstack/) | ✅ 4 services | `pg_data`, `redis_data` | ✅ `node_modules` | 4 ports remapped, lifecycle scripts — the full surface |
 | [`compose-minimal`](compose-minimal/) | ✅ 1 service | `db_data` | — | smallest real DB clone (stop-then-copy) |
 | [`compose-seed`](compose-seed/) | ✅ 2 services | `db_data` only | — | `volumes.exclude`, `external: true`, `--seed` |
+| [`compose-identity`](compose-identity/) | ✅ 2 services | `db_data` | — | fixed `name:`/`container_name:` + literal port → per-worktree identity rewrite (`isolate_name`, `container_name: suffix`, `port_propagation`) |
 | [`node-no-docker`](node-no-docker/) | ❌ | — | ✅ `node_modules` | no-Docker path: copy + symlink + all 3 `env.adjust` types + `start_command` |
 | [`minimal`](minimal/) | ❌ | — | — | bare baseline: copy `.env` + bump one port |
 
 Coverage across the set: every `create` phase, both Docker and non-Docker paths,
 volume cloning + exclude + external + seed, all three `env.adjust` value types,
-symlinks vs copies, and lifecycle scripts.
+symlinks vs copies, lifecycle scripts, and compose identity isolation + port
+propagation on a fixed-name (Supabase-style) stack.
 
 ## Run wtb against one
 

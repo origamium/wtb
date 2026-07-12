@@ -214,10 +214,6 @@ export interface ContainerInfo {
   status: string
   /** ポートマッピング */
   ports: string[]
-  /** ボリュームマウント */
-  volumes: string[]
-  /** ネットワーク */
-  networks: string[]
 }
 
 /**

@@ -80,10 +80,6 @@ export const ENV_FILE_NAMES = [".env", ".env.local", ".env.development", ".env.p
 /** Dockerコマンドのフォーマット */
 export const DOCKER_COMMANDS = {
   CONTAINERS: 'docker ps --format "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"',
-  CONTAINER_VOLUMES:
-    'docker inspect --format="{{range .Mounts}}{{.Source}}:{{.Destination}},{{end}}" {containerId}',
-  CONTAINER_NETWORKS:
-    'docker inspect --format="{{range $key, $value := .NetworkSettings.Networks}}{{$key}},{{end}}" {containerId}',
   VOLUMES: 'docker volume ls --format "{{.Name}}\t{{.Driver}}\t{{.Mountpoint}}"',
   MANAGED_VOLUMES: 'docker volume ls --filter label=wtb.managed=true --format "{{.Name}}"',
   VERSION: "docker --version",

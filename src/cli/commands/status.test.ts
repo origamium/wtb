@@ -42,6 +42,12 @@ describe("Status Command (Refactored)", () => {
     // Default: Docker IS configured so existing Docker-probe tests keep working.
     vi.mocked(repositoryModule.getGitRoot).mockReturnValue("/project")
     vi.mocked(repositoryModule.getGitRootOrThrow).mockReturnValue("/project")
+    vi.mocked(repositoryModule.getMainWorktreeRoot).mockReturnValue("/project")
+    vi.mocked(repositoryModule.getRepositoryContext).mockReturnValue({
+      currentRoot: "/project",
+      mainRoot: "/project",
+      commonGitDir: "/project/.git",
+    })
     vi.mocked(loaderModule.loadConfig).mockReturnValue({
       base_branch: "main",
       docker_compose_file: "./docker-compose.yml",
@@ -77,7 +83,7 @@ describe("Status Command (Refactored)", () => {
     })
 
     it("should exit with error when not in git repository", async () => {
-      vi.mocked(repositoryModule.getGitRootOrThrow).mockImplementation(() => {
+      vi.mocked(repositoryModule.getRepositoryContext).mockImplementation(() => {
         throw new CLIError("Not in a git repository", EXIT_CODES.NOT_GIT_REPOSITORY)
       })
 
@@ -92,6 +98,22 @@ describe("Status Command (Refactored)", () => {
       expect(consoleErrorSpy).toHaveBeenCalledWith("Error: Not in a git repository")
       expect(mockExit).toHaveBeenCalledWith(3) // NOT_GIT_REPOSITORY
 
+      mockExit.mockRestore()
+    })
+
+    it("propagates main configuration validation failures as CONFIG_ERROR", async () => {
+      vi.mocked(loaderModule.loadConfig).mockImplementation(() => {
+        throw new CLIError("unsafe repository-external path", EXIT_CODES.CONFIG_ERROR)
+      })
+      const mockExit = vi.spyOn(process, "exit").mockImplementation(() => {
+        throw new Error("process.exit called")
+      })
+
+      await expect(command.parseAsync([], { from: "user" })).rejects.toThrow(
+        "process.exit called"
+      )
+
+      expect(mockExit).toHaveBeenCalledWith(EXIT_CODES.CONFIG_ERROR)
       mockExit.mockRestore()
     })
   })
@@ -156,7 +178,9 @@ describe("Status Command (Refactored)", () => {
       vi.mocked(repositoryModule.getGitRoot).mockReturnValue("/project")
 
       // Mock compose file exists
-      vi.mocked(dockerComposeModule.findComposeFile).mockReturnValue("/project/docker-compose.yml")
+      vi.mocked(existsSync).mockImplementation((p) =>
+        String(p).endsWith("/docker-compose.yml")
+      )
       vi.mocked(dockerComposeModule.readComposeFile).mockReturnValue({
         version: "3.8",
         services: {
@@ -324,6 +348,30 @@ describe("Status Command (Refactored)", () => {
       })
     })
 
+    it("uses the main config's exact custom Compose path", async () => {
+      vi.mocked(loaderModule.loadConfig).mockReturnValue({
+        base_branch: "main",
+        docker_compose_file: "ops/custom-compose.yml",
+        copy_files: [],
+        link_files: [],
+        env: { file: [], adjust: {} },
+      })
+      vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+        { path: "/project", branch: "main", head: "abc" },
+      ])
+      vi.mocked(existsSync).mockImplementation((p) =>
+        String(p).endsWith("/ops/custom-compose.yml")
+      )
+      vi.mocked(dockerComposeModule.readComposeFile).mockReturnValue({ services: {} })
+
+      await command.parseAsync(["--json"], { from: "user" })
+
+      expect(dockerComposeModule.readComposeFile).toHaveBeenCalledWith(
+        "/project/ops/custom-compose.yml"
+      )
+      expect(parseStdout().worktrees[0].compose.file).toBe("custom-compose.yml")
+    })
+
     it("reports docker.available=false (valid JSON) when Docker is unavailable", async () => {
       vi.mocked(dockerClientModule.getDockerInfo).mockImplementation(() => {
         throw new Error("daemon down")
@@ -431,6 +479,11 @@ describe("Status Command — human output structure (ordered, end to end render)
     vi.mocked(repositoryModule.getGitRoot).mockReturnValue("/project")
     vi.mocked(repositoryModule.getGitRootOrThrow).mockReturnValue("/project")
     vi.mocked(repositoryModule.getCurrentBranch).mockReturnValue("main")
+    vi.mocked(repositoryModule.getRepositoryContext).mockReturnValue({
+      currentRoot: "/project",
+      mainRoot: "/project",
+      commonGitDir: "/project/.git",
+    })
     vi.mocked(loaderModule.loadConfig).mockReturnValue({
       base_branch: "main",
       docker_compose_file: "./docker-compose.yml",
@@ -457,12 +510,14 @@ describe("Status Command — human output structure (ordered, end to end render)
     vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
       { path: "/project", branch: "main", head: "abc" },
     ])
-    vi.mocked(dockerComposeModule.findComposeFile).mockReturnValue("/project/docker-compose.yml")
     vi.mocked(dockerComposeModule.readComposeFile).mockReturnValue({
       services: { web: { image: "nginx" }, db: { image: "postgres" } },
     })
     // only .env exists in the worktree → the Environment line lists exactly it
-    vi.mocked(existsSync).mockImplementation((p) => String(p).endsWith("/.env"))
+    vi.mocked(existsSync).mockImplementation((p) => {
+      const value = String(p)
+      return value.endsWith("/docker-compose.yml") || value.endsWith("/.env")
+    })
     vi.mocked(dockerClientModule.getRunningContainers).mockReturnValue([
       {
         id: "c1",
@@ -508,6 +563,11 @@ describe("Status Command — human output structure (ordered, end to end render)
 
   it("marks only the current worktree with → and only the main worktree with (main)", async () => {
     vi.mocked(repositoryModule.getCurrentBranch).mockReturnValue("feature")
+    vi.mocked(repositoryModule.getRepositoryContext).mockReturnValue({
+      currentRoot: "/project-feature",
+      mainRoot: "/project",
+      commonGitDir: "/project/.git",
+    })
     vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
       { path: "/project", branch: "main", head: "abc" }, // main, not current
       { path: "/project-feature", branch: "feature", head: "def" }, // current, not main

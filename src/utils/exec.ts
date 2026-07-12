@@ -10,6 +10,8 @@ import { isJsonOutputMode } from "./output.js"
 interface SafeExecOptions {
   cwd?: string
   env?: Record<string, string>
+  /** Preserve semantically significant leading whitespace while still trimming trailing output. */
+  preserveLeadingWhitespace?: boolean
 }
 
 /**
@@ -18,12 +20,13 @@ interface SafeExecOptions {
  */
 export function execSafeSync(file: string, args: string[], options?: SafeExecOptions): string {
   try {
-    return execFileSync(file, args, {
+    const stdout = execFileSync(file, args, {
       encoding: FILE_ENCODING,
       stdio: "pipe",
       ...(options?.cwd && { cwd: options.cwd }),
       ...(options?.env && { env: { ...process.env, ...options.env } }),
-    }).trim()
+    })
+    return options?.preserveLeadingWhitespace ? stdout.trimEnd() : stdout.trim()
   } catch (error) {
     const base = `Command failed: ${file} ${args.join(" ")}`
     // execFileSync の throw には .stderr (コマンドの実エラー出力) が載る。これを優先して

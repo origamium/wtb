@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "5fdc9ee4c2b838e996c3733b87086dadc72f9092",
+    "indexed_at": "2026-07-11T18:38:34Z",
+    "project": "wtcompose",
+    "nodes": 1545,
+    "edges": 3868,
+    "original_size": 3932160,
+    "compressed_size": 821199,
+    "compression_level": 9
+}

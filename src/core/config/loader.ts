@@ -174,7 +174,7 @@ export function createDefaultConfig(
 # Base branch for creating new worktrees
 base_branch: "${defaultConfig.base_branch}"
 
-# Docker Compose file path (relative to config file)
+# Docker Compose file path (relative to the repository root)
 docker_compose_file: "${defaultConfig.docker_compose_file}"
 
 # Files and directories to copy when creating a worktree

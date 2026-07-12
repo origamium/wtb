@@ -134,6 +134,21 @@ describe("Config Validator (Refactored)", () => {
       expect(() => validateConfig(invalidConfig, configFile)).not.toThrow()
     })
 
+    it("resolves paths from a .wtb/config file against the repository root", () => {
+      const cfg = {
+        base_branch: "main",
+        docker_compose_file: "compose.yml",
+        copy_files: [],
+        link_files: [],
+        env: { file: [".env"], adjust: {} },
+      } as WtbConfig
+
+      validateConfig(cfg, "/repo/.wtb/config.yaml")
+
+      expect(existsSync).toHaveBeenCalledWith("/repo/compose.yml")
+      expect(existsSync).toHaveBeenCalledWith("/repo/.env")
+    })
+
     it("should throw when volumes.seed_command is not a string", () => {
       const invalidConfig = {
         base_branch: "main",
@@ -160,6 +175,31 @@ describe("Config Validator (Refactored)", () => {
       const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
       expect(() => validateConfig(validConfig, configFile)).not.toThrow()
       stderrSpy.mockRestore()
+    })
+
+    it("rejects absolute and parent-traversing configured paths", () => {
+      const invalidConfig = {
+        base_branch: "main",
+        docker_compose_file: "",
+        copy_files: ["/tmp/secret", "safe/../outside"],
+        link_files: [],
+        env: { file: [], adjust: {} },
+      } as WtbConfig
+
+      expect(() => validateConfig(invalidConfig, configFile)).toThrow(/repository-relative/)
+      expect(() => validateConfig(invalidConfig, configFile)).toThrow(/must not contain '\.\.'/)
+    })
+
+    it("rejects a link path that would redirect an env write", () => {
+      const invalidConfig = {
+        base_branch: "main",
+        docker_compose_file: "",
+        copy_files: [],
+        link_files: ["config"],
+        env: { file: ["config/.env"], adjust: {} },
+      } as WtbConfig
+
+      expect(() => validateConfig(invalidConfig, configFile)).toThrow(/ancestor of a write/)
     })
   })
 

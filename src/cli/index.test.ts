@@ -37,6 +37,72 @@ describe("CLI exit codes (commander exitOverride)", () => {
     expect(exitSpy).toHaveBeenCalledWith(EXIT_CODES.INVALID_USAGE)
   })
 
+  it("emits one remove JSON contract object for a usage error", () => {
+    const previousArgv = process.argv
+    process.argv = [previousArgv[0], previousArgv[1], "remove", "--json"]
+    const program = createMainProgram()
+    try {
+      expect(() => program.parse(["remove", "--json"], { from: "user" })).toThrow("exit")
+      const jsonWrites = stdoutSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((value) => value.trim().startsWith("{"))
+      expect(jsonWrites).toHaveLength(1)
+      expect(JSON.parse(jsonWrites[0])).toMatchObject({
+        branch: null,
+        removed: false,
+        composeDown: null,
+        endCommand: null,
+        ok: false,
+      })
+      expect(exitSpy).toHaveBeenCalledWith(EXIT_CODES.INVALID_USAGE)
+    } finally {
+      process.argv = previousArgv
+    }
+  })
+
+  it("does not emit remove JSON when another command merely uses 'remove' as an argument", () => {
+    const previousArgv = process.argv
+    process.argv = [
+      previousArgv[0],
+      previousArgv[1],
+      "create",
+      "remove",
+      "--json",
+      "--bogus",
+    ]
+    const program = createMainProgram()
+    try {
+      expect(() =>
+        program.parse(["create", "remove", "--json", "--bogus"], { from: "user" })
+      ).toThrow("exit")
+      expect(
+        stdoutSpy.mock.calls
+          .map((call) => String(call[0]))
+          .filter((value) => value.trim().startsWith("{"))
+      ).toEqual([])
+    } finally {
+      process.argv = previousArgv
+    }
+  })
+
+  it("does not treat --json after the option terminator as a remove option", () => {
+    const previousArgv = process.argv
+    process.argv = [previousArgv[0], previousArgv[1], "remove", "feature/x", "--", "--json"]
+    const program = createMainProgram()
+    try {
+      expect(() =>
+        program.parse(["remove", "feature/x", "--", "--json"], { from: "user" })
+      ).toThrow("exit")
+      expect(
+        stdoutSpy.mock.calls
+          .map((call) => String(call[0]))
+          .filter((value) => value.trim().startsWith("{"))
+      ).toEqual([])
+    } finally {
+      process.argv = previousArgv
+    }
+  })
+
   it("exits with INVALID_USAGE (2) for an unknown option", () => {
     const program = createMainProgram()
     expect(() => program.parse(["--bogus-flag"], { from: "user" })).toThrow("exit")

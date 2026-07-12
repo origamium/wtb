@@ -11,7 +11,7 @@ import { interpolateComposeValue } from "../../core/docker/interpolation.js"
 import { parsePortMapping, readComposeFile } from "../../core/docker/compose.js"
 import { resolveComposePath } from "../../core/docker/locate.js"
 import { buildWorktreeEnvMap } from "../../core/environment/env-map.js"
-import { getGitRootOrThrow } from "../../core/git/repository.js"
+import { getRepositoryContext } from "../../core/git/repository.js"
 import { listWorktrees } from "../../core/git/worktree.js"
 import type {
   ComposeServicePorts,
@@ -53,10 +53,11 @@ async function executePortsCommand(
     )
   }
 
-  const gitRoot = getGitRootOrThrow()
+  const repository = getRepositoryContext()
+  const gitRoot = repository.mainRoot
   const config = loadConfig(gitRoot)
-  const worktrees = listWorktrees()
-  const currentPath = path.resolve(process.cwd())
+  const worktrees = listWorktrees(gitRoot)
+  const currentPath = repository.currentRoot
 
   if (branch) {
     // gatherPortsForWorktree は WorktreeInfo 全体を必要とするため、
@@ -113,10 +114,18 @@ function pickCurrentWorktree(
   gitRoot: string
 ): WorktreeInfo | null {
   const resolvedCwd = path.resolve(currentPath)
-  const byCwd = worktrees.find((wt) => {
+  const exact = worktrees.find((wt) => path.resolve(wt.path) === resolvedCwd)
+  if (exact) return exact
+
+  // For callers that pass a nested directory, choose the deepest containing
+  // worktree. The main worktree may itself be an ancestor of a manually placed
+  // linked worktree, so first-match order is not safe.
+  const byCwd = worktrees
+    .filter((wt) => {
     const resolved = path.resolve(wt.path)
-    return resolvedCwd === resolved || resolvedCwd.startsWith(`${resolved}${path.sep}`)
-  })
+      return resolvedCwd.startsWith(`${resolved}${path.sep}`)
+    })
+    .sort((a, b) => path.resolve(b.path).length - path.resolve(a.path).length)[0]
   if (byCwd) return byCwd
   return worktrees.find((wt) => path.resolve(wt.path) === path.resolve(gitRoot)) ?? null
 }

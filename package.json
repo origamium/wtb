@@ -1,6 +1,6 @@
 {
   "name": "@schemelisp/wtb",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publishConfig": {
     "access": "public"
   },
@@ -24,11 +24,15 @@
     "format": "biome format --write src/ e2e/",
     "check": "biome check --write src/ e2e/",
     "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
     "test": "vitest",
     "test:ui": "vitest --ui",
+    "pretest:run": "npm run build",
     "test:run": "vitest run",
     "test:unit": "vitest run src/",
+    "pretest:e2e": "npm run build",
     "test:e2e": "vitest run e2e/",
+    "pretest:integration": "npm run build",
     "test:integration": "bash e2e/integration-docker.sh",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build && npm run test:run"

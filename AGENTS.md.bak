@@ -1,0 +1,66 @@
+<claude-mem-context>
+# Memory Context
+
+# [wtcompose] recent context, 2026-07-12 3:38am GMT+9
+
+Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision
+Format: ID TIME TYPE TITLE
+Fetch details: get_observations([IDs]) | Search: mem-search skill
+
+Stats: 50 obs (23,105t read) | 6,257,812t work | 100% savings
+
+### Jul 10, 2026
+2948 5:59a 🔵 wtcompose: Docker Volume Ownership Safety Gap Identified
+2949 " 🟣 wtcompose: New volume-removal.ts module with assertComposeVolumesSafeForRemoval
+2950 " 🔴 wtcompose: remove command substantially rewritten with JSON output, locked-worktree guard, and pre-removal revalidation
+2951 " 🟣 wtcompose: down --remove-volumes ownership guard added to updown command
+2952 " 🔵 wtcompose: Volume copy system architecture confirmed — atomic overwrite with recovery record
+2953 " ✅ wtcompose: All 55 tests pass after ownership guard additions — typecheck and lint clean
+2959 6:04a 🔴 wtcompose: planVolumeClones target preflight moved before source-existence check
+2960 " 🟣 wtcompose: prepareTargetVolumeForCopy split into preflightTargetVolumeForCopy + prepare
+2961 " ✅ wtcompose: 94 tests pass after preflightTargetVolumeForCopy refactor — typecheck and lint clean
+2967 6:06a 🔵 wtb: Git Worktree Wrapper Project — Audit Requested
+2971 6:09a 🔵 wtb: Docker Compose project collision detection exists in create.ts
+2972 6:11a 🔵 wtb: Volume copy safety — TOCTOU guard and target-data protection in create.ts
+2979 6:14a 🔵 wtb: Full Docker Compose isolation architecture — project naming, volume guards, port allocation, and identity rewrite pipeline
+2987 6:18a 🔵 wtb: Atomic file write, symlink replacement, and copy safety patterns confirmed across create.ts utilities
+2988 " 🔵 wtb: config path validation architecture — resolveRepositoryPath, symlink ancestor rejection, and cross-field conflict detection
+2993 6:25a 🔵 wtb: volume.ts now has target volume lease (TargetVolumeLease) — pins target with stopped container throughout copy lifecycle
+2994 " 🔵 wtb: preflightTargetComposeVolumes called twice — before data phase and inside setupVolumeCopy — double TOCTOU guard for ALL target volumes
+2998 6:30a 🔵 wtb: reclone.ts is architecturally sound — correctly uses mainRoot, rejects main-repo target, delegates to setupVolumeCopy (which now includes double preflight)
+3007 6:35a 🔵 wtb: interpolation.ts one-pass regex handles all Docker Compose variable syntaxes correctly including ${VAR:?msg} required-variable syntax and $$ escape
+3008 " 🔵 wtb: resolveComposeProjectName test coverage is thorough — COMPOSE_PROJECT_NAME env precedence, empty-string fallback, dir-basename normalization, leading separator guard all tested
+3011 6:36a 🔵 wtb: withComposeSnapshot avoids TOCTOU in compose down — writes validated compose to immutable temp file, passes snapshot path to docker compose, cleans up in finally
+3018 6:39a 🔵 wtb: Lease implementation has been UPGRADED from stopped containers to running keepalive containers — significantly stronger identity verification via assertLeaseContainerStillValid
+3019 " 🔵 wtb: preflightTargetComposeVolumes now checks recovery records — target volumes with active recovery records are blocked, preventing reuse of a mid-overwrite target
+3023 6:44a 🔵 wtb: Volume lease containers upgraded from stopped to running — LEASE_KEEPALIVE_COMMAND provides stronger safety guarantees
+3024 " 🔵 wtb: preflightTargetComposeVolumes blocks reuse of volumes with active recovery records
+3025 " 🔵 wtb: Copy and link phases protected by two pre-flight guards against recursive copies and symlink escapes
+3026 " 🔵 wtb: Target lifecycle lease held across seed_command and start_command window — released in finally block for exception safety
+3034 6:49a 🔵 wtb: VolumeCloneOperationLock serializes concurrent clone operations — running container with `wtb.lock=volume-clone` label
+3035 " 🔴 wtb: assertTargetLeaseStillValid correctly excludes own lease container from activeHolders check
+3036 " 🔴 wtb: Unit test suite passes — 154 tests across volume, prune, create.volume, and updown test files
+3037 " 🔵 wtb: Config-level path validation performs cross-field symlink hazard detection before runtime
+3038 " 🔴 wtb: Comprehensive audit complete — no remaining correctness issues found; all critical safety invariants confirmed
+3049 6:53a 🔴 wtb: acquireVolumeCloneOperationLock confirmed called and released in setupVolumeCopy
+3050 " 🔴 wtb: client.ts uses execSync shell strings but repoLabel injection is safely validated
+3051 " 🔵 wtb: atomicWriteFileSync utility — crash-resistant file replacement with mode preservation
+3052 " 🔴 wtb: Comprehensive audit COMPLETE — final state ready for user report
+3061 6:58a 🔴 wtb: contracts_reaudit COMPLETE — assertNoTransientComposeProjectOverride and safeResolveComposeProjectName verified in all callers
+3066 7:04a 🔵 wtb: DockerComposeProjectInspectionError class added — distinguishes Docker unavailable from ownership conflicts
+3067 " 🔵 wtb: copyVolumeAtomicOverwrite deep-read — all 4 phases + SIGINT handler + cleanup logic fully confirmed correct
+3068 7:09a 🔵 wtb: Git Worktree Wrapper — Audit Session Initiated
+3073 7:13a 🔵 wtb: Git Worktree Wrapper — Audit Session Initiated
+3079 7:16a 🔵 wtb: Git Worktree Wrapper Project — Audit Session Initiated
+3084 7:21a 🔵 wtcompose: Full Test Suite — 160 Tests Passing Across 4 Files
+3085 " 🔵 wtcompose: Docker Compose Safety Guards — Network Mode and Project Uniqueness
+3086 " 🔵 wtcompose: Port Reservation System — Cross-Worktree Collision Avoidance
+3090 7:23a 🔵 wtcompose: assertComposeNetworkingSafe Applied to updown.ts — Up-Only Guard
+3091 " 🔵 wtcompose: Full Audit Verification — TypeCheck, Lint, 161 Tests All Green
+### Jul 12, 2026
+3289 2:57a 🔵 wtb — Git Worktree Branch Environment Manager
+3290 2:58a 🔵 wtb CLI — Full Command Reference (remove, reclone, up/down, prune, ls, path, ports, status, doctor, init-claude)
+3293 3:25a 🔵 wtcompose — wtb.yaml Example Files Structure Confirmed
+
+Access 6258k tokens of past work via get_observations([IDs]) or mem-search skill.
+</claude-mem-context>

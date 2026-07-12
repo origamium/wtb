@@ -2,17 +2,15 @@
  * @fileoverview environment/processor.ts のユニットテスト
  */
 
-import { existsSync } from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 import fs from "fs-extra"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
-  backupEnvFile,
   copyAndAdjustEnvFile,
   parseEnvContent,
-  restoreEnvFile,
   serializeEnvFile,
+  writeEnvFile,
 } from "./processor.js"
 
 // =============================================================================
@@ -169,6 +167,22 @@ describe("serializeEnvFile", () => {
     const serialized = serializeEnvFile(parsed)
 
     expect(serialized).toBe(content)
+  })
+})
+
+describe("writeEnvFile", () => {
+  it("atomically replaces the file while preserving its mode", () => {
+    const filePath = path.join(tmpDir, ".env")
+    fs.writeFileSync(filePath, "OLD=1\n")
+    fs.chmodSync(filePath, 0o640)
+
+    writeEnvFile(filePath, parseEnvContent("NEW=2\n"))
+
+    expect(fs.readFileSync(filePath, "utf8")).toBe("NEW=2\n")
+    if (process.platform !== "win32") {
+      expect(fs.statSync(filePath).mode & 0o777).toBe(0o640)
+    }
+    expect(fs.readdirSync(tmpDir)).toEqual([".env"])
   })
 })
 
@@ -392,58 +406,6 @@ describe("copyAndAdjustEnvFile", () => {
     const result = fs.readFileSync(targetPath, "utf-8")
     expect(result).toContain("A=1")
     expect(result).toContain("B=2")
-  })
-})
-
-// =============================================================================
-// backupEnvFile / restoreEnvFile
-// =============================================================================
-
-describe("backupEnvFile", () => {
-  it("should create a backup file with .backup extension", () => {
-    const filePath = path.join(tmpDir, ".env")
-    fs.writeFileSync(filePath, "KEY=value\n")
-
-    const backupPath = backupEnvFile(filePath)
-
-    expect(existsSync(backupPath)).toBe(true)
-    expect(backupPath).toBe(`${filePath}.backup`)
-    expect(fs.readFileSync(backupPath, "utf-8")).toBe("KEY=value\n")
-  })
-
-  it("should use custom suffix", () => {
-    const filePath = path.join(tmpDir, ".env")
-    fs.writeFileSync(filePath, "KEY=value\n")
-
-    const backupPath = backupEnvFile(filePath, ".bak")
-
-    expect(backupPath).toBe(`${filePath}.bak`)
-    expect(existsSync(backupPath)).toBe(true)
-  })
-
-  it("should not throw when source does not exist", () => {
-    const filePath = path.join(tmpDir, ".nonexistent")
-    expect(() => backupEnvFile(filePath)).not.toThrow()
-  })
-})
-
-describe("restoreEnvFile", () => {
-  it("should restore file from backup", () => {
-    const filePath = path.join(tmpDir, ".env")
-    const backupPath = `${filePath}.backup`
-    fs.writeFileSync(filePath, "CURRENT=value\n")
-    fs.writeFileSync(backupPath, "ORIGINAL=value\n")
-
-    restoreEnvFile(filePath)
-
-    expect(fs.readFileSync(filePath, "utf-8")).toBe("ORIGINAL=value\n")
-  })
-
-  it("should throw when backup does not exist", () => {
-    const filePath = path.join(tmpDir, ".env")
-    fs.writeFileSync(filePath, "KEY=value\n")
-
-    expect(() => restoreEnvFile(filePath)).toThrow("Backup file not found")
   })
 })
 

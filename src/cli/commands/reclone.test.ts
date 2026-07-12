@@ -35,7 +35,12 @@ describe("reclone command", () => {
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {})
     errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
     command = recloneCommand()
-    vi.mocked(repositoryModule.getGitRootOrThrow).mockReturnValue("/project")
+    vi.mocked(repositoryModule.getMainWorktreeRoot).mockReturnValue("/project")
+    vi.mocked(repositoryModule.getRepositoryContext).mockReturnValue({
+      currentRoot: "/project-feature",
+      mainRoot: "/project",
+      commonGitDir: "/project/.git",
+    })
     vi.mocked(loaderModule.loadConfig).mockReturnValue({
       base_branch: "main",
       docker_compose_file: "./docker-compose.yml",
@@ -300,6 +305,27 @@ describe("reclone command", () => {
       expect(payload.sourceRestartFailed).toBe(true)
       expect(payload.ok).toBe(false)
       writeSpy.mockRestore()
+    })
+
+    it("treats recovery failure after an incomplete stop as DOCKER_ERROR too", async () => {
+      vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/project-feature")
+      vi.mocked(createModule.setupVolumeCopy).mockResolvedValue({
+        cloned: [],
+        skipped: [],
+        failed: [{ name: "postgres_data", error: "could not safely stop source stack" }],
+        sourceStack: {
+          stopped: false,
+          restarted: false,
+          stopError: "stop timed out",
+          restartError: "up failed",
+          recoverCommand: "docker compose -f x -p y up -d",
+        },
+      })
+
+      await command.parseAsync(["feature/x"], { from: "user" })
+
+      expect(process.exitCode).toBe(EXIT_CODES.DOCKER_ERROR)
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("source environment is DOWN"))
     })
   })
 })

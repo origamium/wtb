@@ -29,7 +29,7 @@ describe("init command", () => {
     errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
     command = initCommand()
 
-    vi.mocked(repositoryModule.getGitRootOrThrow).mockReturnValue("/repo")
+    vi.mocked(repositoryModule.getMainWorktreeRoot).mockReturnValue("/repo")
     vi.mocked(loaderModule.hasConfigFile).mockReturnValue(false)
     vi.mocked(loaderModule.getConfigFilePath).mockReturnValue("/repo/wtb.yaml")
     vi.mocked(loaderModule.findConfigFile).mockReturnValue({
@@ -101,7 +101,7 @@ describe("init command", () => {
   })
 
   it("exits NOT_GIT_REPOSITORY when outside a git repo", async () => {
-    vi.mocked(repositoryModule.getGitRootOrThrow).mockImplementation(() => {
+    vi.mocked(repositoryModule.getMainWorktreeRoot).mockImplementation(() => {
       throw new CLIError("Not in a git repository", EXIT_CODES.NOT_GIT_REPOSITORY)
     })
     const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => {

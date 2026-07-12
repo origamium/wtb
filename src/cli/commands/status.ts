@@ -16,9 +16,12 @@ import {
   getWtbManagedVolumeNames,
   isWtbContainer,
 } from "../../core/docker/client.js"
-import { findComposeFile, readComposeFile } from "../../core/docker/compose.js"
+import { readComposeFile } from "../../core/docker/compose.js"
 // Core modules
-import { getCurrentBranch, getGitRoot, getGitRootOrThrow } from "../../core/git/repository.js"
+import {
+  getRepositoryContext,
+  type RepositoryContext,
+} from "../../core/git/repository.js"
 import { listWorktrees } from "../../core/git/worktree.js"
 import type { CommandOptions } from "../../types/index.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
@@ -99,28 +102,30 @@ export function statusCommand(): Command {
  */
 async function executeStatusCommand(options: CommandOptions): Promise<void> {
   // Git リポジトリチェック + ルート取得
-  const gitRoot = getGitRootOrThrow()
+  const repository = getRepositoryContext()
+  const gitRoot = repository.mainRoot
 
-  // docker_compose_file 設定を取得（設定読み込みエラーは非致命的 → Docker スキップ）
-  let dockerComposeFile = ""
-  try {
-    const config = loadConfig(gitRoot)
-    dockerComposeFile = config.docker_compose_file
-  } catch {
-    // Config load error: treat Docker as unconfigured
-  }
+  // Main configuration is authoritative. Validation failures (especially unsafe
+  // repository-external paths) must remain CONFIG_ERROR instead of being silently
+  // treated as an unconfigured Docker project.
+  const dockerComposeFile = loadConfig(gitRoot).docker_compose_file
 
   // JSON モード: 人間向け出力の代わりに 1 つの機械可読オブジェクトを stdout へ。
   // ls --json / ports と揃え、coding agent が Docker 状態まで構造化して読めるようにする。
   if (options.json) {
-    const payload = buildStatusJson(!!options.all, !!options.dockerOnly, dockerComposeFile)
+    const payload = buildStatusJson(
+      !!options.all,
+      !!options.dockerOnly,
+      dockerComposeFile,
+      repository
+    )
     process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`)
     return
   }
 
   // Worktree 状態表示（--docker-only でない場合）
   if (!options.dockerOnly) {
-    await showWorktreeStatus(!!options.all)
+    await showWorktreeStatus(!!options.all, repository, dockerComposeFile)
   }
 
   // Docker 状態表示
@@ -134,18 +139,19 @@ async function executeStatusCommand(options: CommandOptions): Promise<void> {
 function buildStatusJson(
   showAll: boolean,
   dockerOnly: boolean,
-  dockerComposeFile: string
+  dockerComposeFile: string,
+  repository: RepositoryContext
 ): StatusJson {
   const worktreesJson: WorktreeStatusJson[] = []
 
   if (!dockerOnly) {
-    const worktrees = listWorktrees()
-    const currentBranch = getCurrentBranch()
-    const gitRoot = getGitRoot()
-    const filtered = showAll ? worktrees : worktrees.filter((wt) => wt.branch === currentBranch)
+    const worktrees = listWorktrees(repository.mainRoot)
+    const filtered = showAll
+      ? worktrees
+      : worktrees.filter((wt) => path.resolve(wt.path) === path.resolve(repository.currentRoot))
 
     for (const wt of filtered) {
-      const composeFilePath = findComposeFile(wt.path)
+      const composeFilePath = configuredComposePath(wt.path, dockerComposeFile)
       let serviceCount: number | null = null
       if (composeFilePath) {
         try {
@@ -158,8 +164,8 @@ function buildStatusJson(
       worktreesJson.push({
         branch: wt.branch,
         path: wt.path,
-        isMain: wt.path === gitRoot,
-        isCurrent: wt.branch === currentBranch,
+        isMain: path.resolve(wt.path) === path.resolve(repository.mainRoot),
+        isCurrent: path.resolve(wt.path) === path.resolve(repository.currentRoot),
         compose: {
           file: composeFilePath ? path.basename(composeFilePath) : null,
           services: serviceCount,
@@ -235,12 +241,14 @@ function buildStatusJson(
  * await showWorktreeStatus(false) // 現在のブランチのみ
  * ```
  */
-async function showWorktreeStatus(showAll: boolean): Promise<void> {
+async function showWorktreeStatus(
+  showAll: boolean,
+  repository: RepositoryContext,
+  dockerComposeFile: string
+): Promise<void> {
   console.log("📁 Git Worktrees Status\n")
 
-  const worktrees = listWorktrees()
-  const currentBranch = getCurrentBranch()
-
+  const worktrees = listWorktrees(repository.mainRoot)
   if (worktrees.length === 0) {
     console.log("No worktrees found")
     return
@@ -249,18 +257,20 @@ async function showWorktreeStatus(showAll: boolean): Promise<void> {
   // フィルタリング: showAll が false の場合は現在のブランチのみ
   const filteredWorktrees = showAll
     ? worktrees
-    : worktrees.filter((wt) => wt.branch === currentBranch)
+    : worktrees.filter(
+        (wt) => path.resolve(wt.path) === path.resolve(repository.currentRoot)
+      )
 
   for (const worktree of filteredWorktrees) {
-    const isMain = worktree.path === getGitRoot()
-    const isCurrent = worktree.branch === currentBranch
+    const isMain = path.resolve(worktree.path) === path.resolve(repository.mainRoot)
+    const isCurrent = path.resolve(worktree.path) === path.resolve(repository.currentRoot)
 
     // ブランチ名表示（現在のブランチは → 付き）
     console.log(`${isCurrent ? "→" : " "} ${worktree.branch}${isMain ? " (main)" : ""}`)
     console.log(`   📂 ${worktree.path}`)
 
     // Docker Compose ファイルチェック
-    await showWorktreeDockerInfo(worktree.path)
+    await showWorktreeDockerInfo(worktree.path, dockerComposeFile)
 
     // 環境ファイルチェック
     showWorktreeEnvFiles(worktree.path)
@@ -279,8 +289,11 @@ async function showWorktreeStatus(showAll: boolean): Promise<void> {
  * await showWorktreeDockerInfo('/path/to/worktree')
  * ```
  */
-async function showWorktreeDockerInfo(worktreePath: string): Promise<void> {
-  const composeFilePath = findComposeFile(worktreePath)
+async function showWorktreeDockerInfo(
+  worktreePath: string,
+  dockerComposeFile: string
+): Promise<void> {
+  const composeFilePath = configuredComposePath(worktreePath, dockerComposeFile)
 
   if (composeFilePath) {
     const composeFileName = path.basename(composeFilePath)
@@ -296,6 +309,13 @@ async function showWorktreeDockerInfo(worktreePath: string): Promise<void> {
   } else {
     console.log("   🐳 Docker: No compose file")
   }
+}
+
+/** Resolve only the exact main-configured Compose path for a worktree. */
+function configuredComposePath(worktreePath: string, dockerComposeFile: string): string | null {
+  if (!dockerComposeFile) return null
+  const candidate = path.resolve(worktreePath, dockerComposeFile)
+  return existsSync(candidate) ? candidate : null
 }
 
 /**

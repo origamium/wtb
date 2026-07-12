@@ -13,6 +13,7 @@ import {
   createWorktree,
   gitHashObject,
   isSamePath,
+  listSkipWorktreePaths,
   loadWtbManagedManifest,
   markWtbManagedFile,
   parseWorktreeList,
@@ -28,8 +29,8 @@ describe("createWorktree", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {})
-    // isGitRepository → execGitSafe が throw しなければ true
-    vi.mocked(execGitSafe).mockReturnValue("")
+    // isGitRepository は rev-parse --is-inside-work-tree の "true" を確認する。
+    vi.mocked(execGitSafe).mockReturnValue("true")
   })
 
   afterEach(() => {
@@ -94,8 +95,7 @@ describe("wtb-managed manifest (B1)", () => {
   }): ReturnType<typeof vi.fn> => {
     const fn = vi.fn((args: string[]) => {
       if (args[0] === "ls-files") {
-        if (opts.tracked === false) throw new Error("not tracked")
-        return ""
+        return opts.tracked === false ? "" : `${args[args.length - 1]}\0`
       }
       if (args[0] === "hash-object") {
         const p = args[args.length - 1]
@@ -114,7 +114,7 @@ describe("wtb-managed manifest (B1)", () => {
   it("markWtbManagedFile sets skip-worktree AND records the blob sha into the manifest", () => {
     const git = wireGit({ tracked: true, shaByPath: { "docker-compose.yml": "abc123" } })
 
-    markWtbManagedFile(dir, "docker-compose.yml")
+    expect(markWtbManagedFile(dir, "docker-compose.yml")).toBe(true)
 
     // skip-worktree が立つこと
     expect(git).toHaveBeenCalledWith(
@@ -123,19 +123,32 @@ describe("wtb-managed manifest (B1)", () => {
     )
     // manifest に sha が記録されること
     const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"))
-    expect(manifest).toEqual({ "docker-compose.yml": "abc123" })
+    expect(manifest).toEqual({
+      version: 1,
+      files: { "docker-compose.yml": "abc123" },
+    })
   })
 
   it("markWtbManagedFile is a no-op for an untracked file (no skip-worktree, no manifest)", () => {
     const git = wireGit({ tracked: false })
 
-    markWtbManagedFile(dir, "untracked.yml")
+    expect(markWtbManagedFile(dir, "untracked.yml")).toBe(true)
 
     expect(git).not.toHaveBeenCalledWith(
       ["update-index", "--skip-worktree", "--", "untracked.yml"],
       { cwd: dir }
     )
     expect(fs.existsSync(manifestPath)).toBe(false)
+  })
+
+  it("reports a managed metadata failure instead of hiding it", () => {
+    const git = wireGit({ tracked: true, shaByPath: {} })
+
+    expect(markWtbManagedFile(dir, "docker-compose.yml")).toBe(false)
+    expect(git).not.toHaveBeenCalledWith(
+      ["update-index", "--skip-worktree", "--", "docker-compose.yml"],
+      { cwd: dir }
+    )
   })
 
   it("recording a second managed file merges into the existing manifest", () => {
@@ -153,12 +166,27 @@ describe("wtb-managed manifest (B1)", () => {
     })
   })
 
-  it("loadWtbManagedManifest returns {} when the manifest is absent or unreadable", () => {
+  it("loadWtbManagedManifest returns {} only when the manifest is absent", () => {
     wireGit({ tracked: true })
     expect(loadWtbManagedManifest(dir)).toEqual({})
-    // 壊れた JSON も {} に落とす
+  })
+
+  it("loads the legacy flat manifest format", () => {
+    wireGit({ tracked: true })
+    fs.writeFileSync(manifestPath, JSON.stringify({ ".env": "legacy-sha" }))
+    expect(loadWtbManagedManifest(dir)).toEqual({ ".env": "legacy-sha" })
+  })
+
+  it("fails closed for a corrupt or unsafe manifest", () => {
+    wireGit({ tracked: true })
     fs.writeFileSync(manifestPath, "{ not json")
-    expect(loadWtbManagedManifest(dir)).toEqual({})
+    expect(() => loadWtbManagedManifest(dir)).toThrow("Invalid wtb-managed manifest")
+
+    fs.writeFileSync(
+      manifestPath,
+      JSON.stringify({ version: 1, files: { "../outside": "sha" } })
+    )
+    expect(() => loadWtbManagedManifest(dir)).toThrow("invalid file entry")
   })
 
   it("gitHashObject returns the trimmed sha, or null on error", () => {
@@ -174,6 +202,33 @@ describe("wtb-managed manifest (B1)", () => {
       ["update-index", "--no-skip-worktree", "--", "docker-compose.yml"],
       { cwd: dir }
     )
+  })
+
+  it("lists every uppercase S-tagged skip-worktree path from NUL-delimited Git output", () => {
+    vi.mocked(execGitSafe).mockReturnValue(
+      "H ordinary.txt\0S path with spaces.yml\0S line\nbreak.env\0M modified.txt\0"
+    )
+
+    expect(listSkipWorktreePaths(dir)).toEqual(["path with spaces.yml", "line\nbreak.env"])
+    expect(execGitSafe).toHaveBeenCalledWith(["ls-files", "-v", "-z", "--"], {
+      cwd: dir,
+      preserveLeadingWhitespace: true,
+    })
+  })
+
+  it.each([
+    ["h", "assume-only.txt"],
+    ["s", "skip-and-assume.env"],
+  ])("fails closed for lowercase %s because assume-unchanged hides changes", (tag, file) => {
+    vi.mocked(execGitSafe).mockReturnValue(`${tag} ${file}\0`)
+    expect(() => listSkipWorktreePaths(dir)).toThrow(
+      `Tracked path '${file}' has assume-unchanged set`
+    )
+  })
+
+  it("fails closed instead of returning a partial skip-worktree list for malformed output", () => {
+    vi.mocked(execGitSafe).mockReturnValue("S valid.yml\0malformed\0")
+    expect(() => listSkipWorktreePaths(dir)).toThrow("Unexpected output")
   })
 })
 

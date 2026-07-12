@@ -10,6 +10,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import * as path from "node:path"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import * as worktreeModule from "../../core/git/worktree.js"
 import type { WtbConfig } from "../../types/index.js"
 import { applyEnvAdjustments } from "./create"
 
@@ -21,6 +22,7 @@ vi.mock("../../core/git/worktree.js", () => ({
 }))
 vi.mock("../../core/docker/client.js", () => ({
   getUsedPorts: vi.fn(() => []),
+  getUsedPortsOrThrow: vi.fn(() => []),
 }))
 
 const config = (overrides: Partial<WtbConfig["env"]> = {}): WtbConfig =>
@@ -48,6 +50,9 @@ describe("applyEnvAdjustments — env→env port propagation (pass 2)", () => {
     vi.spyOn(process.stderr, "write").mockImplementation(() => true)
     sourceRoot = mkdtempSync(path.join(tmpdir(), "wtb-src-"))
     targetRoot = mkdtempSync(path.join(tmpdir(), "wtb-tgt-"))
+    vi.mocked(worktreeModule.listWorktrees).mockReturnValue([
+      { path: sourceRoot, branch: "main", head: "main-sha" },
+    ])
   })
 
   afterEach(() => {
@@ -77,6 +82,48 @@ describe("applyEnvAdjustments — env→env port propagation (pass 2)", () => {
       from: "http://localhost:54321",
       to: "http://localhost:54322",
     })
+  })
+
+  it("uses and updates a reservation set shared with the Compose phase", async () => {
+    writeSource(".env", "KONG_HTTP_PORT=54321\n")
+    const reservedPorts = new Set([54322])
+
+    const changes = await applyEnvAdjustments(sourceRoot, targetRoot, config(), {
+      reservedPorts,
+    })
+
+    expect(changes.KONG_HTTP_PORT).toEqual({ from: "54321", to: "54323" })
+    expect(reservedPorts.has(54323)).toBe(true)
+  })
+
+  it("reserves every numeric sibling env value, including non-adjusted keys", async () => {
+    writeSource(".env", "KONG_HTTP_PORT=3000\nFIXED_ADMIN_PORT=9000   \nBUILD_ID=abc123\n")
+
+    const changes = await applyEnvAdjustments(
+      sourceRoot,
+      targetRoot,
+      config({ adjust: { KONG_HTTP_PORT: 0, FIXED_ADMIN_PORT: "3001" } })
+    )
+
+    expect(changes.KONG_HTTP_PORT).toEqual({ from: "3000", to: "3002" })
+    expect(readTarget(".env")).toContain("FIXED_ADMIN_PORT=3001")
+  })
+
+  it("pre-reserves numeric string replacements that will be added in another file", async () => {
+    writeSource("a.env", "KONG_HTTP_PORT=4000\n")
+    writeSource("b.env", "OTHER=value\n")
+
+    const changes = await applyEnvAdjustments(
+      sourceRoot,
+      targetRoot,
+      config({
+        file: ["a.env", "b.env"],
+        adjust: { KONG_HTTP_PORT: 0, FIXED_NEW_PORT: "4001" },
+      })
+    )
+
+    expect(changes.KONG_HTTP_PORT).toEqual({ from: "4000", to: "4002" })
+    expect(readTarget("b.env")).toContain("FIXED_NEW_PORT=4001")
   })
 
   it("does NOT propagate when port_propagation.enabled is false (pass 2 disabled)", async () => {
@@ -133,7 +180,7 @@ describe("applyEnvAdjustments — env→env port propagation (pass 2)", () => {
     // 誤伝播していた (M7 のバグ)。
     // usedPorts に source の両ポートを入れて確実に bump させる。
     const clientModule = await import("../../core/docker/client.js")
-    vi.mocked(clientModule.getUsedPorts).mockReturnValue([3000, 8080])
+    vi.mocked(clientModule.getUsedPortsOrThrow).mockReturnValue([3000, 8080])
 
     writeSource("a.env", "APP_PORT=3000\nLINK=http://localhost:3000\n")
     writeSource("b.env", "APP_PORT=8080\nLINK=http://localhost:8080\n")

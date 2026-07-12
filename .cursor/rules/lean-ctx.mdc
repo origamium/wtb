@@ -1,0 +1,35 @@
+---
+description: "lean-ctx: context compression layer — tool guidance in rule body."
+globs: **/*
+alwaysApply: true
+---
+
+<!-- lean-ctx-rules -->
+<!-- version: 8 -->
+
+CRITICAL: ALWAYS prefer lean-ctx ctx_* tools over native equivalents — ctx_* tools provide superior caching, compression, and session memory. Hooks compress native Shell/Read/Grep as fallback, but direct ctx_* calls are the primary path.
+ACTUALLY EMIT the ctx_* tool call (ctx_compose first) — describing a tool is not calling it.
+WHY ctx_read > native Read: ctx_read picks the optimal mode (map/signatures/terse) per file, caches for instant re-reads (~13 tokens), and compresses 26-92%. Native Read through hook redirect is limited to verbatim pass-through (~5% savings).
+
+MANDATORY MAPPING (always use ctx_* instead of native):
+• Read/cat -> ctx_read(path, mode) — cached, 10 modes, re-reads ~13 tokens
+• Grep/search -> ctx_search(pattern, path) — also action=symbol|semantic for definitions/meaning
+• Shell/bash -> ctx_shell(command) — 95+ compression patterns
+• ctx_compose — orient in code FIRST (bundles search + read + symbols) — call before editing/debugging
+• ctx_callgraph — callers, callees, blast radius — use instead of manual file reading
+• ctx_session / ctx_knowledge — persistent memory — record decisions & progress after milestones
+• ctx_expand — recover full text from [Archived]/compressed output
+
+PARALLEL: fire independent tool calls in the SAME turn — ctx_compose bundles multiple lookups into one call.
+
+RECOVER: compression is reversible — read the shown path (no MCP) or ctx_read(raw=true), never re-read line-by-line.
+
+OUTPUT: never echo tool output, no narration comments, show only changed code.
+<!-- lean-ctx-compression -->
+OUTPUT STYLE: concise
+- Bullet points over paragraphs
+- Skip filler words and hedging ("I think", "probably", "it seems")
+- 1-sentence explanations max, then code/action
+- No repeating what the user said
+<!-- /lean-ctx-compression -->
+<!-- /lean-ctx-rules -->

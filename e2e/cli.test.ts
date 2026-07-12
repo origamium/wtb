@@ -3,7 +3,7 @@
  * Tests all CLI commands against multiple test projects
  */
 
-import { execSync } from "node:child_process"
+import { execSync, spawn, spawnSync } from "node:child_process"
 import { existsSync, lstatSync } from "node:fs"
 import * as path from "node:path"
 import fs from "fs-extra"
@@ -18,6 +18,8 @@ import {
   type TestRepo,
 } from "./helpers.js"
 
+const HAS_DOCKER_DAEMON = spawnSync("docker", ["info"], { stdio: "ignore" }).status === 0
+
 // Ensure CLI is built before running tests
 beforeAll(() => {
   if (!existsSync(CLI_PATH)) {
@@ -27,6 +29,14 @@ beforeAll(() => {
 
 afterAll(() => {
   cleanupAllTestWorkspaces()
+})
+
+// ponytail: every test here blocks on execSync/spawnSync, so the worker's event
+// loop never reaches the poll phase and vitest's IPC acks sit unread; once the
+// file runs past birpc's 60s timeout that surfaces as an unhandled
+// 'Timeout calling "onTaskUpdate"' error. One macrotask yield per test drains it.
+afterEach(async () => {
+  await new Promise((resolve) => setImmediate(resolve))
 })
 
 // =============================================================================
@@ -75,6 +85,8 @@ describe("Help and Version Commands", () => {
       expect(result.stdout).toContain("Create a new git worktree")
       expect(result.stdout).toContain("-p, --path")
       expect(result.stdout).toContain("--no-create-branch")
+      expect(result.stdout).toContain("--strict")
+      expect(result.stdout).toContain("setup")
       expect(result.stdout).toContain("<branch>")
     })
 
@@ -84,7 +96,17 @@ describe("Help and Version Commands", () => {
       expect(result.exitCode).toBe(0)
       expect(result.stdout).toContain("Remove a git worktree")
       expect(result.stdout).toContain("-f, --force")
+      expect(result.stdout).toContain("cleanup failure")
       expect(result.stdout).toContain("<branch>")
+    })
+
+    it("should display prune recovery-discard safeguards", () => {
+      const result = testRepo.runCLI("prune --help")
+
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout).toContain("--discard-recovery")
+      expect(result.stdout).toContain("requires --yes")
+      expect(result.stdout).toMatch(/protected recovery\s+volumes/)
     })
 
     it("should display status command help with all options", () => {
@@ -94,6 +116,34 @@ describe("Help and Version Commands", () => {
       expect(result.stdout).toContain("Show status of worktrees")
       expect(result.stdout).toContain("-a, --all")
       expect(result.stdout).toContain("--docker-only")
+    })
+
+    it("should list up and down commands in main help", () => {
+      const result = testRepo.runCLI("--help")
+
+      expect(result.exitCode).toBe(0)
+      // コマンド一覧の行頭一致で見る ("group" 等の部分一致を避ける)
+      expect(result.stdout).toMatch(/^\s+up\s/m)
+      expect(result.stdout).toMatch(/^\s+down\s/m)
+    })
+
+    it("should display up command help with its options", () => {
+      const result = testRepo.runCLI("up --help")
+
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout).toContain("Docker Compose stack")
+      expect(result.stdout).toContain("[branch]")
+      expect(result.stdout).toContain("--json")
+    })
+
+    it("should display down command help with its options", () => {
+      const result = testRepo.runCLI("down --help")
+
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout).toContain("Docker Compose stack")
+      expect(result.stdout).toContain("[branch]")
+      expect(result.stdout).toContain("--json")
+      expect(result.stdout).toContain("--remove-volumes")
     })
   })
 
@@ -125,7 +175,7 @@ describe("Create Command - Basic Project", () => {
 
   describe("Basic worktree creation", () => {
     it("should create worktree for a new branch", () => {
-      const result = testRepo.runCLI("create test/new-branch")
+      const result = testRepo.runCLI("create test/new-branch --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain("Creating worktree for branch: test/new-branch")
@@ -142,14 +192,14 @@ describe("Create Command - Basic Project", () => {
 
     it("should automatically use existing branch", () => {
       // First create a worktree (which also creates the branch)
-      testRepo.runCLI("create existing-branch")
-      testRepo.runCLI("remove existing-branch --force")
+      testRepo.runCLI("create existing-branch --no-docker")
+      testRepo.runCLI("remove existing-branch --force --no-docker")
 
       // Branch should still exist after worktree removal
       expect(testRepo.branchExists("existing-branch")).toBe(true)
 
       // Creating a new worktree should detect the existing branch
-      const result = testRepo.runCLI("create existing-branch")
+      const result = testRepo.runCLI("create existing-branch --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain("already exists")
@@ -158,7 +208,7 @@ describe("Create Command - Basic Project", () => {
 
     it("should create worktree at custom path with -p option", () => {
       const customPath = path.join(path.dirname(testRepo.path), "custom-wt-path")
-      const result = testRepo.runCLI(`create test/custom -p "${customPath}"`)
+      const result = testRepo.runCLI(`create test/custom -p "${customPath}" --no-docker`)
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain(`Worktree path: ${customPath}`)
@@ -166,7 +216,7 @@ describe("Create Command - Basic Project", () => {
     })
 
     it("should sanitize branch names with slashes for path", () => {
-      const result = testRepo.runCLI("create feature/deep/nested/branch")
+      const result = testRepo.runCLI("create feature/deep/nested/branch --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain("worktree-feature-deep-nested-branch")
@@ -176,10 +226,10 @@ describe("Create Command - Basic Project", () => {
   describe("Error handling", () => {
     it("should fail when worktree already exists for branch", () => {
       // Create first worktree
-      testRepo.runCLI("create duplicate-test")
+      testRepo.runCLI("create duplicate-test --no-docker")
 
       // Try to create duplicate
-      const result = testRepo.runCLI("create duplicate-test")
+      const result = testRepo.runCLI("create duplicate-test --no-docker")
 
       expect(result.exitCode).toBe(6) // EXIT_CODES.WORKTREE_EXISTS
       expect(result.combined).toContain("already exists")
@@ -194,7 +244,7 @@ describe("Create Command - Basic Project", () => {
 
   describe("Status after create", () => {
     it("should show new worktree in status --all", () => {
-      testRepo.runCLI("create status-test")
+      testRepo.runCLI("create status-test --no-docker")
 
       const result = testRepo.runCLI("status --all")
 
@@ -320,7 +370,7 @@ describe("Create Command - Full-Featured Project", () => {
 
   describe("copy_files functionality", () => {
     it("should copy all files specified in copy_files config", () => {
-      const result = testRepo.runCLI("create test/copy-all")
+      const result = testRepo.runCLI("create test/copy-all --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain("Copying files/directories")
@@ -337,7 +387,7 @@ describe("Create Command - Full-Featured Project", () => {
     })
 
     it("should preserve file contents when copying", () => {
-      testRepo.runCLI("create test/content-check")
+      testRepo.runCLI("create test/content-check --no-docker")
 
       const wtPath = testRepo.getWorktreePath("test/content-check")
       const envContent = fs.readFileSync(path.join(wtPath, ".env"), "utf-8")
@@ -347,7 +397,7 @@ describe("Create Command - Full-Featured Project", () => {
     })
 
     it("should preserve directory structure when copying", () => {
-      testRepo.runCLI("create test/dir-structure")
+      testRepo.runCLI("create test/dir-structure --no-docker")
 
       const wtPath = testRepo.getWorktreePath("test/dir-structure")
       const configContent = fs.readFileSync(path.join(wtPath, "config/local.json"), "utf-8")
@@ -358,7 +408,7 @@ describe("Create Command - Full-Featured Project", () => {
 
   describe("start_command functionality", () => {
     it("should execute start_command after worktree creation", () => {
-      const result = testRepo.runCLI("create test/start-cmd")
+      const result = testRepo.runCLI("create test/start-cmd --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain("Running start command")
@@ -367,14 +417,14 @@ describe("Create Command - Full-Featured Project", () => {
     })
 
     it("should create marker file from start_command script", () => {
-      testRepo.runCLI("create test/start-marker")
+      testRepo.runCLI("create test/start-marker --no-docker")
 
       const wtPath = testRepo.getWorktreePath("test/start-marker")
       expect(existsSync(path.join(wtPath, ".start-executed"))).toBe(true)
     })
 
     it("should have access to copied files in start_command", () => {
-      const result = testRepo.runCLI("create test/start-env")
+      const result = testRepo.runCLI("create test/start-env --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain(".env found")
@@ -400,7 +450,7 @@ describe("Create Command - Edge Cases Project", () => {
 
   describe("Files with spaces in path", () => {
     it("should copy directories with spaces in name", () => {
-      testRepo.runCLI("create test/spaces")
+      testRepo.runCLI("create test/spaces --no-docker")
 
       const wtPath = testRepo.getWorktreePath("test/spaces")
       expect(existsSync(path.join(wtPath, "dir with spaces/config.json"))).toBe(true)
@@ -409,7 +459,7 @@ describe("Create Command - Edge Cases Project", () => {
 
   describe("Deeply nested paths", () => {
     it("should copy files in deeply nested directories", () => {
-      testRepo.runCLI("create test/deep")
+      testRepo.runCLI("create test/deep --no-docker")
 
       const wtPath = testRepo.getWorktreePath("test/deep")
       expect(existsSync(path.join(wtPath, "deeply/nested/path/to/file.txt"))).toBe(true)
@@ -418,7 +468,7 @@ describe("Create Command - Edge Cases Project", () => {
 
   describe("Unicode filenames", () => {
     it("should copy files with unicode characters in name", () => {
-      testRepo.runCLI("create test/unicode")
+      testRepo.runCLI("create test/unicode --no-docker")
 
       const wtPath = testRepo.getWorktreePath("test/unicode")
       expect(existsSync(path.join(wtPath, "unicode-日本語.txt"))).toBe(true)
@@ -430,14 +480,14 @@ describe("Create Command - Edge Cases Project", () => {
 
   describe("Branch names with special characters", () => {
     it("should handle branch names with multiple slashes", () => {
-      const result = testRepo.runCLI("create feature/v1/major/release")
+      const result = testRepo.runCLI("create feature/v1/major/release --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain("worktree-feature-v1-major-release")
     })
 
     it("should handle branch names with numbers", () => {
-      const result = testRepo.runCLI("create fix/issue-123")
+      const result = testRepo.runCLI("create fix/issue-123 --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(testRepo.branchExists("fix/issue-123")).toBe(true)
@@ -462,7 +512,7 @@ describe("Create Command - Missing Files Handling", () => {
 
   describe("Graceful handling of missing copy_files", () => {
     it("should skip non-existent files and continue", () => {
-      const result = testRepo.runCLI("create test/skip-missing")
+      const result = testRepo.runCLI("create test/skip-missing --no-start --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain("Skip (not found)")
@@ -470,7 +520,7 @@ describe("Create Command - Missing Files Handling", () => {
     })
 
     it("should copy existing files even when some are missing", () => {
-      testRepo.runCLI("create test/partial-copy")
+      testRepo.runCLI("create test/partial-copy --no-start --no-docker")
 
       const wtPath = testRepo.getWorktreePath("test/partial-copy")
       expect(existsSync(path.join(wtPath, ".env"))).toBe(true)
@@ -478,12 +528,41 @@ describe("Create Command - Missing Files Handling", () => {
   })
 
   describe("Graceful handling of missing start_command", () => {
-    it("should continue worktree creation when start_command fails", () => {
-      const result = testRepo.runCLI("create test/no-script")
+    it("keeps the worktree but does not print a success banner when start_command fails", () => {
+      const result = testRepo.runCLI("create test/no-script --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain("Start command failed")
-      expect(result.combined).toContain("Worktree created successfully")
+      expect(result.combined).toContain("setup operation(s) FAILED")
+      expect(result.combined).not.toContain("Worktree created successfully")
+      expect(existsSync(testRepo.getWorktreePath("test/no-script"))).toBe(true)
+    })
+
+    it("reports setup failures in JSON and makes --strict non-zero", () => {
+      const res = spawnSync(
+        "node",
+        [
+          CLI_PATH,
+          "create",
+          "test/no-script-strict",
+          "--no-docker",
+          "--json",
+          "--strict",
+        ],
+        { cwd: testRepo.path, encoding: "utf-8" }
+      )
+
+      expect(res.status).toBe(1)
+      const payload = JSON.parse(res.stdout)
+      expect(payload.created).toBe(true)
+      expect(payload.ok).toBe(false)
+      expect(payload.setupWarnings).toEqual(
+        expect.arrayContaining([expect.objectContaining({ phase: "copy" })])
+      )
+      expect(payload.setupFailures).toEqual([
+        expect.objectContaining({ phase: "start", message: "start_command failed" }),
+      ])
+      expect(existsSync(testRepo.getWorktreePath("test/no-script-strict"))).toBe(true)
     })
   })
 })
@@ -498,7 +577,7 @@ describe("Remove Command - Basic Project", () => {
   beforeEach(() => {
     testRepo = createTestRepo("basic", "remove")
     // Create a worktree to remove
-    testRepo.runCLI("create test/to-remove")
+    testRepo.runCLI("create test/to-remove --no-docker --no-start")
   })
 
   afterEach(() => {
@@ -510,7 +589,7 @@ describe("Remove Command - Basic Project", () => {
       const wtPath = testRepo.getWorktreePath("test/to-remove")
       expect(existsSync(wtPath)).toBe(true)
 
-      const result = testRepo.runCLI("remove test/to-remove")
+      const result = testRepo.runCLI("remove test/to-remove --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain("Worktree removed successfully")
@@ -518,10 +597,60 @@ describe("Remove Command - Basic Project", () => {
     })
 
     it("should show remaining worktrees after removal", () => {
-      const result = testRepo.runCLI("remove test/to-remove")
+      const result = testRepo.runCLI("remove test/to-remove --no-docker")
 
       expect(result.combined).toContain("Remaining worktrees")
       expect(result.combined).toContain("main")
+    })
+  })
+
+  describe("--json", () => {
+    it("emits machine-readable JSON on stdout and the human banner on stderr", () => {
+      // runCLI (execSync) は成功時 stderr を捨てるので、stdout/stderr を分けて
+      // 検証できる spawnSync を使う (--json の stdout 純度がこのテストの主眼)。
+      const res = spawnSync(
+        "node",
+        [CLI_PATH, "remove", "test/to-remove", "--json", "--no-docker"],
+        {
+          cwd: testRepo.path,
+          encoding: "utf-8",
+        }
+      )
+
+      expect(res.status).toBe(0)
+      const payload = JSON.parse(res.stdout)
+      expect(payload.branch).toBe("test/to-remove")
+      expect(payload.removed).toBe(true)
+      expect(payload.composeDown).toMatchObject({
+        ran: false,
+        failed: false,
+        skippedReason: "no-docker-flag",
+      })
+      expect(payload.endCommand).toBeNull()
+      expect(payload.cleanupErrors).toEqual([])
+      expect(payload.ok).toBe(true)
+      // 人間向けバナーは stderr へ
+      expect(res.stderr).toContain("Worktree removed successfully")
+      expect(existsSync(testRepo.getWorktreePath("test/to-remove"))).toBe(false)
+    })
+
+    it("always emits one JSON object for a hard error", () => {
+      const res = spawnSync("node", [CLI_PATH, "remove", "does/not/exist", "--json"], {
+        cwd: testRepo.path,
+        encoding: "utf-8",
+      })
+
+      expect(res.status).toBe(1)
+      const payload = JSON.parse(res.stdout)
+      expect(payload).toMatchObject({
+        branch: "does/not/exist",
+        path: null,
+        removed: false,
+        composeDown: null,
+        endCommand: null,
+        ok: false,
+      })
+      expect(payload.cleanupErrors).toEqual([expect.stringContaining("No worktree found")])
     })
   })
 
@@ -530,7 +659,7 @@ describe("Remove Command - Basic Project", () => {
       const wtPath = testRepo.getWorktreePath("test/to-remove")
       fs.writeFileSync(path.join(wtPath, "untracked.txt"), "untracked content")
 
-      const result = testRepo.runCLI("remove test/to-remove --force")
+      const result = testRepo.runCLI("remove test/to-remove --force --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(result.combined).toContain("Force removal enabled")
@@ -541,7 +670,7 @@ describe("Remove Command - Basic Project", () => {
       const wtPath = testRepo.getWorktreePath("test/to-remove")
       fs.writeFileSync(path.join(wtPath, "README.md"), "modified content")
 
-      const result = testRepo.runCLI("remove test/to-remove --force")
+      const result = testRepo.runCLI("remove test/to-remove --force --no-docker")
 
       expect(result.exitCode).toBe(0)
       expect(existsSync(wtPath)).toBe(false)
@@ -551,7 +680,7 @@ describe("Remove Command - Basic Project", () => {
   describe("Error handling", () => {
     it("should fail when worktree does not exist", () => {
       // Remove first
-      testRepo.runCLI("remove test/to-remove --force")
+      testRepo.runCLI("remove test/to-remove --force --no-docker")
 
       const result = testRepo.runCLI("remove nonexistent/branch")
 
@@ -567,7 +696,7 @@ describe("Remove Command - Basic Project", () => {
     })
 
     it("should list available worktrees when target not found", () => {
-      testRepo.runCLI("remove test/to-remove --force")
+      testRepo.runCLI("remove test/to-remove --force --no-docker")
 
       const result = testRepo.runCLI("remove nonexistent")
 
@@ -592,7 +721,10 @@ describe("Remove Command - wtb-managed file protection (B1)", () => {
     testRepo = createTestRepo("relocatability", "managed-protect")
     // create rewrites the tracked compose (identity) + .env (port adjust) → both
     // become wtb-managed. Skip volume clone / start so the test needs no Docker.
-    testRepo.runCLI(`create ${BRANCH} --no-volume-copy --no-start`)
+    const flags = HAS_DOCKER_DAEMON
+      ? "--no-volume-copy --no-start"
+      : "--no-docker --no-start"
+    testRepo.runCLI(`create ${BRANCH} ${flags}`)
   })
 
   afterEach(() => {
@@ -608,9 +740,13 @@ describe("Remove Command - wtb-managed file protection (B1)", () => {
     const abs = path.isAbsolute(manifestPath) ? manifestPath : path.join(wtPath, manifestPath)
     expect(existsSync(abs)).toBe(true)
     const manifest = JSON.parse(fs.readFileSync(abs, "utf-8"))
-    // Both rewritten tracked files are recorded with a blob sha.
-    const keys = Object.keys(manifest)
-    expect(keys.some((k) => k.includes("docker-compose.yml"))).toBe(true)
+    expect(manifest.version).toBe(1)
+    // The adjusted env is always managed. Compose is also managed when the
+    // Docker-backed identity/ownership preflight can run.
+    const keys = Object.keys(manifest.files)
+    if (HAS_DOCKER_DAEMON) {
+      expect(keys.some((k) => k.includes("docker-compose.yml"))).toBe(true)
+    }
     expect(keys.some((k) => k.includes(".env"))).toBe(true)
   })
 
@@ -620,8 +756,7 @@ describe("Remove Command - wtb-managed file protection (B1)", () => {
 
     // No user edit → the only "changes" are wtb's own rewrites, which the manifest
     // recognises and excludes from the dirty check. Remove must succeed without -f.
-    const result = testRepo.runCLI(`remove ${BRANCH}`)
-
+    const result = testRepo.runCLI(`remove ${BRANCH} --no-docker`)
     expect(result.exitCode).toBe(0)
     expect(result.combined).toContain("Worktree removed successfully")
     expect(existsSync(wtPath)).toBe(false)
@@ -632,7 +767,7 @@ describe("Remove Command - wtb-managed file protection (B1)", () => {
     // Simulate a genuine user edit on top of wtb's rewritten .env.
     fs.appendFileSync(path.join(wtPath, ".env"), "\nUSER_SECRET=do-not-lose-me\n")
 
-    const result = testRepo.runCLI(`remove ${BRANCH}`)
+    const result = testRepo.runCLI(`remove ${BRANCH} --no-docker`)
 
     // The edit diverges from the recorded sha → really dirty → blocked, worktree kept.
     expect(result.exitCode).toBe(1)
@@ -644,7 +779,7 @@ describe("Remove Command - wtb-managed file protection (B1)", () => {
     const wtPath = testRepo.getWorktreePath(BRANCH)
     fs.appendFileSync(path.join(wtPath, ".env"), "\nUSER_SECRET=do-not-lose-me\n")
 
-    const result = testRepo.runCLI(`remove ${BRANCH} -f`)
+    const result = testRepo.runCLI(`remove ${BRANCH} -f --no-docker`)
 
     expect(result.exitCode).toBe(0)
     expect(result.combined).toContain("Worktree removed successfully")
@@ -655,11 +790,148 @@ describe("Remove Command - wtb-managed file protection (B1)", () => {
     const wtPath = testRepo.getWorktreePath(BRANCH)
     fs.writeFileSync(path.join(wtPath, "scratch.txt"), "untracked work")
 
-    const result = testRepo.runCLI(`remove ${BRANCH}`)
+    const result = testRepo.runCLI(`remove ${BRANCH} --no-docker`)
 
     expect(result.exitCode).toBe(1)
     expect(result.combined).toContain("uncommitted or untracked changes")
     expect(existsSync(wtPath)).toBe(true)
+  })
+
+  it("fails closed when a real Git S-bit is absent from the manifest, preserving it even with -f", () => {
+    const wtPath = testRepo.getWorktreePath(BRANCH)
+    const hiddenPath = path.join(wtPath, "DESCRIPTION.txt")
+    const original = fs.readFileSync(hiddenPath, "utf-8")
+
+    // Simulate an S-bit owned outside wtb. Its edit is invisible to `git status`, and the
+    // valid manifest deliberately does not list DESCRIPTION.txt.
+    execSync("git update-index --skip-worktree -- DESCRIPTION.txt", {
+      cwd: wtPath,
+      stdio: "pipe",
+    })
+    fs.writeFileSync(hiddenPath, `${original}\nUSER_DATA=must-survive\n`)
+
+    const result = testRepo.runCLI(`remove ${BRANCH} -f --no-docker`)
+
+    expect(result.exitCode).toBe(1)
+    expect(result.combined).toContain("missing from the wtb-managed manifest")
+    expect(existsSync(wtPath)).toBe(true)
+    expect(fs.readFileSync(hiddenPath, "utf-8")).toContain("USER_DATA=must-survive")
+    expect(
+      execSync("git ls-files -v -- DESCRIPTION.txt", { cwd: wtPath, encoding: "utf-8" })
+    ).toMatch(/^[Ss] /)
+  })
+
+  it("fails closed for a real Git h tag and preserves assume-unchanged plus user data", () => {
+    const wtPath = testRepo.getWorktreePath(BRANCH)
+    const hiddenPath = path.join(wtPath, "DESCRIPTION.txt")
+    const original = fs.readFileSync(hiddenPath, "utf-8")
+
+    execSync("git update-index --assume-unchanged -- DESCRIPTION.txt", {
+      cwd: wtPath,
+      stdio: "pipe",
+    })
+    fs.writeFileSync(hiddenPath, `${original}\nASSUME_DATA=must-survive\n`)
+    expect(
+      execSync("git ls-files -v -- DESCRIPTION.txt", { cwd: wtPath, encoding: "utf-8" })
+    ).toMatch(/^h /)
+
+    const result = testRepo.runCLI(`remove ${BRANCH} -f --no-docker`)
+
+    expect(result.exitCode).toBe(1)
+    expect(result.combined).toContain("assume-unchanged")
+    expect(existsSync(wtPath)).toBe(true)
+    expect(fs.readFileSync(hiddenPath, "utf-8")).toContain("ASSUME_DATA=must-survive")
+    expect(
+      execSync("git ls-files -v -- DESCRIPTION.txt", { cwd: wtPath, encoding: "utf-8" })
+    ).toMatch(/^h /)
+  })
+
+  it("fails closed for a lowercase Git tag even when the managed manifest contains the path", () => {
+    const wtPath = testRepo.getWorktreePath(BRANCH)
+    const managedPath = path.join(wtPath, ".env")
+    const before = fs.readFileSync(managedPath, "utf-8")
+
+    // create already gave this manifest-managed path skip-worktree (S). Combining
+    // assume-unchanged changes the tag to lowercase s; clearing only skip-worktree would
+    // still leave its content hidden from status.
+    execSync("git update-index --assume-unchanged -- .env", { cwd: wtPath, stdio: "pipe" })
+    expect(execSync("git ls-files -v -- .env", { cwd: wtPath, encoding: "utf-8" })).toMatch(
+      /^[a-z] /
+    )
+
+    const result = testRepo.runCLI(`remove ${BRANCH} -f --no-docker`)
+
+    expect(result.exitCode).toBe(1)
+    expect(result.combined).toContain("assume-unchanged")
+    expect(existsSync(wtPath)).toBe(true)
+    expect(fs.readFileSync(managedPath, "utf-8")).toBe(before)
+    expect(execSync("git ls-files -v -- .env", { cwd: wtPath, encoding: "utf-8" })).toMatch(
+      /^[a-z] /
+    )
+  })
+
+  it("keeps a file written concurrently while a sleeping end_command runs", async () => {
+    const wtPath = testRepo.getWorktreePath(BRANCH)
+    fs.appendFileSync(path.join(testRepo.path, "wtb.yaml"), '\nend_command: "sleep 1"\n')
+
+    const child = spawn(
+      process.execPath,
+      [CLI_PATH, "remove", BRANCH, "--no-docker"],
+      { cwd: testRepo.path, stdio: ["ignore", "pipe", "pipe"] }
+    )
+    let output = ""
+    let signalEndStarted: (() => void) | undefined
+    const endStarted = new Promise<void>((resolve) => {
+      signalEndStarted = resolve
+    })
+    const collect = (chunk: Buffer): void => {
+      output += chunk.toString()
+      if (output.includes("Running end command: sleep 1")) signalEndStarted?.()
+    }
+    child.stdout.on("data", collect)
+    child.stderr.on("data", collect)
+    child.once("error", (error) => {
+      output += error.message
+      signalEndStarted?.()
+    })
+    const completed = new Promise<number>((resolve) => {
+      child.once("close", (code) => {
+        signalEndStarted?.()
+        resolve(code ?? 1)
+      })
+    })
+
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        endStarted,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error(`end_command did not start; output:\n${output}`)),
+            5000
+          )
+        }),
+      ])
+      expect(output).toContain("Running end command: sleep 1")
+
+      // This write occurs after the initial dirty snapshot and while remove is blocked in sleep.
+      fs.writeFileSync(path.join(wtPath, "late-during-end.txt"), "must survive\n")
+
+      const exitCode = await completed
+      expect(exitCode, output).toBe(1)
+      expect(output).toContain("changed during cleanup")
+      expect(existsSync(wtPath)).toBe(true)
+      expect(fs.readFileSync(path.join(wtPath, "late-during-end.txt"), "utf-8")).toBe(
+        "must survive\n"
+      )
+      // The failed removal leaves the worktree in its original managed state.
+      expect(execSync("git ls-files -v -- .env", { cwd: wtPath, encoding: "utf-8" })).toMatch(
+        /^S /
+      )
+    } finally {
+      if (timeout) clearTimeout(timeout)
+      if (child.exitCode === null) child.kill("SIGTERM")
+    }
   })
 })
 
@@ -708,12 +980,15 @@ describe("Remove Command - Missing Files Handling", () => {
   })
 
   describe("Graceful handling of missing end_command", () => {
-    it("should continue removal when end_command fails", () => {
+    it("force-removes but exits non-zero when end_command fails", () => {
+      const wtPath = testRepo.getWorktreePath("test/missing-end")
       const result = testRepo.runCLI("remove test/missing-end --force")
 
-      expect(result.exitCode).toBe(0)
+      expect(result.exitCode).toBe(1)
       expect(result.combined).toContain("End command failed")
-      expect(result.combined).toContain("Worktree removed successfully")
+      expect(result.combined).toContain("force-removed, but cleanup was incomplete")
+      expect(result.combined).not.toContain("Worktree removed successfully")
+      expect(existsSync(wtPath)).toBe(false)
     })
   })
 })
@@ -955,6 +1230,73 @@ describe("Reclone Command", () => {
 })
 
 // =============================================================================
+// UP / DOWN COMMANDS
+// =============================================================================
+// NOTE: 実際に docker を起動する幸福系は e2e/integration-docker.sh 側で担保する。
+// ここでは docker 不要で決まるエラー経路 (config / target 解決) のみを検証する。
+describe("Up and Down Commands", () => {
+  let testRepo: TestRepo
+
+  beforeEach(() => {
+    testRepo = createTestRepo("no-docker", "updown")
+  })
+
+  afterEach(() => {
+    testRepo.cleanup()
+  })
+
+  it("up exits with CONFIG_ERROR (4) when no docker_compose_file is configured", () => {
+    testRepo.runCLI("create feature/updown --no-docker --no-start")
+
+    const result = testRepo.runCLI("up feature/updown")
+
+    expect(result.exitCode).toBe(4)
+    expect(result.combined).toContain("No docker_compose_file is configured")
+  })
+
+  it("down exits with CONFIG_ERROR (4) when no docker_compose_file is configured", () => {
+    testRepo.runCLI("create feature/updown-d --no-docker --no-start")
+
+    const result = testRepo.runCLI("down feature/updown-d")
+
+    expect(result.exitCode).toBe(4)
+    expect(result.combined).toContain("No docker_compose_file is configured")
+  })
+
+  it("up fails with exit 1 for an unknown branch and lists available worktrees on stderr", () => {
+    const result = testRepo.runCLI("up does/not/exist")
+
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain("No worktree found for branch")
+    expect(result.stderr).toContain("Available worktrees:")
+    expect(result.stdout).toBe("")
+  })
+
+  it("up refuses the main repository worktree", () => {
+    // branch 無しで main repo root から実行 → main worktree に解決され拒否される
+    const result = testRepo.runCLI("up")
+
+    expect(result.exitCode).toBe(1)
+    expect(result.combined).toContain("main repository worktree")
+  })
+
+  it("up works from INSIDE a linked worktree (regression: main-root resolution)", () => {
+    // 回帰テスト: 旧実装は gitRoot に `--show-toplevel` (= worktree 内では worktree 自身)
+    // を使っていたため、worktree 内からの実行が常に main-repo ガード (exit 1) で拒否され、
+    // 「default: the current worktree」がどこからも成立しなかった。正しい実装では main
+    // root が source として解決され、ガードを通過して設定チェック (exit 4) に到達する。
+    testRepo.runCLI("create feature/updown-inside --no-docker --no-start")
+    const worktreePath = testRepo.runCLI("path feature/updown-inside").stdout.trim()
+
+    const result = runCLI("up", worktreePath)
+
+    expect(result.exitCode).toBe(4)
+    expect(result.combined).toContain("No docker_compose_file is configured")
+    expect(result.combined).not.toContain("main repository worktree")
+  })
+})
+
+// =============================================================================
 // PRUNE COMMAND
 // =============================================================================
 // NOTE: `wtb prune` queries GLOBAL Docker volumes, so we deliberately never run
@@ -977,7 +1319,7 @@ describe("Prune Command", () => {
     expect(result.combined).toContain("prune")
   })
 
-  it("--json emits a valid dry-run summary (no deletion)", () => {
+  it.skipIf(!HAS_DOCKER_DAEMON)("--json emits a valid dry-run summary (no deletion)", () => {
     const result = testRepo.runCLI("prune --json")
 
     expect(result.exitCode).toBe(0)
@@ -985,8 +1327,16 @@ describe("Prune Command", () => {
     // shape only — values depend on the host's global wtb volumes; never assert deletion
     expect(payload.dryRun).toBe(true)
     expect(Array.isArray(payload.candidates)).toBe(true)
+    expect(Array.isArray(payload.protected)).toBe(true)
     expect(Array.isArray(payload.removed)).toBe(true)
     expect(payload.removed).toEqual([]) // dry-run never removes
+  })
+
+  it.skipIf(HAS_DOCKER_DAEMON)("fails closed without a Docker daemon", () => {
+    const result = testRepo.runCLI("prune --json")
+
+    expect(result.exitCode).not.toBe(0)
+    expect(result.combined.toLowerCase()).toMatch(/docker|daemon/)
   })
 })
 
@@ -1008,7 +1358,7 @@ describe("Full Workflow Tests", () => {
 
     it("should complete create → status → remove cycle", () => {
       // Create
-      const createResult = testRepo.runCLI("create feature/workflow")
+      const createResult = testRepo.runCLI("create feature/workflow --no-docker --no-start")
       expect(createResult.exitCode).toBe(0)
 
       // Status
@@ -1016,7 +1366,7 @@ describe("Full Workflow Tests", () => {
       expect(statusResult.combined).toContain("feature/workflow")
 
       // Remove
-      const removeResult = testRepo.runCLI("remove feature/workflow")
+      const removeResult = testRepo.runCLI("remove feature/workflow --no-docker")
       expect(removeResult.exitCode).toBe(0)
 
       // Verify removed
@@ -1038,7 +1388,7 @@ describe("Full Workflow Tests", () => {
 
     it("should complete full lifecycle with all features", () => {
       // Create with copy_files and start_command
-      const createResult = testRepo.runCLI("create feature/full-lifecycle")
+      const createResult = testRepo.runCLI("create feature/full-lifecycle --no-docker")
 
       expect(createResult.exitCode).toBe(0)
       expect(createResult.combined).toContain("Copying files/directories")
@@ -1079,9 +1429,9 @@ describe("Full Workflow Tests", () => {
 
     it("should manage multiple worktrees simultaneously", () => {
       // Create multiple worktrees
-      testRepo.runCLI("create feature/one")
-      testRepo.runCLI("create feature/two")
-      testRepo.runCLI("create feature/three")
+      testRepo.runCLI("create feature/one --no-docker --no-start")
+      testRepo.runCLI("create feature/two --no-docker --no-start")
+      testRepo.runCLI("create feature/three --no-docker --no-start")
 
       // Verify all exist
       const worktrees = testRepo.listWorktrees()
@@ -1094,7 +1444,7 @@ describe("Full Workflow Tests", () => {
       expect(status.combined).toContain("feature/three")
 
       // Remove one
-      testRepo.runCLI("remove feature/two")
+      testRepo.runCLI("remove feature/two --no-docker")
 
       // Verify removed
       const statusAfter = testRepo.runCLI("status --all")
@@ -1191,7 +1541,7 @@ describe("Cross-Project Compatibility", () => {
       })
 
       it("should create worktree successfully", () => {
-        const result = testRepo.runCLI("create test/cross-project")
+        const result = testRepo.runCLI("create test/cross-project --no-docker --no-start")
 
         expect(result.exitCode).toBe(0)
         expect(result.combined).toContain("Worktree created successfully")
@@ -1205,9 +1555,11 @@ describe("Cross-Project Compatibility", () => {
       })
 
       it("should remove worktree successfully", () => {
-        testRepo.runCLI("create test/to-cleanup")
+        testRepo.runCLI("create test/to-cleanup --no-docker --no-start")
 
-        const result = testRepo.runCLI("remove test/to-cleanup --force")
+        const result = testRepo.runCLI(
+          "remove test/to-cleanup --force --no-docker --no-end"
+        )
 
         expect(result.exitCode).toBe(0)
         expect(result.combined).toContain("Worktree removed successfully")
@@ -1232,7 +1584,7 @@ describe("Create Command - link_files", () => {
   })
 
   it("should create symlinks for paths in link_files", () => {
-    const result = testRepo.runCLI("create test/symlinks")
+    const result = testRepo.runCLI("create test/symlinks --no-docker")
 
     expect(result.exitCode).toBe(0)
     expect(result.combined).toContain("Creating symlinks")
@@ -1253,7 +1605,7 @@ describe("Create Command - link_files", () => {
   })
 
   it("should skip non-existent paths in link_files", () => {
-    const result = testRepo.runCLI("create test/skip-missing-links")
+    const result = testRepo.runCLI("create test/skip-missing-links --no-docker")
 
     // Missing paths should be skipped (wtb.yaml has shared-data and .env which exist,
     // so this test verifies that existing paths work and non-existent would be skipped)
@@ -1262,7 +1614,7 @@ describe("Create Command - link_files", () => {
   })
 
   it("should copy (not symlink) paths in copy_files but not link_files", () => {
-    const result = testRepo.runCLI("create test/copy-not-link")
+    const result = testRepo.runCLI("create test/copy-not-link --no-docker")
 
     expect(result.exitCode).toBe(0)
     const wtPath = testRepo.getWorktreePath("test/copy-not-link")
@@ -1277,7 +1629,7 @@ describe("Create Command - link_files", () => {
   })
 
   it("link_files takes priority over copy_files for same path", () => {
-    const result = testRepo.runCLI("create test/priority-check")
+    const result = testRepo.runCLI("create test/priority-check --no-docker")
 
     expect(result.exitCode).toBe(0)
     expect(result.combined).toContain("Creating symlinks")
@@ -1292,12 +1644,12 @@ describe("Create Command - link_files", () => {
 
   it("should replace existing file/directory with symlink", () => {
     // First create (makes symlinks)
-    testRepo.runCLI("create test/replace-test")
+    testRepo.runCLI("create test/replace-test --no-docker")
     // Remove the worktree
-    testRepo.runCLI("remove test/replace-test --force")
+    testRepo.runCLI("remove test/replace-test --force --no-docker")
 
     // Create again — should handle existing symlinks gracefully
-    const result = testRepo.runCLI("create test/replace-test")
+    const result = testRepo.runCLI("create test/replace-test --no-docker")
     expect(result.exitCode).toBe(0)
     expect(result.combined).toContain("Worktree created successfully")
   })
@@ -1319,7 +1671,7 @@ describe("Create Command - env.adjust", () => {
   })
 
   it("should create worktree and adjust env file ports", () => {
-    const result = testRepo.runCLI("create test/env-ports")
+    const result = testRepo.runCLI("create test/env-ports --no-docker")
 
     expect(result.exitCode).toBe(0)
     expect(result.combined).toContain("Adjusting environment files")
@@ -1376,13 +1728,52 @@ describe("Create Command - env.adjust", () => {
     expect(app).not.toBe(db)
   })
 
+  it("serializes parallel creates so sibling env port allocations stay unique", async () => {
+    const runCreate = (branch: string) =>
+      new Promise<{ exitCode: number; output: string }>((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [CLI_PATH, "create", branch, "--no-docker", "--no-start"],
+          { cwd: testRepo.path, stdio: ["ignore", "pipe", "pipe"] }
+        )
+        let output = ""
+        child.stdout.on("data", (chunk: Buffer) => {
+          output += chunk.toString()
+        })
+        child.stderr.on("data", (chunk: Buffer) => {
+          output += chunk.toString()
+        })
+        child.once("error", reject)
+        child.once("close", (code) => resolve({ exitCode: code ?? 1, output }))
+      })
+
+    const branches = ["parallel/alpha", "parallel/beta"]
+    const results = await Promise.all(branches.map(runCreate))
+    expect(results, results.map((result) => result.output).join("\n")).toEqual([
+      expect.objectContaining({ exitCode: 0 }),
+      expect.objectContaining({ exitCode: 0 }),
+    ])
+
+    const allocated = branches.map((branch) => {
+      const env = fs.readFileSync(path.join(testRepo.getWorktreePath(branch), ".env"), "utf-8")
+      return new Set(
+        [...env.matchAll(/^(?:APP_PORT|DB_PORT|REDIS_PORT)=(\d+)$/gm)].map((match) =>
+          Number(match[1])
+        )
+      )
+    })
+    expect(allocated[0].size).toBe(3)
+    expect(allocated[1].size).toBe(3)
+    expect([...allocated[0]].filter((port) => allocated[1].has(port))).toEqual([])
+  })
+
   it("should copy env file even when adjust is empty", () => {
     // Create a project with env.file set but adjust empty via CLI
     // Use the basic project which has env.file: [] to verify no env copy
     const basicRepo = createTestRepo("basic", "env-no-adjust")
 
     try {
-      const result = basicRepo.runCLI("create test/no-adjust")
+      const result = basicRepo.runCLI("create test/no-adjust --no-docker")
       expect(result.exitCode).toBe(0)
       // Basic project has env.file: [] so no env processing
       expect(result.combined).not.toContain("environment file")
@@ -1409,21 +1800,25 @@ describe("Create Command - --no-create-branch", () => {
 
   it("should succeed when branch already exists with --no-create-branch", () => {
     // Create branch first
-    testRepo.runCLI("create existing-for-flag")
-    testRepo.runCLI("remove existing-for-flag --force")
+    testRepo.runCLI("create existing-for-flag --no-docker")
+    testRepo.runCLI("remove existing-for-flag --force --no-docker")
 
     // Branch should still exist
     expect(testRepo.branchExists("existing-for-flag")).toBe(true)
 
     // Create worktree without creating new branch
-    const result = testRepo.runCLI("create existing-for-flag --no-create-branch")
+    const result = testRepo.runCLI(
+      "create existing-for-flag --no-create-branch --no-docker"
+    )
 
     expect(result.exitCode).toBe(0)
     expect(result.combined).toContain("Worktree created successfully")
   })
 
   it("should fail when branch does not exist with --no-create-branch", () => {
-    const result = testRepo.runCLI("create nonexistent-branch --no-create-branch")
+    const result = testRepo.runCLI(
+      "create nonexistent-branch --no-create-branch --no-docker"
+    )
 
     expect(result.exitCode).toBe(1)
     expect(result.combined).toContain("does not exist")
@@ -1431,7 +1826,7 @@ describe("Create Command - --no-create-branch", () => {
   })
 
   it("should create new branch without --no-create-branch flag", () => {
-    const result = testRepo.runCLI("create brand-new-branch")
+    const result = testRepo.runCLI("create brand-new-branch --no-docker")
 
     expect(result.exitCode).toBe(0)
     expect(result.combined).toContain("Creating new branch: brand-new-branch")
@@ -1837,7 +2232,9 @@ describe("Relocatability scenario (Supabase-like tracked compose)", () => {
     repo.cleanup()
   })
 
-  it("rewrites the tracked compose per-worktree, propagates ports, and keeps the worktree clean", () => {
+  it.skipIf(!HAS_DOCKER_DAEMON)(
+    "rewrites the tracked compose per-worktree, propagates ports, and keeps the worktree clean",
+    () => {
     const create = repo.runCLI("create feat/iso --no-volume-copy")
     expect(create.exitCode).toBe(0)
 
@@ -1870,9 +2267,10 @@ describe("Relocatability scenario (Supabase-like tracked compose)", () => {
     expect(ports.combined).toContain("localhost:")
 
     // removal is not blocked by the rewrite (skip-worktree → clean status)
-    const rm = repo.runCLI("remove feat/iso")
+    const rm = repo.runCLI("remove feat/iso --no-docker")
     expect(rm.exitCode).toBe(0)
-  })
+    }
+  )
 
   it("doctor reports relocatability findings (info, since identity rewrite + propagation are on by default)", () => {
     const res = repo.runCLI("doctor --json")
