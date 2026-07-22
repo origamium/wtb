@@ -33,7 +33,7 @@
     "pretest:e2e": "npm run build",
     "test:e2e": "vitest run e2e/",
     "pretest:integration": "npm run build",
-    "test:integration": "bash e2e/integration-docker.sh",
+    "test:integration": "bash e2e/integration-docker.sh && bash e2e/integration-databases.sh",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build && npm run test:run"
   },

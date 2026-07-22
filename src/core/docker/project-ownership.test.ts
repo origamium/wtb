@@ -47,7 +47,23 @@ describe("assertDockerComposeProjectOwnedByWorktree", () => {
     ).not.toThrow()
   })
 
-  it("rejects an otherwise-owned project with an additional unknown config file", () => {
+it("accepts Compose working_dir set to the Compose file directory", () => {
+  vi.mocked(execDockerSafe)
+    .mockReturnValueOnce("abc123")
+    .mockReturnValueOnce(
+      JSON.stringify({
+        "com.docker.compose.project": "feature",
+        "com.docker.compose.project.working_dir": "/repo/wt/ops",
+        "com.docker.compose.project.config_files": "/repo/wt/ops/compose.yml",
+      })
+    )
+
+  expect(() =>
+    assertDockerComposeProjectOwnedByWorktree("feature", "/repo/wt", "ops/compose.yml")
+  ).not.toThrow()
+})
+
+it("rejects an otherwise-owned project with an additional unknown config file", () => {
     vi.mocked(execDockerSafe)
       .mockReturnValueOnce("abc123")
       .mockReturnValueOnce(

@@ -38,6 +38,7 @@ describe("create file setup safety", () => {
     const target = path.join(targetRoot, ".env")
     fs.writeFileSync(source, "QUOTED='a # b'\n# keep bytes\n")
     fs.writeFileSync(target, "OLD=1\n", { mode: 0o640 })
+    fs.chmodSync(target, 0o640)
 
     const result = await copyConfiguredFiles(
       sourceRoot,

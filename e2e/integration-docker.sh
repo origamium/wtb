@@ -178,7 +178,7 @@ run_json() {
   LAST_JSON="$BASE/$label.json"
   LAST_STDERR="$BASE/$label.stderr"
   set +e
-  node "$CLI" "$@" --json >"$LAST_JSON" 2>"$LAST_STDERR"
+  ( cd "$PROJ" && node "$CLI" "$@" --json >"$LAST_JSON" 2>"$LAST_STDERR" )
   LAST_STATUS=$?
   set -e
   assert_json_object "$LAST_JSON"

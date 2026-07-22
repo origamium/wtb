@@ -87,6 +87,7 @@ export function assertDockerComposeProjectOwnedByWorktree(
       rejectSymlinkAncestors: true,
     })
   )
+  const expectedComposeDir = canonicalPath(path.dirname(expectedCompose))
   for (const containerId of output.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
     let rawLabels: string
     try {
@@ -124,7 +125,7 @@ export function assertDockerComposeProjectOwnedByWorktree(
     if (
       project !== targetProject ||
       typeof workingDir !== "string" ||
-      canonicalPath(workingDir) !== expectedWorktree ||
+      ![expectedWorktree, expectedComposeDir].includes(canonicalPath(workingDir)) ||
       !ownsExpectedConfig
     ) {
       throw new Error(
