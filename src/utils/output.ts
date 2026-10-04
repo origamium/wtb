@@ -9,6 +9,7 @@
  */
 
 let jsonMode = false
+let jsonResultWritten = false
 
 /**
  * JSON 出力モードを切り替える。コマンド action の冒頭で毎回明示的に設定すること
@@ -16,6 +17,17 @@ let jsonMode = false
  */
 export function setJsonOutputMode(enabled: boolean): void {
   jsonMode = enabled
+  jsonResultWritten = false
+}
+
+export function writeJsonResult(payload: unknown): void {
+  const serialized = JSON.stringify(payload, null, 2)
+  jsonResultWritten = true
+  process.stdout.write(`${serialized}\n`)
+}
+
+export function hasWrittenJsonResult(): boolean {
+  return jsonResultWritten
 }
 
 /**

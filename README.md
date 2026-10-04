@@ -31,6 +31,10 @@ A CLI tool built on Git worktrees that gives every branch its own isolated worki
   - [`status`](#wtb-status)
   - [`doctor`](#wtb-doctor)
   - [`init-claude`](#wtb-init-claude)
+  - [`setup` / `teardown`](#wtb-setup-branch--wtb-teardown-branch)
+  - [`await`](#wtb-await-branch)
+  - [`env`](#wtb-env-branch)
+  - [`init-orca`](#wtb-init-orca)
 - [Configuration](#configuration)
 - [Environment variable adjustment](#environment-variable-adjustment)
 - [Docker Compose integration](#docker-compose-integration)
@@ -41,6 +45,7 @@ A CLI tool built on Git worktrees that gives every branch its own isolated worki
 - [Design notes](#design-notes)
 - [Requirements](#requirements)
 - [Claude Code integration](#claude-code-integration)
+- [Orca integration](#orca-integration)
 - [Troubleshooting](#troubleshooting)
 - [FAQ](#faq)
 - [Roadmap](#roadmap)
@@ -68,7 +73,7 @@ wtb is built for a particular way of working: running many changes — including
 - **Every worktree is fully autonomous on data.** Each worktree starts from a complete copy of the DB state, so it can write migrations and mutate data freely without affecting any other worktree.
 - **Conflicts are expected — and that's fine.** Working this way, conflicts are the norm; the best code emerges from the collision of competing requirements. wtb deliberately does *not* try to resolve them for you.
 - **Docker Compose only, for now.** wtb currently supports Docker Compose plus its YAML and env files only. Other stacks are out of scope at this stage.
-- **No coding-agent orchestration (yet).** wtb does not orchestrate coding agents. A coding agent launched inside a worktree should treat its job as done once it finishes the task; if more work is needed, a human is expected to go in and pick it up. In practice the recommended pattern is to let the agent run all the way to opening a pull request.
+- **Agent orchestration stays with Orca.** Orca can create worktrees and launch agents; wtb's setup/archive hooks prepare and clean up each worktree's Compose environment. wtb itself does not schedule or coordinate agents.
 - _The author is partial to the V6 hybrid power units used in F1._
 
 ## How it works
@@ -378,6 +383,7 @@ Lightweight, scriptable listing of worktrees — like Unix `ls`. Use this instea
 | Option | Description |
 |--------|-------------|
 | `-l, --long` | Long format: short hash, relative age, dirty flag, subject |
+| `--full` | Include long fields plus `baseBranch`, `ahead`, and `behind` relative to configured `base_branch` |
 | `--json` | Machine-readable JSON (combines with `-l` for enriched fields) |
 | `-p, --paths` | Absolute paths only, one per line — pipe-friendly |
 
@@ -425,6 +431,7 @@ wtb ls -l --json | jq '.[] | select(.dirty == true)'
 
 JSON fields (always): `path, branch, head, isMain, isCurrent, locked, prunable, bare, detached`.
 With `-l`: adds `shortHash, subject, ageRelative, ageTimestamp, dirty` — plus `enrichmentError` if per-worktree enrichment failed (e.g., prunable).
+With `--full`: includes the long fields and `baseBranch`, `ahead`, `behind`. Unknown dirty/count values are `null` with `enrichmentError`, so an unresolved base or unreadable checkout is not mistaken for a clean, merged branch. The default and `-l` formats remain unchanged.
 
 ### `wtb path <branch>`
 
@@ -479,7 +486,7 @@ Richer inspection: worktrees + Docker Compose services + running containers + vo
    🔧 Environment: .env, .env.local
 ```
 
-`--json` returns one structured object (`{ worktrees: [...], docker: {...} }`) and stays valid JSON even when Docker is down (`docker.available: false`). Each `docker.volumes.wtb` entry carries a `labelled` boolean: `true` means the volume has the `wtb.managed=true` label (the source of truth); `false` means it was matched only by the legacy `wtb`/`worktree` name heuristic — check `labelled` before treating a volume as wtb-managed. Together with `wtb ls --json`, `wtb ports` (JSON by default), and `--json` on `create` / `remove` / `reclone` / `up` / `down`, every wtb read *and* mutation now has a machine-readable form.
+`--json` returns one structured object (`{ worktrees: [...], docker: {...} }`) and stays valid JSON even when Docker is down (`docker.available: false`). Each `docker.volumes.wtb` entry carries a `labelled` boolean: `true` means the volume has the `wtb.managed=true` label (the source of truth); `false` means it was matched only by the legacy `wtb`/`worktree` name heuristic — check `labelled` before treating a volume as wtb-managed. The inspection and lifecycle commands listed here provide JSON output; `init` and `init-claude` use human-readable output and exit codes.
 
 ```bash
 wtb status --json | jq '.docker.containers[] | select(.isWtb) | .name'   # this project's containers
@@ -519,6 +526,98 @@ Installs the bundled Claude Code skill into this repo (or globally). See [Claude
 | `--check` | Verify the installed `SKILL.md` against this CLI's version — exit `0` when up to date, `1` when it's missing, unstamped, or stale. Respects `--user`; writes nothing |
 
 The installer stamps `SKILL.md` with `<!-- wtb-skill-version: X.Y.Z -->` right after the frontmatter. `--check` (and the skip message when the file already exists without `--force`) compares that stamp to the CLI version, so a stale skill is machine-detectable after upgrading wtb — refresh it with `wtb init-claude --force`.
+
+### `wtb setup [branch]` / `wtb teardown [branch]`
+
+Prepare or clean up an **existing linked worktree** without adding/removing its Git worktree or branch. The current worktree is the default. Main-worktree targets are refused. These commands let Orca own the checkout lifecycle while wtb owns its development environment.
+
+`setup` runs the same copy/link/env/Compose/data/start preparation as `create`, with strict failure handling by default. It refuses to overwrite unrelated local changes or adopt unknown existing environment state. Completed preparation is recorded under the target's Git directory (`git rev-parse --git-path wtb-setup.json`); repeating a completed setup preserves ports and data and does not replay seed/start commands. `--up --wait` can retry startup/readiness after preparation has completed.
+
+| Option | Command | Description |
+|--------|---------|-------------|
+| `--up` | setup | Start the prepared Compose stack |
+| `--wait` | setup | Start the stack and wait for readiness; implies `--up` |
+| `--timeout <seconds>` | setup | Readiness deadline; default `120` |
+| `--seed` | setup | Run `volumes.seed_command` instead of cloning |
+| `--no-copy`, `--no-link`, `--no-env`, `--no-docker`, `--no-start` | setup | Skip the corresponding preparation phase |
+| `--no-volume-copy`, `--no-stop` | setup | Control cloning as on `create` |
+| `--remove-volumes` | teardown | Delete only volumes whose wtb ownership matches this worktree |
+| `--dry-run` | both | Validate and preview without changes |
+| `--json` | both | One result on stdout, including early failures |
+
+`teardown` runs the configured `end_command` first, then revalidates ownership and brings down the Compose stack with the requested volume policy. It never deletes the checkout or branch. Unlike `remove`, setting `end_command` does not suppress the final guarded Compose cleanup. A failed hook prevents that cleanup; all cleanup errors exit non-zero so an Orca archive hook can stop checkout deletion. Its internal cleanup deadline is 110 seconds, leaving time to report failure before Orca's archive limit.
+
+`setup --json` returns `{ branch, path, prepared, reused, dryRun, setup, up, readiness, ok, exitCode, error?, recovery? }`. `setup` carries the preparation phase results; `up` and `readiness` contain results only when requested. The readiness timeout does not limit database cloning or lifecycle preparation time.
+
+Cleanup may partially succeed before failing. A retained checkout does not restore data already deleted by Docker or `end_command`. Teardown invalidates the completed setup record before mutation so later setup cannot silently reuse a partially removed environment. Source-stack restoration failures during preparation retain Docker exit `5` and their recovery details.
+
+`teardown --json` returns `{ branch, path, dryRun, removed: false, tornDown, composeDown, endCommand, cleanupErrors, ok }`. `composeDown` is `null` or `{ ran, failed, volumesRemoved }`; `endCommand` is `null` or `{ ran, failed }`. Partial failure details remain available even when the command exits non-zero.
+
+**Interrupted preparation requires manual recovery.** A preparing/failed record is not an instruction to replay setup: inspect the reported phase, preserve local work and database recovery records, and repair the affected operation (for example with `reclone` for a failed volume clone). There is no automatic resume/reset/force switch. Do not delete the setup record to bypass the guard. A fresh checkout is the safe fallback after preserving work and completing cleanup. Readiness failure after completed preparation is different: retry `setup --up --wait` or `up` followed by `await` without rerunning initialization.
+
+### `wtb await [branch]`
+
+Wait for the existing worktree's configured Compose services to become ready. A container with a healthcheck must report `healthy`; a container without a healthcheck must be running. Explicit successful-completion dependencies and Compose job services instead need exit code `0`. This checks container readiness, not an application-specific HTTP endpoint. Missing or starting services remain pending; deadline expiry exits non-zero.
+
+```bash
+wtb up feature/auth
+wtb await feature/auth --timeout 120 --json
+```
+
+`--timeout <seconds>` defaults to `120`; `--json` writes `{ branch, path, project, composeFile, ok, timedOut, elapsedMs, services }`. Each service contains `{ service, expectedReplicas, ready, containers }`; each container contains `{ id, name, service, state, health, exitCode, ready }`. It uses the same target/project safety checks as `up`, and never starts a stack by itself. Missing/no active Compose configuration exits `4`, Docker errors exit `5`, and timeout exits `1`.
+
+### `wtb env [branch]`
+
+Print only keys explicitly listed in `env.adjust`, using their current values from the target worktree's configured env files; later files in `env.file` win. It does not dump the entire environment or unrelated credentials. Removed (`null`) and missing keys are omitted. Output is shell-quoted for POSIX shells rather than executable expansion of env-file text.
+
+```bash
+wtb env feature/auth
+eval "$(wtb env feature/auth)"
+wtb env feature/auth --json
+```
+
+`--json` returns a values object. `eval` assigns shell variables; it does not automatically export newly assigned variables to child processes. Use the JSON form when passing values to tools instead of a shell. Values explicitly included in `env.adjust` can still be sensitive; choose those keys intentionally.
+
+### `wtb init-orca`
+
+Install shared setup/archive hooks into `orca.yaml` at Orca's registered repository root. `ORCA_ROOT_PATH`, when present, must resolve to a checkout root sharing the caller's Git directory; otherwise the command fails without writing. Outside an Orca terminal, the canonical main-worktree root is used.
+
+| Option | Description |
+|--------|-------------|
+| `--remove-volumes` | Configure archive to remove this worktree's owned Docker volumes; omitted means retain volumes |
+| `-f, --force` | Replace only conflicting `scripts.setup`, `scripts.archive`, and `setupAgentStartupPolicy` keys |
+| `--check` | Write nothing; exit `0` for matching hooks and `1` for missing/different hooks. Use the same `--remove-volumes` policy as installation |
+| `--dry-run` | Preview target and integration keys without writing |
+| `--json` | One result including `path`, `changed`, `wrote`, `differences`, and `ok`; errors include `error` and `exitCode` |
+
+Comments and unrelated YAML settings are retained. Existing differing hooks are refused unless `--force` is given. Malformed YAML, a non-mapping or anchored `scripts` value, shared anchored integration values, and a symlinked `orca.yaml` are refused even with `--force`. The installer does not run Orca, start Docker, or modify Orca's local settings.
+
+## Orca integration
+
+From the repository registered in Orca, configure `wtb.yaml` and install hooks:
+
+```bash
+wtb init-orca --remove-volumes --dry-run
+wtb init-orca --remove-volumes
+wtb init-orca --remove-volumes --check
+```
+
+This produces the following integration keys; omit `--remove-volumes` to retain worktree data on archive:
+
+```yaml
+setupAgentStartupPolicy: wait-for-setup
+scripts:
+  setup: wtb setup --up --wait --timeout 120 --json
+  archive: wtb teardown --remove-volumes --json
+```
+
+In Orca, enable **shared repository hooks** and **run setup by default**. Existing local hook settings can override shared `orca.yaml`; `wait-for-setup` controls agent startup order, not whether setup runs. Ensure `wtb`, Git, Docker, and Docker Compose are available on the execution host's PATH. Commit `orca.yaml` and `wtb.yaml` so future checkouts carry the configuration.
+
+Orca invokes setup in the new worktree with `ORCA_WORKTREE_PATH`, `ORCA_ROOT_PATH`, and `ORCA_WORKSPACE_NAME`. wtb resolves source data and configuration from Git's main worktree. Orca retains responsibility for worktree creation, deletion, terminals, and agents. Never call `wtb create` or `wtb remove` from these hooks.
+
+For Orca CLI operations, use `worktree create --setup run` to explicitly run setup, and **`worktree rm --run-hooks`** to run archive. CLI deletion skips archive by default; `--force` does not enable hooks. Orca builds advertising `worktree.archive-failure-blocking.v1` block deletion when archive fails or cannot report success; `--force` does not waive that failure. The archive hook has a **120-second deadline**, independent of setup's readiness timeout. A cleanup timeout is a failure requiring inspection, not proof that cleanup completed. Do not bypass archive failures automatically.
+
+See [the example](examples/orca/orca.yaml) and [the contract checklist](docs/readme-contract.md) for configuration and verification boundaries.
 
 ## Configuration
 
@@ -962,13 +1061,7 @@ Short for "worktree turbo" — git worktrees, but with the environment-wrangling
 
 ## Roadmap
 
-Planned, **not yet implemented** — listed so the intended direction is on record.
-
-- **`wtb await [branch]`** — block until the worktree's Compose services report healthy (poll `docker compose -p <project> ps`), with `--timeout` and `--json`. Closes the gap between "stack started" (`wtb up` / `create`) and "stack usable", replacing the `sleep && curl` loops agents write today.
-- **`wtb ls --full`** — per-worktree ahead/behind counts vs `base_branch` and a dirty flag in one call, so "which worktree is abandoned and safe to remove" doesn't take N git invocations.
-- **`wtb env <branch>`** — print the worktree's adjusted env as `KEY=VALUE` lines for `eval "$(wtb env X)"`, as a shell-friendly alternative to parsing `wtb ports --json`. Will be added if parsing friction is actually reported.
-
-Everything previously listed here has shipped (seed-instead-of-copy, stop-then-copy, per-worktree identity isolation, `up`/`down`, machine-readable output across the board). Open an issue with what you'd like to see next.
+The previously planned `await`, `ls --full`, and `env` commands are now implemented, alongside Orca setup/archive integration. See their command reference and [verification checklist](docs/readme-contract.md). Orca continues to own agent orchestration; wtb focuses on worktree environment isolation.
 
 ## Changelog
 

@@ -16,6 +16,7 @@ import {
 import * as path from "node:path"
 import { Command } from "commander"
 import fs from "fs-extra"
+import { parse as parseYaml } from "yaml"
 import { EXIT_CODES } from "../../constants/index.js"
 import { loadConfig } from "../../core/config/loader.js"
 import { resolveRepositoryPath } from "../../core/config/paths.js"
@@ -86,13 +87,13 @@ import {
 } from "../../core/git/worktree.js"
 import type { ComposeConfig, WtbConfig } from "../../types/index.js"
 import { CLIError, getErrorMessage } from "../../utils/error.js"
-import { executeLifecycleCommand } from "../../utils/exec.js"
-import { out, setJsonOutputMode } from "../../utils/output.js"
+import { execGitSafe, executeLifecycleCommand } from "../../utils/exec.js"
+import { out, setJsonOutputMode, writeJsonResult } from "../../utils/output.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
 import { createVolumeCopyProgressHandler } from "../utils/progress.js"
 import { runRelocatabilityPreflight } from "./doctor.js"
 
-interface CreateOptions {
+export interface CreateOptions {
   path?: string
   createBranch?: boolean
   docker?: boolean
@@ -232,7 +233,6 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
   const gitRoot = repository.mainRoot
   const dryRun = options.dryRun === true
   let releaseRepositoryLock = dryRun ? undefined : await acquireRepositoryLock(repository)
-  let targetLifecycleLease: TargetVolumeLifecycleLease | undefined
 
   try {
     // 既存のworktreeチェック
@@ -271,11 +271,6 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
       : path.join(path.dirname(gitRoot), `worktree-${sanitizedBranch}`)
 
     const skipDocker = options.docker === false
-    const skipEnv = options.env === false
-    const skipCopy = options.copy === false
-    const skipLink = options.link === false
-    const skipStart = options.start === false
-    const skipVolumeCopy = options.volumeCopy === false
     const forceVolumeCopy = options.forceVolumeCopy === true
     const useSeed = options.seed === true
     if (useSeed && skipDocker) {
@@ -367,377 +362,40 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
       })
     }
 
-    // --json 用の各 phase の結果トラッカー
-    let envChanges: Record<string, { from: string; to: string }> = {}
-    let composePorts: ComposePortChanges = {}
-    let composeIdentity: ComposeIdentityRewrite = { containerNames: [] }
-    let composeValueChanges: ComposeValueChange[] = []
-    let volumeResult: VolumeCopyResult = emptyVolumeCopyResult()
-    let startCommandFailed = false
-    let startCommandRan = false
-    let composeFailed = false
-    const setupIssues = emptySetupIssues()
-    // One reservation set is shared by env and Compose allocation while the
-    // repository lock is held by the caller. It includes stopped sibling
-    // worktrees as well as Docker's currently published ports.
-    const reservedPorts = new Set<number>()
-    const needsPortReservations =
-      (!skipEnv && Object.values(config.env.adjust).some((value) => typeof value === "number")) ||
-      (!skipDocker && Boolean(config.docker_compose_file))
-    let portReservationFailed = false
-    if (!dryRun && needsPortReservations) {
-      try {
-        for (const port of collectWorktreeEnvPorts(worktreePath, config)) reservedPorts.add(port)
-        for (const port of collectWorktreeComposePorts(worktreePath, config)) {
-          reservedPorts.add(port)
+    const {
+      envChanges,
+      composePorts,
+      composeIdentity,
+      composeValueChanges,
+      volumeResult,
+      startCommandFailed,
+      startCommandRan,
+      composeFailed,
+      setupIssues,
+      volumeFailures,
+      seedFailed,
+      seedRan,
+      sourceRestartFailed,
+    } = await prepareWorktreeEnvironment({
+      repository,
+      worktreePath,
+      branch,
+      config,
+      options,
+      previewRevision: dryRun
+        ? useExistingBranch
+          ? `refs/heads/${branch}`
+          : trackRemoteBranch
+            ? `refs/remotes/origin/${branch}`
+            : config.base_branch
+        : undefined,
+      releaseAllocationLock: async () => {
+        if (releaseRepositoryLock) {
+          await releaseRepositoryLock()
+          releaseRepositoryLock = undefined
         }
-        if (!skipDocker) {
-          for (const port of getUsedPortsOrThrow()) reservedPorts.add(port)
-        }
-      } catch (error) {
-        portReservationFailed = true
-        const message = `Could not build a complete repository-wide port reservation set: ${getErrorMessage(error)}`
-        addSetupIssue(setupIssues, "failure", { phase: "env", message })
-        out(`  ❌ ${message}`)
-      }
-    }
-
-    // link_files に含まれるパスはコピーをスキップしてシンボリックリンクを優先する
-    const linkFileSet = new Set<string>()
-    for (const configuredPath of config.link_files ?? []) {
-      try {
-        linkFileSet.add(resolveRepositoryPath(gitRoot, configuredPath, { field: "link_files" }))
-      } catch {
-        // linkConfiguredFiles records the runtime validation failure in setupIssues.
-      }
-    }
-    let composeSourcePath: string | null = null
-    if (config.docker_compose_file) {
-      try {
-        composeSourcePath = resolveRepositoryPath(gitRoot, config.docker_compose_file, {
-          field: "docker_compose_file source",
-        })
-      } catch {
-        // setupDockerCompose records the runtime validation failure.
-      }
-    }
-
-    const filesToCopy = (config.copy_files ?? []).filter((configuredPath) => {
-      if (!skipCopy && !dryRun) {
-        try {
-          assertSetupSourceDoesNotContainWorktree(gitRoot, worktreePath, configuredPath, "copy")
-        } catch (error) {
-          const message = getErrorMessage(error)
-          addSetupIssue(setupIssues, "failure", {
-            phase: "copy",
-            path: configuredPath,
-            message,
-          })
-          out(`  ❌ Refusing unsafe copy source '${configuredPath}': ${message}`)
-          return false
-        }
-      }
-      let sourcePath: string
-      try {
-        sourcePath = resolveRepositoryPath(gitRoot, configuredPath, { field: "copy_files" })
-      } catch {
-        return true
-      }
-      if (linkFileSet.has(sourcePath)) return false
-      // The dedicated Compose phase must see the branch checkout before deciding
-      // whether to fall back to main; a generic copy here would overwrite it. With
-      // --no-docker, preserve an already checked-out branch Compose as well, while
-      // retaining the explicit copy_files fallback when the target file is absent.
-      if (composeSourcePath === null || sourcePath !== composeSourcePath) return true
-      if (!skipDocker) return false
-      try {
-        const targetComposePath = resolveRepositoryPath(
-          worktreePath,
-          config.docker_compose_file,
-          { field: "docker_compose_file target", rejectSymlinkAncestors: true }
-        )
-        return !existsSync(targetComposePath)
-      } catch {
-        // Let copyConfiguredFiles surface a structured setup failure.
-        return true
-      }
+      },
     })
-
-    // File copying phase
-    if (filesToCopy.length > 0) {
-      out("")
-      if (skipCopy) {
-        out("⏭️  Skipping file copy (--no-copy)")
-      } else if (dryRun) {
-        out(`📋 Would copy files: ${filesToCopy.join(", ")}`)
-      } else {
-        out("📋 Copying files/directories...")
-        await copyConfiguredFiles(gitRoot, worktreePath, filesToCopy, setupIssues)
-      }
-    }
-
-    // Symlink phase
-    const linkFiles = (config.link_files ?? []).filter((configuredPath) => {
-      if (skipLink || dryRun) return true
-      try {
-        assertSetupSourceDoesNotContainWorktree(gitRoot, worktreePath, configuredPath, "link")
-        return true
-      } catch (error) {
-        const message = getErrorMessage(error)
-        addSetupIssue(setupIssues, "failure", {
-          phase: "link",
-          path: configuredPath,
-          message,
-        })
-        out(`  ❌ Refusing unsafe link source '${configuredPath}': ${message}`)
-        return false
-      }
-    })
-    if (linkFiles.length > 0) {
-      out("")
-      if (skipLink) {
-        out("⏭️  Skipping symlink creation (--no-link)")
-      } else if (dryRun) {
-        out(`🔗 Would create symlinks: ${linkFiles.join(", ")}`)
-      } else {
-        out("🔗 Creating symlinks...")
-        await linkConfiguredFiles(gitRoot, worktreePath, linkFiles, setupIssues)
-      }
-    }
-
-    // Environment file phase
-    if (config.env.file.length > 0) {
-      out("")
-      if (skipEnv) {
-        out("⏭️  Skipping environment file processing (--no-env)")
-      } else if (dryRun) {
-        const mode = Object.keys(config.env.adjust).length > 0 ? "adjust" : "copy"
-        out(`🔧 Would process environment files (${mode}): ${config.env.file.join(", ")}`)
-      } else if (portReservationFailed && Object.keys(config.env.adjust).length > 0) {
-        out("⏭️  Skipping environment port allocation because sibling reservations are incomplete")
-      } else if (Object.keys(config.env.adjust).length > 0) {
-        out("🔧 Adjusting environment files...")
-        envChanges = await applyEnvAdjustments(gitRoot, worktreePath, config, {
-          reservedPorts,
-          issues: setupIssues,
-        })
-      } else {
-        out("📋 Copying environment files...")
-        await copyConfiguredFiles(gitRoot, worktreePath, config.env.file, setupIssues, "env")
-      }
-    }
-
-    // Docker Compose phase
-    if (config.docker_compose_file) {
-      out("")
-      if (skipDocker) {
-        out("⏭️  Skipping Docker Compose setup (--no-docker)")
-      } else if (dryRun) {
-        const sourceComposePath = resolveRepositoryPath(gitRoot, config.docker_compose_file, {
-          field: "docker_compose_file source",
-          rejectSymlinkAncestors: true,
-        })
-        if (existsSync(sourceComposePath)) {
-          out(`🐳 Would configure Docker Compose: ${config.docker_compose_file}`)
-        } else {
-          out(`⚠️  Docker Compose source not found: ${config.docker_compose_file} (would skip)`)
-        }
-      } else if (portReservationFailed) {
-        composeFailed = true
-        out("⏭️  Skipping Docker Compose setup because sibling port reservations are incomplete")
-      } else {
-        const composeResult = await setupDockerCompose(
-          gitRoot,
-          worktreePath,
-          config,
-          branch,
-          envChanges,
-          reservedPorts,
-          setupIssues
-        )
-        composePorts = composeResult.portChanges
-        composeIdentity = composeResult.identity
-        composeValueChanges = composeResult.composeValueChanges
-        composeFailed = composeResult.failed
-      }
-    }
-
-    // The repository-wide allocation/write transaction is now complete: the lock covers
-    // worktree creation, copy/link, env allocation, and Compose allocation + atomic write.
-    // Volume cloning and start commands can be slow and have their own safety protocols, so
-    // release before either phase to avoid blocking unrelated repository operations.
-    if (releaseRepositoryLock) {
-      await releaseRepositoryLock()
-      releaseRepositoryLock = undefined
-    }
-
-    // Data phase: either SEED (run a seed command, never touching the source volume)
-    // or CLONE (auto-copy named compose volumes so e.g. PostgreSQL data carries over).
-    // --seed replaces cloning entirely, so the source stack is never stopped.
-    let volumeFailures = 0
-    if (
-      config.docker_compose_file &&
-      !skipDocker &&
-      !dryRun &&
-      !composeFailed &&
-      setupIssues.failures.length === 0
-    ) {
-      volumeResult = preflightTargetComposeVolumes(
-        gitRoot,
-        worktreePath,
-        config,
-        branch,
-        repository.commonGitDir
-      )
-      volumeFailures = volumeResult.failed.length
-      for (const failure of volumeResult.failed) {
-        out(`  ❌ Target volume safety check failed (${failure.name}): ${failure.error}`)
-      }
-    }
-    let seedFailed = false
-    let seedRan = false
-    const acquireLifecycleVolumes = async (requireEmpty: boolean): Promise<void> => {
-      let releaseLifecycleRepositoryLock: Awaited<
-        ReturnType<typeof acquireRepositoryLock>
-      > | undefined
-      try {
-        // Atomic overwrite publishes recovery state under this same lock. Re-read
-        // it while serialized, then retain Docker leases after releasing the
-        // short repository critical section.
-        releaseLifecycleRepositoryLock = await acquireRepositoryLock(repository)
-        const safety = preflightTargetComposeVolumes(
-          gitRoot,
-          worktreePath,
-          config,
-          branch,
-          repository.commonGitDir
-        )
-        if (safety.failed.length > 0) {
-          throw new Error(safety.failed.map(({ name, error }) => `${name}: ${error}`).join("; "))
-        }
-        targetLifecycleLease = acquireWorktreeTargetVolumeLifecycleLeases(
-          gitRoot,
-          worktreePath,
-          config,
-          branch,
-          requireEmpty
-        )
-      } catch (error) {
-        const message = `Could not safely prepare target volumes for lifecycle commands: ${getErrorMessage(error)}`
-        volumeResult.failed.push({ name: config.docker_compose_file, error: message })
-        volumeFailures = volumeResult.failed.length
-        out(`  ❌ ${message}`)
-      } finally {
-        if (releaseLifecycleRepositoryLock) await releaseLifecycleRepositoryLock()
-      }
-    }
-    if (useSeed) {
-      // seedCommand is guaranteed non-empty here (validated above).
-      out("")
-      if (dryRun) {
-        out(`🌱 Would seed data instead of cloning volumes: ${seedCommand}`)
-      } else if (
-        composeFailed ||
-        setupIssues.failures.length > 0 ||
-        volumeFailures > 0
-      ) {
-        out(
-          "⏭️  Skipping seed command because setup failed; running it against an unisolated or incomplete worktree could modify source data"
-        )
-      } else {
-        await acquireLifecycleVolumes(true)
-        if (volumeFailures > 0) {
-          out(
-            "⏭️  Skipping seed command because target volumes could not be prepared as fresh, exclusively-owned volumes"
-          )
-        } else {
-        out(`🌱 Seeding data instead of cloning volumes: ${seedCommand}`)
-        seedRan = true
-        seedFailed = !(await executeSeedCommand(seedCommand as string, worktreePath))
-        }
-      }
-    } else if (config.docker_compose_file && !skipDocker) {
-      out("")
-      if (composeFailed) {
-        out("⏭️  Skipping volume clone because Docker Compose setup failed")
-      } else if (volumeFailures > 0) {
-        out("⏭️  Skipping volume clone because target volume ownership validation failed")
-      } else if (skipVolumeCopy) {
-        out("⏭️  Skipping volume clone (--no-volume-copy)")
-      } else if (dryRun) {
-        previewVolumeCopy(gitRoot, config)
-      } else {
-        volumeResult = await setupVolumeCopy(gitRoot, worktreePath, config, {
-          force: forceVolumeCopy,
-          stop: options.stop,
-          branch,
-          commonGitDir: repository.commonGitDir,
-        })
-        volumeFailures = volumeResult.failed.length
-      }
-    }
-
-    // Clone may only cover a configured subset. Prepare and pin every remaining
-    // non-external target volume as well, then keep the leases through
-    // start_command so Compose cannot adopt a concurrently substituted volume.
-    if (
-      !useSeed &&
-      config.docker_compose_file &&
-      !skipDocker &&
-      !dryRun &&
-      !composeFailed &&
-      setupIssues.failures.length === 0 &&
-      volumeFailures === 0
-    ) {
-      await acquireLifecycleVolumes(false)
-    }
-
-    // A stop command may fail after partially stopping services. If recovery also
-    // failed, do not start the target stack while the source environment is in an
-    // unknown/down state.
-    const sourceRestartFailed = volumeResult.sourceStack?.restarted === false
-
-    // start_command phase
-    if (config.start_command) {
-      out("")
-      if (skipStart) {
-        out("⏭️  Skipping start command (--no-start)")
-      } else if (dryRun) {
-        out(`🚀 Would run start command: ${config.start_command}`)
-      } else if (
-        composeFailed ||
-        setupIssues.failures.length > 0 ||
-        volumeFailures > 0 ||
-        seedFailed ||
-        sourceRestartFailed
-      ) {
-        out(
-          "⏭️  Skipping start command because setup/data isolation failed; the command could start an incomplete worktree or operate on the source Compose stack"
-        )
-      } else {
-        out(`🚀 Running start command: ${config.start_command}`)
-        startCommandRan = true
-        startCommandFailed = !(await executeStartCommand(config.start_command, worktreePath))
-        if (startCommandFailed) {
-          addSetupIssue(setupIssues, "failure", {
-            phase: "start",
-            message: "start_command failed",
-          })
-        }
-      }
-    }
-
-    if (targetLifecycleLease) {
-      try {
-        targetLifecycleLease.release()
-        targetLifecycleLease = undefined
-      } catch (error) {
-        const message = `Failed to release target volume lifecycle lease(s): ${getErrorMessage(error)}`
-        volumeResult.failed.push({ name: config.docker_compose_file, error: message })
-        volumeFailures = volumeResult.failed.length
-        out(`  ❌ ${message}`)
-      }
-    }
 
     // 成功メッセージ
     out("")
@@ -859,6 +517,458 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
       process.exitCode = EXIT_CODES.GENERAL_ERROR
     }
   } finally {
+    if (releaseRepositoryLock) await releaseRepositoryLock()
+  }
+}
+
+export type EnvironmentSetupPhase = SetupPhase | "volumes"
+
+export interface EnvironmentSetupResult {
+  envChanges: Record<string, { from: string; to: string }>
+  composePorts: ComposePortChanges
+  composeIdentity: ComposeIdentityRewrite
+  composeValueChanges: ComposeValueChange[]
+  volumeResult: VolumeCopyResult
+  startCommandFailed: boolean
+  startCommandRan: boolean
+  composeFailed: boolean
+  setupIssues: SetupIssues
+  volumeFailures: number
+  seedFailed: boolean
+  seedRan: boolean
+  sourceRestartFailed: boolean
+}
+
+/** Shared by create and setup. Caller holds the allocation lock on entry. */
+export async function prepareWorktreeEnvironment(input: {
+  repository: ReturnType<typeof getRepositoryContext>
+  worktreePath: string
+  branch: string
+  config: WtbConfig
+  options: CreateOptions
+  previewRevision?: string
+  releaseAllocationLock: () => Promise<void>
+  onPhase?: (phase: EnvironmentSetupPhase) => void
+}): Promise<EnvironmentSetupResult> {
+  const { repository, worktreePath, branch, config, options, releaseAllocationLock, onPhase } =
+    input
+  const gitRoot = repository.mainRoot
+  const dryRun = options.dryRun === true
+  const skipDocker = options.docker === false
+  const skipEnv = options.env === false
+  const skipCopy = options.copy === false
+  const skipLink = options.link === false
+  const skipStart = options.start === false
+  const skipVolumeCopy = options.volumeCopy === false
+  const forceVolumeCopy = options.forceVolumeCopy === true
+  const useSeed = options.seed === true
+  const seedCommand = config.volumes?.seed_command
+  let targetLifecycleLease: TargetVolumeLifecycleLease | undefined
+  try {
+    // --json 用の各 phase の結果トラッカー
+    let envChanges: Record<string, { from: string; to: string }> = {}
+    let composePorts: ComposePortChanges = {}
+    let composeIdentity: ComposeIdentityRewrite = { containerNames: [] }
+    let composeValueChanges: ComposeValueChange[] = []
+    let volumeResult: VolumeCopyResult = emptyVolumeCopyResult()
+    let startCommandFailed = false
+    let startCommandRan = false
+    let composeFailed = false
+    const setupIssues = emptySetupIssues()
+    // One reservation set is shared by env and Compose allocation while the
+    // repository lock is held by the caller. It includes stopped sibling
+    // worktrees as well as Docker's currently published ports.
+    const reservedPorts = new Set<number>()
+    const needsPortReservations =
+      (!skipEnv && Object.values(config.env.adjust).some((value) => typeof value === "number")) ||
+      (!skipDocker && Boolean(config.docker_compose_file))
+    let portReservationFailed = false
+    if (!dryRun && needsPortReservations) {
+      try {
+        for (const port of collectWorktreeEnvPorts(worktreePath, config)) reservedPorts.add(port)
+        for (const port of collectWorktreeComposePorts(worktreePath, config)) {
+          reservedPorts.add(port)
+        }
+        if (!skipDocker && config.docker_compose_file) {
+          for (const port of getUsedPortsOrThrow()) reservedPorts.add(port)
+        }
+      } catch (error) {
+        portReservationFailed = true
+        const message = `Could not build a complete repository-wide port reservation set: ${getErrorMessage(error)}`
+        addSetupIssue(setupIssues, "failure", { phase: "env", message })
+        out(`  ❌ ${message}`)
+      }
+    }
+
+    // link_files に含まれるパスはコピーをスキップしてシンボリックリンクを優先する
+    const linkFileSet = new Set<string>()
+    for (const configuredPath of config.link_files ?? []) {
+      try {
+        linkFileSet.add(resolveRepositoryPath(gitRoot, configuredPath, { field: "link_files" }))
+      } catch {
+        // linkConfiguredFiles records the runtime validation failure in setupIssues.
+      }
+    }
+    let composeSourcePath: string | null = null
+    if (config.docker_compose_file) {
+      try {
+        composeSourcePath = resolveRepositoryPath(gitRoot, config.docker_compose_file, {
+          field: "docker_compose_file source",
+        })
+      } catch {
+        // setupDockerCompose records the runtime validation failure.
+      }
+    }
+
+    const filesToCopy = (config.copy_files ?? []).filter((configuredPath) => {
+      if (!skipCopy && !dryRun) {
+        try {
+          assertSetupSourceDoesNotContainWorktree(gitRoot, worktreePath, configuredPath, "copy")
+        } catch (error) {
+          const message = getErrorMessage(error)
+          addSetupIssue(setupIssues, "failure", {
+            phase: "copy",
+            path: configuredPath,
+            message,
+          })
+          out(`  ❌ Refusing unsafe copy source '${configuredPath}': ${message}`)
+          return false
+        }
+      }
+      let sourcePath: string
+      try {
+        sourcePath = resolveRepositoryPath(gitRoot, configuredPath, { field: "copy_files" })
+      } catch {
+        return true
+      }
+      if (linkFileSet.has(sourcePath)) return false
+      // The dedicated Compose phase must see the branch checkout before deciding
+      // whether to fall back to main; a generic copy here would overwrite it. With
+      // --no-docker, preserve an already checked-out branch Compose as well, while
+      // retaining the explicit copy_files fallback when the target file is absent.
+      if (composeSourcePath === null || sourcePath !== composeSourcePath) return true
+      if (!skipDocker) return false
+      try {
+        const targetComposePath = resolveRepositoryPath(worktreePath, config.docker_compose_file, {
+          field: "docker_compose_file target",
+          rejectSymlinkAncestors: true,
+        })
+        return !existsSync(targetComposePath)
+      } catch {
+        // Let copyConfiguredFiles surface a structured setup failure.
+        return true
+      }
+    })
+
+    onPhase?.("copy")
+    // File copying phase
+    if (filesToCopy.length > 0) {
+      out("")
+      if (skipCopy) {
+        out("⏭️  Skipping file copy (--no-copy)")
+      } else if (dryRun) {
+        previewConfiguredFiles(gitRoot, filesToCopy, "copy")
+      } else {
+        out("📋 Copying files/directories...")
+        const excludedSources = new Set<string>()
+        if (
+          composeSourcePath &&
+          (!skipDocker || existsSync(path.resolve(worktreePath, config.docker_compose_file)))
+        ) {
+          excludedSources.add(composeSourcePath)
+        }
+        await copyConfiguredFiles(
+          gitRoot,
+          worktreePath,
+          filesToCopy,
+          setupIssues,
+          "copy",
+          excludedSources
+        )
+      }
+    }
+
+    onPhase?.("link")
+    // Symlink phase
+    const linkFiles = (config.link_files ?? []).filter((configuredPath) => {
+      if (skipLink || dryRun) return true
+      try {
+        assertSetupSourceDoesNotContainWorktree(gitRoot, worktreePath, configuredPath, "link")
+        return true
+      } catch (error) {
+        const message = getErrorMessage(error)
+        addSetupIssue(setupIssues, "failure", {
+          phase: "link",
+          path: configuredPath,
+          message,
+        })
+        out(`  ❌ Refusing unsafe link source '${configuredPath}': ${message}`)
+        return false
+      }
+    })
+    if (linkFiles.length > 0) {
+      out("")
+      if (skipLink) {
+        out("⏭️  Skipping symlink creation (--no-link)")
+      } else if (dryRun) {
+        previewConfiguredFiles(gitRoot, linkFiles, "link")
+      } else {
+        out("🔗 Creating symlinks...")
+        await linkConfiguredFiles(gitRoot, worktreePath, linkFiles, setupIssues)
+      }
+    }
+
+    onPhase?.("env")
+    // Environment file phase
+    if (config.env.file.length > 0) {
+      out("")
+      if (skipEnv) {
+        out("⏭️  Skipping environment file processing (--no-env)")
+      } else if (dryRun) {
+        const mode = Object.keys(config.env.adjust).length > 0 ? "adjust" : "copy"
+        previewConfiguredFiles(gitRoot, config.env.file, `env ${mode}`)
+      } else if (portReservationFailed && Object.keys(config.env.adjust).length > 0) {
+        out("⏭️  Skipping environment port allocation because sibling reservations are incomplete")
+      } else if (Object.keys(config.env.adjust).length > 0) {
+        out("🔧 Adjusting environment files...")
+        envChanges = await applyEnvAdjustments(gitRoot, worktreePath, config, {
+          reservedPorts,
+          issues: setupIssues,
+        })
+      } else {
+        out("📋 Copying environment files...")
+        await copyConfiguredFiles(gitRoot, worktreePath, config.env.file, setupIssues, "env")
+      }
+    }
+
+    onPhase?.("compose")
+    // Docker Compose phase
+    if (config.docker_compose_file) {
+      out("")
+      if (skipDocker) {
+        out("⏭️  Skipping Docker Compose setup (--no-docker)")
+      } else if (dryRun) {
+        const preview = readComposeForPreview(gitRoot, worktreePath, config, input.previewRevision)
+        if (preview) {
+          out(
+            `🐳 Would configure Docker Compose: ${config.docker_compose_file} (${preview.source})`
+          )
+        } else {
+          out(`⚠️  Docker Compose source not found: ${config.docker_compose_file} (would skip)`)
+        }
+      } else if (portReservationFailed) {
+        composeFailed = true
+        out("⏭️  Skipping Docker Compose setup because sibling port reservations are incomplete")
+      } else {
+        const composeResult = await setupDockerCompose(
+          gitRoot,
+          worktreePath,
+          config,
+          branch,
+          envChanges,
+          reservedPorts,
+          setupIssues
+        )
+        composePorts = composeResult.portChanges
+        composeIdentity = composeResult.identity
+        composeValueChanges = composeResult.composeValueChanges
+        composeFailed = composeResult.failed
+      }
+    }
+
+    // The repository-wide allocation/write transaction is now complete: the lock covers
+    // worktree creation, copy/link, env allocation, and Compose allocation + atomic write.
+    // Volume cloning and start commands can be slow and have their own safety protocols, so
+    // release before either phase to avoid blocking unrelated repository operations.
+    await releaseAllocationLock()
+
+    onPhase?.("volumes")
+    // Data phase: either SEED (run a seed command, never touching the source volume)
+    // or CLONE (auto-copy named compose volumes so e.g. PostgreSQL data carries over).
+    // --seed replaces cloning entirely, so the source stack is never stopped.
+    let volumeFailures = 0
+    if (
+      config.docker_compose_file &&
+      !skipDocker &&
+      !dryRun &&
+      !composeFailed &&
+      setupIssues.failures.length === 0
+    ) {
+      volumeResult = preflightTargetComposeVolumes(
+        gitRoot,
+        worktreePath,
+        config,
+        branch,
+        repository.commonGitDir
+      )
+      volumeFailures = volumeResult.failed.length
+      for (const failure of volumeResult.failed) {
+        out(`  ❌ Target volume safety check failed (${failure.name}): ${failure.error}`)
+      }
+    }
+    let seedFailed = false
+    let seedRan = false
+    const acquireLifecycleVolumes = async (requireEmpty: boolean): Promise<void> => {
+      let releaseLifecycleRepositoryLock:
+        | Awaited<ReturnType<typeof acquireRepositoryLock>>
+        | undefined
+      try {
+        // Atomic overwrite publishes recovery state under this same lock. Re-read
+        // it while serialized, then retain Docker leases after releasing the
+        // short repository critical section.
+        releaseLifecycleRepositoryLock = await acquireRepositoryLock(repository)
+        const safety = preflightTargetComposeVolumes(
+          gitRoot,
+          worktreePath,
+          config,
+          branch,
+          repository.commonGitDir
+        )
+        if (safety.failed.length > 0) {
+          throw new Error(safety.failed.map(({ name, error }) => `${name}: ${error}`).join("; "))
+        }
+        targetLifecycleLease = acquireWorktreeTargetVolumeLifecycleLeases(
+          gitRoot,
+          worktreePath,
+          config,
+          branch,
+          requireEmpty
+        )
+      } catch (error) {
+        const message = `Could not safely prepare target volumes for lifecycle commands: ${getErrorMessage(error)}`
+        volumeResult.failed.push({ name: config.docker_compose_file, error: message })
+        volumeFailures = volumeResult.failed.length
+        out(`  ❌ ${message}`)
+      } finally {
+        if (releaseLifecycleRepositoryLock) await releaseLifecycleRepositoryLock()
+      }
+    }
+    if (useSeed) {
+      // seedCommand is guaranteed non-empty here (validated above).
+      out("")
+      if (dryRun) {
+        out(`🌱 Would seed data instead of cloning volumes: ${seedCommand}`)
+      } else if (composeFailed || setupIssues.failures.length > 0 || volumeFailures > 0) {
+        out(
+          "⏭️  Skipping seed command because setup failed; running it against an unisolated or incomplete worktree could modify source data"
+        )
+      } else {
+        await acquireLifecycleVolumes(true)
+        if (volumeFailures > 0) {
+          out(
+            "⏭️  Skipping seed command because target volumes could not be prepared as fresh, exclusively-owned volumes"
+          )
+        } else {
+          out(`🌱 Seeding data instead of cloning volumes: ${seedCommand}`)
+          seedRan = true
+          seedFailed = !(await executeSeedCommand(seedCommand as string, worktreePath))
+        }
+      }
+    } else if (config.docker_compose_file && !skipDocker) {
+      out("")
+      if (composeFailed || setupIssues.failures.length > 0) {
+        out("⏭️  Skipping volume clone because environment setup failed")
+      } else if (volumeFailures > 0) {
+        out("⏭️  Skipping volume clone because target volume ownership validation failed")
+      } else if (skipVolumeCopy) {
+        out("⏭️  Skipping volume clone (--no-volume-copy)")
+      } else if (dryRun) {
+        previewVolumeCopy(
+          gitRoot,
+          config,
+          readComposeForPreview(gitRoot, worktreePath, config, input.previewRevision)?.compose ??
+            null
+        )
+      } else {
+        volumeResult = await setupVolumeCopy(gitRoot, worktreePath, config, {
+          force: forceVolumeCopy,
+          stop: options.stop,
+          branch,
+          commonGitDir: repository.commonGitDir,
+        })
+        volumeFailures = volumeResult.failed.length
+      }
+    }
+
+    // Clone may only cover a configured subset. Prepare and pin every remaining
+    // non-external target volume as well, then keep the leases through
+    // start_command so Compose cannot adopt a concurrently substituted volume.
+    if (
+      !useSeed &&
+      config.docker_compose_file &&
+      !skipDocker &&
+      !dryRun &&
+      !composeFailed &&
+      setupIssues.failures.length === 0 &&
+      volumeFailures === 0
+    ) {
+      await acquireLifecycleVolumes(false)
+    }
+
+    // A stop command may fail after partially stopping services. If recovery also
+    // failed, do not start the target stack while the source environment is in an
+    // unknown/down state.
+    const sourceRestartFailed = volumeResult.sourceStack?.restarted === false
+
+    onPhase?.("start")
+    // start_command phase
+    if (config.start_command) {
+      out("")
+      if (skipStart) {
+        out("⏭️  Skipping start command (--no-start)")
+      } else if (dryRun) {
+        out(`🚀 Would run start command: ${config.start_command}`)
+      } else if (
+        composeFailed ||
+        setupIssues.failures.length > 0 ||
+        volumeFailures > 0 ||
+        seedFailed ||
+        sourceRestartFailed
+      ) {
+        out(
+          "⏭️  Skipping start command because setup/data isolation failed; the command could start an incomplete worktree or operate on the source Compose stack"
+        )
+      } else {
+        out(`🚀 Running start command: ${config.start_command}`)
+        startCommandRan = true
+        startCommandFailed = !(await executeStartCommand(config.start_command, worktreePath))
+        if (startCommandFailed) {
+          addSetupIssue(setupIssues, "failure", {
+            phase: "start",
+            message: "start_command failed",
+          })
+        }
+      }
+    }
+
+    if (targetLifecycleLease) {
+      try {
+        targetLifecycleLease.release()
+        targetLifecycleLease = undefined
+      } catch (error) {
+        const message = `Failed to release target volume lifecycle lease(s): ${getErrorMessage(error)}`
+        volumeResult.failed.push({ name: config.docker_compose_file, error: message })
+        volumeFailures = volumeResult.failed.length
+        out(`  ❌ ${message}`)
+      }
+    }
+
+    return {
+      envChanges,
+      composePorts,
+      composeIdentity,
+      composeValueChanges,
+      volumeResult,
+      startCommandFailed,
+      startCommandRan,
+      composeFailed,
+      setupIssues,
+      volumeFailures,
+      seedFailed,
+      seedRan,
+      sourceRestartFailed,
+    }
+  } finally {
     if (targetLifecycleLease) {
       try {
         targetLifecycleLease.release()
@@ -867,15 +977,72 @@ async function executeCreateCommand(branch: string, options: CreateOptions): Pro
         // safe by keeping its volume pinned for manual inspection.
       }
     }
-    if (releaseRepositoryLock) await releaseRepositoryLock()
   }
 }
 
-/**
- * --json 用の機械可読な結果オブジェクトを stdout に 1 つだけ書き込む。
- */
-function writeJsonResult(payload: Record<string, unknown>): void {
-  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`)
+/** Read the same branch checkout that execution will use, without creating a worktree. */
+export function readComposeForPreview(
+  gitRoot: string,
+  worktreePath: string,
+  config: WtbConfig,
+  revision?: string
+): { compose: ComposeConfig; source: string } | null {
+  if (!config.docker_compose_file) return null
+  const relative = path
+    .relative(
+      gitRoot,
+      resolveRepositoryPath(gitRoot, config.docker_compose_file, {
+        field: "docker_compose_file",
+        rejectSymlinkAncestors: true,
+      })
+    )
+    .split(path.sep)
+    .join("/")
+  if (revision) {
+    const entry = execGitSafe(["ls-tree", "-z", revision, "--", relative], { cwd: gitRoot })
+    if (entry) {
+      if (!entry.startsWith("100644 ") && !entry.startsWith("100755 ")) {
+        throw new CLIError(
+          `Compose source in ${revision} is not a regular file`,
+          EXIT_CODES.GENERAL_ERROR
+        )
+      }
+      const content = execGitSafe(["show", `${revision}:${relative}`], {
+        cwd: gitRoot,
+        preserveLeadingWhitespace: true,
+      })
+      const compose = parseYaml(content) as ComposeConfig
+      if (!compose || typeof compose !== "object" || Array.isArray(compose)) {
+        throw new CLIError("Compose source must be a YAML mapping", EXIT_CODES.CONFIG_ERROR)
+      }
+      return { compose, source: `branch ${revision}` }
+    }
+  } else {
+    const target = resolveRepositoryPath(worktreePath, relative, {
+      field: "docker_compose_file target",
+      rejectSymlinkAncestors: true,
+    })
+    if (existsSync(target)) return { compose: readComposeFile(target), source: "target worktree" }
+  }
+  const source = resolveRepositoryPath(gitRoot, relative, {
+    field: "docker_compose_file source",
+    rejectSymlinkAncestors: true,
+  })
+  return existsSync(source) ? { compose: readComposeFile(source), source: "main fallback" } : null
+}
+
+function previewConfiguredFiles(gitRoot: string, files: string[], operation: string): void {
+  for (const relative of files) {
+    const source = resolveRepositoryPath(gitRoot, relative, {
+      field: operation,
+      rejectSymlinkAncestors: true,
+    })
+    out(
+      existsSync(source)
+        ? `  [dry-run] Would ${operation}: ${relative}`
+        : `  [dry-run] Missing source: ${relative} (would skip ${operation})`
+    )
+  }
 }
 
 /** Prevent recursive copy trees and self-referential directory symlinks. */
@@ -908,11 +1075,16 @@ export function assertSetupSourceDoesNotContainWorktree(
  * recursive copy may otherwise follow an existing destination symlink and
  * overwrite a file outside the worktree.
  */
-function assertCopyDestinationsAreNotSymlinks(sourcePath: string, targetPath: string): void {
+function assertCopyDestinationsAreNotSymlinks(
+  sourcePath: string,
+  targetPath: string,
+  excludedSources: ReadonlySet<string>
+): void {
   const pending = [{ source: sourcePath, target: targetPath }]
   while (pending.length > 0) {
     // biome-ignore lint/style/noNonNullAssertion: guarded by pending.length
     const current = pending.pop()!
+    if (excludedSources.has(current.source)) continue
     try {
       if (lstatSync(current.target).isSymbolicLink()) {
         throw new Error(`copy destination is a symlink: ${current.target}`)
@@ -940,7 +1112,8 @@ export async function copyConfiguredFiles(
   targetRoot: string,
   copyFiles: string[],
   issues: SetupIssues = emptySetupIssues(),
-  phase: SetupPhase = "copy"
+  phase: SetupPhase = "copy",
+  excludedSources: ReadonlySet<string> = new Set()
 ): Promise<SetupIssues> {
   for (const relativePath of copyFiles) {
     try {
@@ -960,6 +1133,7 @@ export async function copyConfiguredFiles(
         continue
       }
 
+      if (excludedSources.has(sourcePath)) continue
       const stat = statSync(sourcePath)
       await fs.ensureDir(path.dirname(targetPath))
       // Re-resolve after creating the parent so a concurrently introduced
@@ -969,17 +1143,24 @@ export async function copyConfiguredFiles(
         rejectSymlinkAncestors: true,
       })
 
-      assertCopyDestinationsAreNotSymlinks(sourcePath, targetPath)
+      assertCopyDestinationsAreNotSymlinks(sourcePath, targetPath, excludedSources)
 
       if (stat.isDirectory()) {
         if (phase === "env") {
           throw new Error(`Environment path must be a file: ${relativePath}`)
         }
-        await fs.copy(sourcePath, targetPath, { overwrite: true })
+        await fs.copy(sourcePath, targetPath, {
+          overwrite: true,
+          filter: (source) => !excludedSources.has(source),
+        })
         out(`  ✅ Copied directory: ${relativePath}`)
       } else {
         if (phase === "env") copyEnvFileAtomic(sourcePath, targetPath)
-        else await fs.copy(sourcePath, targetPath, { overwrite: true })
+        else
+          await fs.copy(sourcePath, targetPath, {
+            overwrite: true,
+            filter: (source) => !excludedSources.has(source),
+          })
         out(`  ✅ Copied file: ${relativePath}`)
       }
     } catch (error) {
@@ -1235,9 +1416,7 @@ export async function setupDockerCompose(
     const configuredTarget = path.resolve(targetComposePath)
     const bypassFiles = automaticComposeFiles
       .map((fileName) => path.join(worktreePath, fileName))
-      .filter(
-        (candidate) => path.resolve(candidate) !== configuredTarget && existsSync(candidate)
-      )
+      .filter((candidate) => path.resolve(candidate) !== configuredTarget && existsSync(candidate))
     if (bypassFiles.length > 0) {
       throw new Error(
         `Additional auto-loaded Compose file(s) can bypass the isolated docker_compose_file: ${bypassFiles.map((candidate) => path.relative(worktreePath, candidate)).join(", ")}`
@@ -1284,8 +1463,7 @@ export async function setupDockerCompose(
       const otherBranches = safeWorktreeBranches(gitRoot)
       const slug = uniqueProjectSlug(branch, otherBranches)
       const selectedName = (sourceConfig as { name?: unknown }).name
-      const selectedHasExplicitName =
-        typeof selectedName === "string" && selectedName.length > 0
+      const selectedHasExplicitName = typeof selectedName === "string" && selectedName.length > 0
       const identityBaseConfig = selectedHasExplicitName
         ? sourceConfig
         : (mainConfigForSafety ?? sourceConfig)
@@ -1505,9 +1683,7 @@ export async function setupDockerCompose(
       // skip-worktree を立て、wtb の出力 sha を manifest に記録する (remove の dirty
       // チェック / git status 汚染 / 誤コミット防止 + ユーザー手編集の保護)。
       if (markWtbManagedFile(worktreePath, config.docker_compose_file) === false) {
-        throw new Error(
-          `Failed to persist managed-file metadata for ${config.docker_compose_file}`
-        )
+        throw new Error(`Failed to persist managed-file metadata for ${config.docker_compose_file}`)
       }
       out(`  ✅ Docker Compose file configured: ${config.docker_compose_file}`)
       for (const [serviceName, changes] of Object.entries(portChanges)) {
@@ -1646,16 +1822,20 @@ function applyComposeVolumeOwnershipLabels(
  * dry-run 時の volume clone プレビュー。実 Docker は触らない。
  * `wtb reclone --dry-run` からも再利用する。
  */
-export function previewVolumeCopy(gitRoot: string, config: WtbConfig): void {
+export function previewVolumeCopy(
+  gitRoot: string,
+  config: WtbConfig,
+  targetCompose?: ComposeConfig | null
+): void {
   if (!config.docker_compose_file) return
   const sourceComposePath = path.resolve(gitRoot, config.docker_compose_file)
-  if (!existsSync(sourceComposePath)) {
+  if (targetCompose === null || (targetCompose === undefined && !existsSync(sourceComposePath))) {
     out("📦 Would clone Docker volumes — but compose file not found, skipping")
     return
   }
   let composeConfig: ReturnType<typeof readComposeFile>
   try {
-    composeConfig = readComposeFile(sourceComposePath)
+    composeConfig = targetCompose ?? readComposeFile(sourceComposePath)
   } catch {
     out("📦 Would clone Docker volumes — but compose file unreadable, skipping")
     return
@@ -1704,11 +1884,7 @@ function acquireWorktreeTargetVolumeLifecycleLeases(
     config.docker_compose_file,
     targetProject
   )
-  assertDockerComposeProjectOwnedByWorktree(
-    targetProject,
-    worktreePath,
-    config.docker_compose_file
-  )
+  assertDockerComposeProjectOwnedByWorktree(targetProject, worktreePath, config.docker_compose_file)
   const targetVolumes: string[] = []
   for (const key of Object.keys(composeConfig.volumes ?? {})) {
     const resolved = resolveVolumeName(composeConfig, key, targetProject)
@@ -1893,11 +2069,7 @@ export async function setupVolumeCopy(
     path.dirname(sourceComposePath)
   )
   try {
-    assertDockerComposeProjectOwnedByWorktree(
-      sourceProject,
-      gitRoot,
-      config.docker_compose_file
-    )
+    assertDockerComposeProjectOwnedByWorktree(sourceProject, gitRoot, config.docker_compose_file)
   } catch (error) {
     const message = `Cannot prove ownership of the source Compose project: ${getErrorMessage(error)}`
     const result = emptyVolumeCopyResult()
@@ -1967,212 +2139,213 @@ export async function setupVolumeCopy(
   }
 
   try {
-  // ── plan-before-stop: stop する前に全 cloneable volume を分類する ──────────────
-  const stopEnabled = options.stop !== false
-  const force = options.force === true
-  let plan: VolumeClonePlanEntry[]
-  try {
-    plan = planVolumeClones(
-      cloneable,
-      composeConfig,
-      targetComposeConfig,
-      sourceProject,
-      targetProject,
-      { force, stopEnabled, ownership }
-    )
-  } catch (error) {
-    const message = `Could not safely inspect Docker volumes: ${getErrorMessage(error)}`
-    out(`  ❌ ${message}`)
-    for (const key of cloneable) result.failed.push({ name: key, error: message })
-    return result
-  }
-
-  // plan の skip を結果へ反映 (理由付き)。
-  for (const entry of plan) {
-    if (entry.action === "skip") {
-      out(`  ⏭️  ${entry.key}: ${entry.reason ?? "skipped"}`)
-      result.skipped.push({ name: entry.key, reason: entry.reason ?? "skipped" })
-    }
-  }
-
-  const needsStop = plan.some((e) => e.action === "clone-after-stop")
-
-  // SIGINT/SIGTERM (cli/index.ts の handler) は process.exit() で下の finally を
-  // バイパスするため、prepend した signal handler でも source を復帰させる。
-  let restartOnAbort: (() => void) | undefined
-  const abortSignals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"]
-  let stopAttempted = false
-  let stoppedStack = false
-  let stopError: string | undefined
-
-  // 停止した source スタックを堅牢に復帰する: composeStart → (失敗時) composeUp →
-  // (両方失敗時) error と recover コマンドを記録する。パスはコピペで安全なようクオートする。
-  const recoverCommand = `docker compose -f ${shellQuote(sourceComposePath)} -p ${shellQuote(sourceProject)} up -d`
-  const restartSourceStack = (): { restarted: boolean; error?: string } => {
+    // ── plan-before-stop: stop する前に全 cloneable volume を分類する ──────────────
+    const stopEnabled = options.stop !== false
+    const force = options.force === true
+    let plan: VolumeClonePlanEntry[]
     try {
-      composeStart(sourceComposePath, sourceProject, gitRoot)
-      return { restarted: true }
-    } catch {
-      try {
-        composeUp(sourceComposePath, sourceProject, gitRoot)
-        return { restarted: true }
-      } catch (error) {
-        return { restarted: false, error: getErrorMessage(error) }
-      }
-    }
-  }
-
-  // ── stop は clone-after-stop が 1 件以上ある時だけ ─────────────────────────────
-  if (needsStop) {
-    out(
-      "  ⏸️  Source Compose stack is running — stopping it to clone volumes safely (will restart after)..."
-    )
-
-    // `docker compose stop` can time out or fail after stopping only some services. Treat
-    // the stack as recovery-required from the moment the stop attempt begins, and install
-    // the abort handler before invoking Docker so a signal during the command cannot leave
-    // the source environment partially stopped.
-    stopAttempted = true
-    restartOnAbort = () => {
-      out("")
-      out("  ⚠️  Interrupted — restoring the source Compose stack before exit...")
-      const r = restartSourceStack()
-      if (r.restarted) {
-        out("  ✅ Source stack restored")
-      } else {
-        out(`  ⚠️  Failed to restore source stack: ${r.error}`)
-        out(`     Your source environment may be DOWN. Bring it back up manually: ${recoverCommand}`)
-      }
-    }
-    for (const sig of abortSignals) {
-      process.prependListener(sig, restartOnAbort)
-    }
-
-    try {
-      composeStop(sourceComposePath, sourceProject, gitRoot)
-      stoppedStack = true
-    } catch (error) {
-      stopError = getErrorMessage(error)
-      out(
-        `  ❌ Could not safely stop source stack (${stopError}) — it may be partially stopped; clone-after-stop volumes failed and recovery will be attempted`
+      plan = planVolumeClones(
+        cloneable,
+        composeConfig,
+        targetComposeConfig,
+        sourceProject,
+        targetProject,
+        { force, stopEnabled, ownership }
       )
-      // A failed stop is not an intentional skip: data isolation was not completed. Keep
-      // the entries out of the copy loop, but surface every affected volume as a failure so
-      // create/reclone JSON gets ok:false (and --strict exits non-zero).
-      for (const entry of plan) {
-        if (entry.action === "clone-after-stop") {
-          entry.action = "skip"
-          entry.reason = `could not safely stop source stack: ${stopError}`
-          result.failed.push({ name: entry.key, error: entry.reason })
+    } catch (error) {
+      const message = `Could not safely inspect Docker volumes: ${getErrorMessage(error)}`
+      out(`  ❌ ${message}`)
+      for (const key of cloneable) result.failed.push({ name: key, error: message })
+      return result
+    }
+
+    // plan の skip を結果へ反映 (理由付き)。
+    for (const entry of plan) {
+      if (entry.action === "skip") {
+        out(`  ⏭️  ${entry.key}: ${entry.reason ?? "skipped"}`)
+        result.skipped.push({ name: entry.key, reason: entry.reason ?? "skipped" })
+      }
+    }
+
+    const needsStop = plan.some((e) => e.action === "clone-after-stop")
+
+    // SIGINT/SIGTERM (cli/index.ts の handler) は process.exit() で下の finally を
+    // バイパスするため、prepend した signal handler でも source を復帰させる。
+    let restartOnAbort: (() => void) | undefined
+    const abortSignals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"]
+    let stopAttempted = false
+    let stoppedStack = false
+    let stopError: string | undefined
+
+    // 停止した source スタックを堅牢に復帰する: composeStart → (失敗時) composeUp →
+    // (両方失敗時) error と recover コマンドを記録する。パスはコピペで安全なようクオートする。
+    const recoverCommand = `docker compose -f ${shellQuote(sourceComposePath)} -p ${shellQuote(sourceProject)} up -d`
+    const restartSourceStack = (): { restarted: boolean; error?: string } => {
+      try {
+        composeStart(sourceComposePath, sourceProject, gitRoot)
+        return { restarted: true }
+      } catch {
+        try {
+          composeUp(sourceComposePath, sourceProject, gitRoot)
+          return { restarted: true }
+        } catch (error) {
+          return { restarted: false, error: getErrorMessage(error) }
         }
       }
     }
-  }
 
-  try {
-    for (const entry of plan) {
-      if (entry.action === "skip") continue // 既に上で記録済み
+    // ── stop は clone-after-stop が 1 件以上ある時だけ ─────────────────────────────
+    if (needsStop) {
+      out(
+        "  ⏸️  Source Compose stack is running — stopping it to clone volumes safely (will restart after)..."
+      )
 
-      const { source, target } = entry
+      // `docker compose stop` can time out or fail after stopping only some services. Treat
+      // the stack as recovery-required from the moment the stop attempt begins, and install
+      // the abort handler before invoking Docker so a signal during the command cannot leave
+      // the source environment partially stopped.
+      stopAttempted = true
+      restartOnAbort = () => {
+        out("")
+        out("  ⚠️  Interrupted — restoring the source Compose stack before exit...")
+        const r = restartSourceStack()
+        if (r.restarted) {
+          out("  ✅ Source stack restored")
+        } else {
+          out(`  ⚠️  Failed to restore source stack: ${r.error}`)
+          out(
+            `     Your source environment may be DOWN. Bring it back up manually: ${recoverCommand}`
+          )
+        }
+      }
+      for (const sig of abortSignals) {
+        process.prependListener(sig, restartOnAbort)
+      }
 
-      // 停止後の in-use 再チェック (安全網): force でなく、まだ掴まれているなら skip。
-      if (!force) {
-        let usingContainers: string[]
+      try {
+        composeStop(sourceComposePath, sourceProject, gitRoot)
+        stoppedStack = true
+      } catch (error) {
+        stopError = getErrorMessage(error)
+        out(
+          `  ❌ Could not safely stop source stack (${stopError}) — it may be partially stopped; clone-after-stop volumes failed and recovery will be attempted`
+        )
+        // A failed stop is not an intentional skip: data isolation was not completed. Keep
+        // the entries out of the copy loop, but surface every affected volume as a failure so
+        // create/reclone JSON gets ok:false (and --strict exits non-zero).
+        for (const entry of plan) {
+          if (entry.action === "clone-after-stop") {
+            entry.action = "skip"
+            entry.reason = `could not safely stop source stack: ${stopError}`
+            result.failed.push({ name: entry.key, error: entry.reason })
+          }
+        }
+      }
+    }
+
+    try {
+      for (const entry of plan) {
+        if (entry.action === "skip") continue // 既に上で記録済み
+
+        const { source, target } = entry
+
+        // 停止後の in-use 再チェック (安全網): force でなく、まだ掴まれているなら skip。
+        if (!force) {
+          let usingContainers: string[]
+          try {
+            usingContainers = getContainersUsingVolumeOrThrow(source.name)
+          } catch (error) {
+            const message = `could not verify source volume usage after stopping: ${getErrorMessage(error)}`
+            out(`  ❌ ${entry.key}: ${message}`)
+            result.failed.push({ name: entry.key, error: message })
+            continue
+          }
+          if (usingContainers.length > 0) {
+            out(
+              `  ⚠️  ${entry.key}: source volume '${source.name}' is still in use by ${usingContainers.join(", ")} after stopping — skipping`
+            )
+            result.skipped.push({
+              name: entry.key,
+              reason: "still in use after stopping the source stack",
+            })
+            continue
+          }
+        }
+
+        let targetHadData = false
+        let targetPreflight: ReturnType<typeof preflightTargetVolumeForCopy>
         try {
-          usingContainers = getContainersUsingVolumeOrThrow(source.name)
+          targetPreflight = preflightTargetVolumeForCopy(target.name, ownership)
         } catch (error) {
-          const message = `could not verify source volume usage after stopping: ${getErrorMessage(error)}`
+          const message = `target volume changed after planning: ${getErrorMessage(error)}`
           out(`  ❌ ${entry.key}: ${message}`)
           result.failed.push({ name: entry.key, error: message })
           continue
         }
-        if (usingContainers.length > 0) {
-          out(
-            `  ⚠️  ${entry.key}: source volume '${source.name}' is still in use by ${usingContainers.join(", ")} after stopping — skipping`
-          )
-          result.skipped.push({
-            name: entry.key,
-            reason: "still in use after stopping the source stack",
+        if (targetPreflight.size > 0) {
+          // The strict preflight above proved exact ownership. Existing owned data is
+          // an intentional skip without force; foreign/unmanaged/unknown state is a
+          // failure and can never reach this branch.
+          if (!force) {
+            out(
+              `  ⏭️  ${entry.key}: owned target volume '${target.name}' gained data after planning — skipping (use --force-volume-copy to overwrite)`
+            )
+            result.skipped.push({
+              name: entry.key,
+              reason: "owned target volume already has data (appeared after planning)",
+            })
+            continue
+          }
+          targetHadData = true
+        }
+
+        try {
+          await copyVolume(source.name, target.name, {
+            onProgress: createVolumeCopyProgressHandler(`  📦 ${entry.key}`),
+            clearTarget: targetHadData,
+            ownership,
+            recoveryDirectory,
           })
-          continue
+          out(`  ✅ Cloned ${source.name} → ${target.name}`)
+          result.cloned.push(entry.key)
+        } catch (error) {
+          out(`  ❌ Failed to clone ${entry.key}: ${getErrorMessage(error)}`)
+          result.failed.push({ name: entry.key, error: getErrorMessage(error) })
         }
       }
 
-      let targetHadData = false
-      let targetPreflight: ReturnType<typeof preflightTargetVolumeForCopy>
-      try {
-        targetPreflight = preflightTargetVolumeForCopy(target.name, ownership)
-      } catch (error) {
-        const message = `target volume changed after planning: ${getErrorMessage(error)}`
-        out(`  ❌ ${entry.key}: ${message}`)
-        result.failed.push({ name: entry.key, error: message })
-        continue
-      }
-      if (targetPreflight.size > 0) {
-        // The strict preflight above proved exact ownership. Existing owned data is
-        // an intentional skip without force; foreign/unmanaged/unknown state is a
-        // failure and can never reach this branch.
-        if (!force) {
-          out(
-            `  ⏭️  ${entry.key}: owned target volume '${target.name}' gained data after planning — skipping (use --force-volume-copy to overwrite)`
-          )
-          result.skipped.push({
-            name: entry.key,
-            reason: "owned target volume already has data (appeared after planning)",
-          })
-          continue
+      out(
+        `  → ${result.cloned.length} volume(s) cloned, ${result.skipped.length} skipped, ${result.failed.length} failed`
+      )
+    } finally {
+      if (restartOnAbort) {
+        for (const sig of abortSignals) {
+          process.removeListener(sig, restartOnAbort)
         }
-        targetHadData = true
       }
-
-      try {
-        await copyVolume(source.name, target.name, {
-          onProgress: createVolumeCopyProgressHandler(`  📦 ${entry.key}`),
-          clearTarget: targetHadData,
-          ownership,
-          recoveryDirectory,
-        })
-        out(`  ✅ Cloned ${source.name} → ${target.name}`)
-        result.cloned.push(entry.key)
-      } catch (error) {
-        out(`  ❌ Failed to clone ${entry.key}: ${getErrorMessage(error)}`)
-        result.failed.push({ name: entry.key, error: getErrorMessage(error) })
-      }
-    }
-
-    out(
-      `  → ${result.cloned.length} volume(s) cloned, ${result.skipped.length} skipped, ${result.failed.length} failed`
-    )
-  } finally {
-    if (restartOnAbort) {
-      for (const sig of abortSignals) {
-        process.removeListener(sig, restartOnAbort)
-      }
-    }
-    if (stopAttempted) {
-      out("  ▶️  Restoring source Compose stack...")
-      const restart = restartSourceStack()
-      if (restart.restarted) {
-        out(stoppedStack ? "  ✅ Source stack restarted" : "  ✅ Source stack restored")
-        result.sourceStack = {
-          stopped: stoppedStack,
-          restarted: true,
-          ...(stopError ? { stopError } : {}),
-        }
-      } else {
-        out(`  ⚠️  Failed to restore source stack: ${restart.error}`)
-        out(`     Bring it back up manually: ${recoverCommand}`)
-        result.sourceStack = {
-          stopped: stoppedStack,
-          restarted: false,
-          ...(stopError ? { stopError } : {}),
-          restartError: restart.error,
-          recoverCommand,
+      if (stopAttempted) {
+        out("  ▶️  Restoring source Compose stack...")
+        const restart = restartSourceStack()
+        if (restart.restarted) {
+          out(stoppedStack ? "  ✅ Source stack restarted" : "  ✅ Source stack restored")
+          result.sourceStack = {
+            stopped: stoppedStack,
+            restarted: true,
+            ...(stopError ? { stopError } : {}),
+          }
+        } else {
+          out(`  ⚠️  Failed to restore source stack: ${restart.error}`)
+          out(`     Bring it back up manually: ${recoverCommand}`)
+          result.sourceStack = {
+            stopped: stoppedStack,
+            restarted: false,
+            ...(stopError ? { stopError } : {}),
+            restartError: restart.error,
+            recoverCommand,
+          }
         }
       }
     }
-  }
-
   } finally {
     if (result.sourceStack?.restarted === false) {
       const message =
@@ -2268,7 +2441,6 @@ export function planVolumeClones(
   }))
 
   for (const { key, source, target, targetPreflight } of inspected) {
-
     // 2. source 不在
     if (!volumeExistsOrThrow(source.name)) {
       plan.push({

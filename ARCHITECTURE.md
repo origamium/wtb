@@ -16,6 +16,11 @@ src/
 │   ├── index.ts                     # Commander プログラム生成・エラーハンドリング・main()
 │   ├── commands/                    # サブコマンド実装（1 ファイル = 1 コマンド）
 │   │   ├── create.ts                # wtb create — worktree 構築パイプライン（clone/--seed）
+│   │   ├── setup.ts                 # 既存 worktree を準備。Orca の setup フック
+│   │   ├── teardown.ts              # 環境のみ cleanup。Git worktree は残す
+│   │   ├── init-orca.ts             # 共有 orca.yaml の安全な更新・検査
+│   │   ├── await.ts                 # Compose readiness 待機
+│   │   ├── env.ts                   # env.adjust キーだけ shell/JSON 出力
 │   │   ├── remove.ts                # wtb remove — Docker teardown / end_command / worktree 削除（--json）
 │   │   ├── reclone.ts               # wtb reclone — 既存 worktree の volume クローンのみ再実行
 │   │   ├── updown.ts                # wtb up / down — worktree 自身の project 名で compose up/down
@@ -33,6 +38,7 @@ src/
 │       ├── ports-render.ts          # ports 用 pure renderer (JSON / pretty)
 │       ├── doctor-render.ts         # doctor 用 pure renderer (JSON / pretty)
 │       ├── claude-skill-install.ts  # SKILL.md テンプレートのコピー処理
+│       ├── orca-install.ts          # YAML Document の限定 merge と atomic write
 │       ├── command-helpers.ts       # withErrorHandling — CLIError → exit code の共通ハンドラ
 │       ├── progress.ts              # 進捗表示 (creates 用)
 │       └── *.test.ts
@@ -74,7 +80,7 @@ src/
         └── docker-project/          # docker-compose + init-db フィクスチャ
 
 e2e/
-├── cli.test.ts                      # CLI を子プロセスで起動するシナリオテスト (101 件)
+├── cli.test.ts                      # CLI を子プロセスで起動するシナリオテスト
 ├── helpers.ts                       # createTestRepo / runCLI / cleanup
 └── projects/                        # フィクスチャプロジェクト（basic, edge-cases, env-adjust,
                                      # full-featured, link-files, missing-files, no-docker）
@@ -273,6 +279,24 @@ executeLifecycleCommand(command, cwd): void               // start_command / end
 ---
 
 ## コマンドのライフサイクル
+
+### Orca と wtb の境界
+
+Orca が Git worktree・ブランチ・terminal・agent を管理し、`orca.yaml` の共有フックから wtb を呼び出す。`scripts.setup` は `wtb setup --up --wait --timeout 120 --json`、`scripts.archive` は `wtb teardown [--remove-volumes] --json`。`setupAgentStartupPolicy: wait-for-setup` は準備完了前の agent 起動を防ぐ。Orca の setup 実行ポリシーと共有フック採用は別設定で、インストーラは変更しない。
+
+`setup [branch]` は checkout 作成後の共通準備パイプラインを strict に実行する。main worktree を拒否し、既存のローカル変更や不明な状態を保護する。worktree 固有 Git path `wtb-setup.json` に `preparing` / `complete` / `failed` / `torn-down` とフェーズを保持する。完了済み準備は再利用し、ポート再採番・seed/start の重複実行を避ける。準備完了と起動/readiness は分離し、readiness の再試行で初期化を繰り返さない。中断された準備は自動再開せず、手動復旧を要求する。
+
+`teardown [branch]` は環境 cleanup 専用で Git 削除を呼ばない。end hook 実行前に volume の所有を検証し、`--remove-volumes` 指定時だけ最終 Compose cleanup で volume を削除する。内部 110 秒の deadline と cleanup 失敗の非ゼロ終了で、Orca の archive deadline 120 秒より前に結果を返す。Orca CLI 削除は `--run-hooks` が必須で、既定では archive を実行しない。archive 失敗時の checkout 保持には Orca の `worktree.archive-failure-blocking.v1` 対応が必要。
+
+`init-orca` は `ORCA_ROOT_PATH` が同じ Git common directory の checkout root であることを検証し、未指定時は canonical main root を使う。YAML Document 上で `scripts.setup`・`scripts.archive`・`setupAgentStartupPolicy` だけを変更し、コメントと他のキーを保持する。競合は `--force` なしで拒否し、壊れた構造と symlink は force でも拒否する。通常書き込みは repository lock と既存 atomic writer を使う。`--check` / `--dry-run` はファイルも lock も作らない。
+
+### Readiness と情報出力
+
+`await` は明示した worktree の Compose file/project を検証してコンテナ状態をポーリングする。healthcheck は healthy、通常サービスは running、成功完了依存や job は exit 0 を要求する。未準備・unhealthy・再起動中・失敗終了は回復可能性があるため期限まで待機する。Docker・プロトコル・設定・identity エラーは即時失敗し、readiness 未到達は timeout を結果に記録する。
+
+`ls --full` は長形式に `base_branch` との ahead/behind を加える。不明な dirty/count をゼロへ変換せず `null` と `enrichmentError` を返す。`env` は `env.adjust` にある有効なキーだけを、後勝ちの env-file マップから取得する。POSIX shell 引用または JSON を使い、ファイル内のコマンド展開を実行しない。
+
+契約とテストの対応は [docs/readme-contract.md](docs/readme-contract.md) を参照。
 
 ### `wtb create <branch>` — フェーズパイプライン
 

@@ -40,13 +40,7 @@ describe("create file setup safety", () => {
     fs.writeFileSync(target, "OLD=1\n", { mode: 0o640 })
     fs.chmodSync(target, 0o640)
 
-    const result = await copyConfiguredFiles(
-      sourceRoot,
-      targetRoot,
-      [".env"],
-      undefined,
-      "env"
-    )
+    const result = await copyConfiguredFiles(sourceRoot, targetRoot, [".env"], undefined, "env")
 
     expect(result.failures).toEqual([])
     expect(fs.readFileSync(target, "utf8")).toBe("QUOTED='a # b'\n# keep bytes\n")
@@ -63,7 +57,11 @@ describe("create file setup safety", () => {
     const result = await copyConfiguredFiles(sourceRoot, targetRoot, [".env"])
 
     expect(result.failures).toEqual([
-      expect.objectContaining({ phase: "copy", path: ".env", message: expect.stringContaining("symlink") }),
+      expect.objectContaining({
+        phase: "copy",
+        path: ".env",
+        message: expect.stringContaining("symlink"),
+      }),
     ])
     expect(fs.readFileSync(outside, "utf8")).toBe("OUTSIDE=1\n")
   })
@@ -86,6 +84,115 @@ describe("create file setup safety", () => {
       }),
     ])
     expect(fs.readFileSync(outside, "utf8")).toBe("outside")
+  })
+
+  it("preserves an excluded branch Compose inside a recursively copied parent", async () => {
+    fs.mkdirpSync(path.join(sourceRoot, "infra", "nested"))
+    fs.mkdirpSync(path.join(targetRoot, "infra", "nested"))
+    const sourceCompose = path.join(sourceRoot, "infra", "nested", "compose.yml")
+    const targetCompose = path.join(targetRoot, "infra", "nested", "compose.yml")
+    fs.writeFileSync(sourceCompose, "name: main-project\n")
+    fs.writeFileSync(targetCompose, "name: branch-project\n", { mode: 0o640 })
+    fs.chmodSync(targetCompose, 0o640)
+    fs.writeFileSync(path.join(sourceRoot, "infra", "local.env"), "COPIED=yes\n")
+
+    const result = await copyConfiguredFiles(
+      sourceRoot,
+      targetRoot,
+      ["infra"],
+      undefined,
+      "copy",
+      new Set([sourceCompose])
+    )
+
+    expect(result).toEqual({ warnings: [], failures: [] })
+    expect(fs.readFileSync(targetCompose, "utf8")).toBe("name: branch-project\n")
+    expect(fs.statSync(targetCompose).mode & 0o777).toBe(0o640)
+    expect(fs.readFileSync(path.join(targetRoot, "infra", "local.env"), "utf8")).toBe(
+      "COPIED=yes\n"
+    )
+  })
+
+  it("leaves an excluded Compose absent so the dedicated phase can choose the fallback", async () => {
+    fs.mkdirpSync(path.join(sourceRoot, "infra"))
+    const sourceCompose = path.join(sourceRoot, "infra", "compose.yml")
+    fs.writeFileSync(sourceCompose, "name: main-project\n")
+    fs.writeFileSync(path.join(sourceRoot, "infra", "local.env"), "COPIED=yes\n")
+
+    const result = await copyConfiguredFiles(
+      sourceRoot,
+      targetRoot,
+      ["infra"],
+      undefined,
+      "copy",
+      new Set([sourceCompose])
+    )
+
+    expect(result.failures).toEqual([])
+    expect(fs.existsSync(path.join(targetRoot, "infra", "compose.yml"))).toBe(false)
+    expect(fs.readFileSync(path.join(targetRoot, "infra", "local.env"), "utf8")).toBe(
+      "COPIED=yes\n"
+    )
+  })
+
+  it("does not follow an excluded destination symlink while copying its siblings", async () => {
+    fs.mkdirpSync(path.join(sourceRoot, "infra"))
+    fs.mkdirpSync(path.join(targetRoot, "infra"))
+    const sourceCompose = path.join(sourceRoot, "infra", "compose.yml")
+    const targetCompose = path.join(targetRoot, "infra", "compose.yml")
+    const outside = path.join(externalRoot, "compose.yml")
+    fs.writeFileSync(sourceCompose, "source")
+    fs.writeFileSync(outside, "external data")
+    fs.symlinkSync(outside, targetCompose)
+    fs.writeFileSync(path.join(sourceRoot, "infra", "local.env"), "COPIED=yes\n")
+
+    const result = await copyConfiguredFiles(
+      sourceRoot,
+      targetRoot,
+      ["infra"],
+      undefined,
+      "copy",
+      new Set([sourceCompose])
+    )
+
+    expect(result.failures).toEqual([])
+    expect(fs.lstatSync(targetCompose).isSymbolicLink()).toBe(true)
+    expect(fs.readFileSync(outside, "utf8")).toBe("external data")
+    expect(fs.readFileSync(path.join(targetRoot, "infra", "local.env"), "utf8")).toBe(
+      "COPIED=yes\n"
+    )
+  })
+
+  it("still fails before writes when a non-excluded sibling is a destination symlink", async () => {
+    fs.mkdirpSync(path.join(sourceRoot, "infra"))
+    fs.mkdirpSync(path.join(targetRoot, "infra"))
+    const sourceCompose = path.join(sourceRoot, "infra", "compose.yml")
+    const outside = path.join(externalRoot, "secret.env")
+    fs.writeFileSync(sourceCompose, "source Compose")
+    fs.writeFileSync(path.join(targetRoot, "infra", "compose.yml"), "branch Compose")
+    fs.writeFileSync(path.join(sourceRoot, "infra", "secret.env"), "source secret")
+    fs.writeFileSync(outside, "external secret")
+    fs.symlinkSync(outside, path.join(targetRoot, "infra", "secret.env"))
+
+    const result = await copyConfiguredFiles(
+      sourceRoot,
+      targetRoot,
+      ["infra"],
+      undefined,
+      "copy",
+      new Set([sourceCompose])
+    )
+
+    expect(result.failures).toEqual([
+      expect.objectContaining({
+        phase: "copy",
+        message: expect.stringContaining("copy destination is a symlink"),
+      }),
+    ])
+    expect(fs.readFileSync(outside, "utf8")).toBe("external secret")
+    expect(fs.readFileSync(path.join(targetRoot, "infra", "compose.yml"), "utf8")).toBe(
+      "branch Compose"
+    )
   })
 
   it("atomically replaces an existing directory with a symlink and removes staging files", async () => {
@@ -111,7 +218,10 @@ describe("create file setup safety", () => {
     const result = await linkConfiguredFiles(sourceRoot, targetRoot, ["nested/value.txt"])
 
     expect(result.failures).toEqual([
-      expect.objectContaining({ phase: "link", message: expect.stringContaining("symlink ancestor") }),
+      expect.objectContaining({
+        phase: "link",
+        message: expect.stringContaining("symlink ancestor"),
+      }),
     ])
     expect(fs.readdirSync(externalRoot)).toEqual([])
   })
@@ -119,7 +229,10 @@ describe("create file setup safety", () => {
   it("turns runtime traversal attempts into setup failures", async () => {
     const result = await copyConfiguredFiles(sourceRoot, targetRoot, ["../outside"])
     expect(result.failures).toEqual([
-      expect.objectContaining({ path: "../outside", message: expect.stringContaining("must not contain") }),
+      expect.objectContaining({
+        path: "../outside",
+        message: expect.stringContaining("must not contain"),
+      }),
     ])
   })
 
@@ -140,12 +253,7 @@ describe("create file setup safety", () => {
     fs.mkdirpSync(nestedTarget)
 
     expect(() =>
-      assertSetupSourceDoesNotContainWorktree(
-        sourceRoot,
-        nestedTarget,
-        "worktrees/feature",
-        "copy"
-      )
+      assertSetupSourceDoesNotContainWorktree(sourceRoot, nestedTarget, "worktrees/feature", "copy")
     ).toThrow(/contains the target worktree/)
   })
 })

@@ -31,6 +31,10 @@ Git worktree をベースにした CLI ツールで、ブランチごとに独�
   - [`status`](#wtb-status)
   - [`doctor`](#wtb-doctor)
   - [`init-claude`](#wtb-init-claude)
+  - [`setup` / `teardown`](#wtb-setup-branch--wtb-teardown-branch)
+  - [`await`](#wtb-await-branch)
+  - [`env`](#wtb-env-branch)
+  - [`init-orca`](#wtb-init-orca)
 - [設定ファイル](#設定ファイル)
 - [環境変数の自動調整](#環境変数の自動調整)
 - [Docker Compose 連携](#docker-compose-連携)
@@ -41,6 +45,7 @@ Git worktree をベースにした CLI ツールで、ブランチごとに独�
 - [設計メモ](#設計メモ)
 - [必要環境](#必要環境)
 - [Claude Code 連携](#claude-code-連携)
+- [Orca 連携](#orca-連携)
 - [トラブルシューティング](#トラブルシューティング)
 - [FAQ](#faq)
 - [ロードマップ](#ロードマップ)
@@ -68,7 +73,7 @@ wtb は特定の働き方 — DB やバックエンドのコード変更を含�
 - **各 worktree はデータ的にも完全自立。** DB の状態も完全なコピーから始まるので、各 worktree で他に影響を与えず、マイグレーションなどを自由に記述できる自立性を保ちます。
 - **コンフリクトは起きて当然 — それでよい。** この働き方ではコンフリクトが起きるのが当たり前であり、最適なコードはさまざまな要件の衝突のすえに生まれます。wtb はこれを **あえて解消しません**。
 - **当面は Docker Compose のみ。** 現状サポートするのは Docker Compose とその YAML ファイル・env ファイルだけです。他のスタックは現段階ではスコープ外です。
-- **coding agent のオーケストレーションは(まだ)非対応。** wtb は coding agent のオーケストレーションをしません。各 worktree に立ち上がった coding agent は、作業を完遂したらそこで終了したとみなすのがよく、追加の作業があれば人力で見に行くことを推奨します。むしろ、プルリクエストの作成まで一気にやらせてしまうことを推奨します。
+- **エージェントの管理は Orca に任せる。** Orca が worktree とエージェントを管理し、wtb の setup/archive フックが開発環境を準備・片付けします。wtb 自体はエージェントのスケジューリングや協調処理を行いません。
 - _作者は F1 で使われる V6 Hybrid PU が好きです。_
 
 ## 仕組み
@@ -424,6 +429,7 @@ wtb list      # 同じ
 | オプション | 説明 |
 |-----------|------|
 | `-l, --long` | 長形式（短縮コミットハッシュ、経過時間、dirty状態、サブジェクト） |
+| `--full` | 長形式に `baseBranch`・`ahead`・`behind` を追加。設定の `base_branch` と比較 |
 | `--json` | 機械可読JSON出力（`-l` と組み合わせると拡張フィールドも追加） |
 | `-p, --paths` | 絶対パスのみを1行ずつ出力（`$(wtb ls -p \| fzf)` 等の用途に便利） |
 
@@ -562,6 +568,100 @@ wtb doctor --strict        # CI ステップをクリーンなレポートでゲ
 | `--check` | インストール済み `SKILL.md` をこの CLI のバージョンと照合 — 最新なら exit `0`、未インストール/stamp なし/古い場合は exit `1`。`--user` に対応。何も書き込まない |
 
 インストーラは frontmatter 直後に `<!-- wtb-skill-version: X.Y.Z -->` の stamp を埋め込みます。`--check`(および `--force` なしで既存ファイルがあったときの skip メッセージ)はこの stamp を CLI バージョンと比較するため、wtb をアップグレードした後の skill の陳腐化を機械的に検知できます — `wtb init-claude --force` で更新してください。
+
+### `wtb setup [branch]` / `wtb teardown [branch]`
+
+**既存の linked worktree** の環境を準備・片付けします。Git worktree とブランチの作成・削除は行いません。branch 省略時は現在の worktree が対象で、main worktree への実行は拒否します。Orca が checkout を管理し、wtb が環境を管理するためのコマンドです。
+
+`setup` は `create` と共通の copy/link/env/Compose/data/start 処理を実行し、失敗時は既定で非ゼロ終了します。無関係なローカル変更や既存の不明な環境状態を上書きしません。準備結果は対象 worktree の Git ディレクトリ (`git rev-parse --git-path wtb-setup.json`) に保存します。完了後の再実行ではポート・データを保持し、seed/start を繰り返しません。
+
+| オプション | コマンド | 内容 |
+|------------|----------|------|
+| `--up` | setup | 準備済みの Compose スタックを起動 |
+| `--wait` | setup | 起動と readiness 待機。`--up` を含む |
+| `--timeout <seconds>` | setup | readiness の期限。既定 `120` 秒。DB コピーや準備処理の時間制限ではない |
+| `--seed` | setup | volume コピーの代わりに `volumes.seed_command` を実行 |
+| `--no-copy`, `--no-link`, `--no-env`, `--no-docker`, `--no-start` | setup | 対応フェーズを省略 |
+| `--no-volume-copy`, `--no-stop` | setup | `create` と同じコピー制御 |
+| `--remove-volumes` | teardown | この worktree の wtb 所有権が一致する volume のみ削除 |
+| `--dry-run` | 両方 | 変更せず検証・プレビュー |
+| `--json` | 両方 | 初期エラーを含め stdout に JSON を 1 件出力 |
+
+`setup --json` は `{ branch, path, prepared, reused, dryRun, setup, up, readiness, ok, exitCode, error?, recovery? }`。`setup` は各準備フェーズの結果で、`up` と `readiness` は要求した場合の結果です。
+
+`teardown` は `end_command` を先に実行し、所有権を再検証して Compose の停止と要求された volume cleanup を行います。checkout とブランチは残します。`remove` と異なり、`end_command` があっても最後の Compose cleanup を省略しません。フックが失敗した場合は後続 cleanup を止めます。内部期限は 110 秒で、失敗は非ゼロ終了として Orca に伝えます。 cleanup は途中まで成功してから失敗する場合があり、checkout が残っても削除済みデータは復元されません。変更前に setup 完了記録を無効化し、不完全な環境の再利用を防ぎます。準備中のソーススタック復旧失敗は Docker exit `5` と復旧情報を保持します。
+
+`teardown --json` は `{ branch, path, dryRun, removed: false, tornDown, composeDown, endCommand, cleanupErrors, ok }`。`composeDown` は `null` または `{ ran, failed, volumesRemoved }`、`endCommand` は `null` または `{ ran, failed }` です。非ゼロ終了時にも部分失敗の詳細を保持します。
+
+**準備の中断・失敗は手動で復旧します。** preparing/failed 記録がある場合は setup を自動再開しません。表示されたフェーズと状態を調べ、ローカル変更・DB 復旧記録を保存してから、該当処理を修復します。volume コピーの失敗には `reclone` を使用できます。resume/reset/force フラグはなく、記録削除でガードを回避しないでください。必要なら変更を保存して cleanup を済ませ、新規 checkout を作ります。準備完了後の readiness 失敗なら `setup --up --wait`、または `up` → `await` を再実行でき、初期化は繰り返しません。
+
+### `wtb await [branch]`
+
+既存 worktree の Compose サービスが利用可能になるまで待機します。healthcheck があるコンテナは `healthy`、ないものは running が条件です。完了成功を要求する依存や Compose job サービスは exit `0` を条件にします。アプリ固有の HTTP endpoint までは検証しません。
+
+```bash
+wtb up feature/auth
+wtb await feature/auth --timeout 120 --json
+```
+
+`--timeout` は既定 120 秒。`await` 自体はサービスを起動しません。未起動・起動中サービスは待機対象で、期限超過は exit `1`、Compose 未設定/有効サービスなしは `4`、Docker エラーは `5` です。
+
+JSON は `{ branch, path, project, composeFile, ok, timedOut, elapsedMs, services }`。各サービスは `{ service, expectedReplicas, ready, containers }`、各コンテナは `{ id, name, service, state, health, exitCode, ready }` です。
+
+### `wtb env [branch]`
+
+対象 worktree の `env.file` を読み、**`env.adjust` に指定したキーだけ**現在値を出力します。後ろの env file が優先で、削除指定 (`null`)・存在しないキーは出力しません。ファイル全体や無関係な認証情報は出力しません。
+
+```bash
+wtb env feature/auth
+eval "$(wtb env feature/auth)"
+wtb env feature/auth --json
+```
+
+標準出力は POSIX shell 用に安全に引用した `KEY='value'` 行です。`eval` は変数を代入しますが、新規変数を自動で export しません。`--json` は値のオブジェクトを返します。`env.adjust` 自体に機密キーを指定している場合は、その値も出力対象です。
+
+`wtb ls --full --json` は長形式に `baseBranch`・`ahead`・`behind` を追加します。比較元の参照や checkout を読めなければ `enrichmentError` と `null` を返し、不明な値を clean/差分ゼロと扱いません。既存の標準形式と `-l` は変わりません。
+
+### `wtb init-orca`
+
+Orca に登録したリポジトリルートの `orca.yaml` へ共有フックを設定します。`ORCA_ROOT_PATH` があれば、同じ Git common directory を共有する checkout ルートか検証し、不正なら書き込まず終了します。Orca 外では canonical な main worktree が出力先です。
+
+| オプション | 内容 |
+|------------|------|
+| `--remove-volumes` | archive 時に対象 worktree の所有 volume を削除。省略時は保持 |
+| `-f, --force` | 競合する `scripts.setup`・`scripts.archive`・`setupAgentStartupPolicy` だけ置換 |
+| `--check` | 書き込みなし。一致なら exit `0`、未設定/差異ありなら `1`。インストール時と同じ volume オプションを指定 |
+| `--dry-run` | 対象パスと設定キーをプレビュー |
+| `--json` | `path`・`changed`・`wrote`・`differences`・`ok` 等を出力。エラーは `error`・`exitCode` を含む |
+
+コメントと無関係な YAML キーを保持します。既存フックと内容が異なれば `--force` が必要です。壊れた YAML、mapping でない/anchor 付きの `scripts`、共有 anchor の設定値、symlink の `orca.yaml` は force でも拒否します。Orca の実行・ローカル設定変更・Docker 起動は行いません。
+
+## Orca 連携
+
+Orca に登録したリポジトリで `wtb.yaml` を設定し、フックを生成します。
+
+```bash
+wtb init-orca --remove-volumes --dry-run
+wtb init-orca --remove-volumes
+wtb init-orca --remove-volumes --check
+```
+
+生成するキーは以下です。archive 後にデータを残す場合は `--remove-volumes` を省略してください。
+
+```yaml
+setupAgentStartupPolicy: wait-for-setup
+scripts:
+  setup: wtb setup --up --wait --timeout 120 --json
+  archive: wtb teardown --remove-volumes --json
+```
+
+Orca 側で **共有リポジトリフックの採用**と **setup の既定実行**を有効にしてください。ローカル設定が共有 `orca.yaml` を上書きする場合があります。`wait-for-setup` は agent 起動順序の指定で、setup 実行の有効化とは別です。実行ホストの PATH に `wtb`・Git・Docker・Docker Compose が必要です。`orca.yaml` と `wtb.yaml` はコミットして使用します。
+
+Orca は新 worktree を cwd とし、`ORCA_WORKTREE_PATH`・`ORCA_ROOT_PATH`・`ORCA_WORKSPACE_NAME` を渡します。wtb の設定・コピー元は Git の main worktree です。worktree 作成・削除・terminal・agent は Orca の責務です。フックから `wtb create` / `wtb remove` を呼ばないでください。
+
+Orca CLI の作成では `worktree create --setup run`、削除では **`worktree rm --run-hooks`** を使います。削除はフック省略が既定で、`--force` だけでは実行されません。`worktree.archive-failure-blocking.v1` 対応版では archive の失敗・終了不明は checkout 削除を止め、`--force` でも解除されません。archive の期限は **120 秒**で、setup の readiness 期限とは別です。cleanup のタイムアウトを成功と扱わず、失敗を自動的に無視しないでください。
+
+[設定例](examples/orca/orca.yaml)と[README 契約の検証一覧](docs/readme-contract.md)も参照してください。
 
 ## 設定ファイル
 
@@ -1037,13 +1137,7 @@ wtb は内部で `git worktree add` を使い、その上に git 単体ではカ
 
 ## ロードマップ
 
-以下は **今後の予定であり、まだ実装されていません**。意図する方向性を記録するために記載しています。
-
-- **`wtb await [branch]`** — worktree の Compose サービスが healthy になるまで待機する(`docker compose -p <project> ps` をポーリング。`--timeout` / `--json` 付き)。`wtb up` / `create` の「起動した」と「使える」の間のギャップを埋め、エージェントが今書いている `sleep && curl` ループを置き換える。
-- **`wtb ls --full`** — worktree ごとの `base_branch` に対する ahead/behind と dirty フラグを 1 コールで出す。「どの worktree が放置されていて消してよいか」を N 回の git 実行なしに判定できるようにする。
-- **`wtb env <branch>`** — worktree の調整済み env を `KEY=VALUE` 行で出力し、`eval "$(wtb env X)"` できるようにする(`wtb ports --json` のパースが面倒だという声が実際に出たら追加)。
-
-以前ここに載っていたものはすべて実装済みです(seed-instead-of-copy、stop-then-copy、worktree ごとの identity 分離、`up`/`down`、全コマンドの機械可読出力)。次に欲しい機能があれば issue を立ててください。
+予定だった `await`・`ls --full`・`env` に加え、Orca の setup/archive 連携を実装しました。各コマンドの説明と[検証一覧](docs/readme-contract.md)を参照してください。エージェントの協調管理は Orca が担当し、wtb は worktree の環境分離に集中します。
 
 ## Changelog
 

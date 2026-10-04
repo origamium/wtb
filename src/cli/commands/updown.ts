@@ -8,25 +8,17 @@
  * docker 操作が目的そのものであるこのコマンドでは hard-fail として適用する)。
  */
 
-import { existsSync } from "node:fs"
 import { Command } from "commander"
 import { EXIT_CODES } from "../../constants/index.js"
-import { loadConfig } from "../../core/config/loader.js"
-import { resolveRepositoryPath } from "../../core/config/paths.js"
 import {
   assertComposeNetworkingSafe,
   assertComposeStorageDefinitionsSafe,
   composeDown,
   composeUp,
   readComposeFile,
-  safeResolveComposeProjectName,
   withComposeSnapshot,
 } from "../../core/docker/compose.js"
-import {
-  assertComposeProjectUnique,
-  assertDockerComposeProjectOwnedByWorktree,
-  DockerComposeProjectInspectionError,
-} from "../../core/docker/project-ownership.js"
+import { DockerComposeProjectInspectionError } from "../../core/docker/project-ownership.js"
 import {
   acquireTargetVolumeLifecycleLeases,
   getVolumeRecoveryDirectory,
@@ -39,11 +31,11 @@ import {
   assertComposeVolumesSafeForRemoval,
   DockerVolumeInspectionError,
 } from "../../core/docker/volume-removal.js"
-import { acquireRepositoryLock, getRepositoryContext } from "../../core/git/repository.js"
-import { isSamePath, listWorktrees } from "../../core/git/worktree.js"
+import { resolveWorktreeComposeContext } from "../../core/docker/worktree-context.js"
+import { acquireRepositoryLock } from "../../core/git/repository.js"
 import { CLIError, getErrorMessage } from "../../utils/error.js"
 import { out, setJsonOutputMode } from "../../utils/output.js"
-import { resolveWorktreeTarget, withErrorHandling } from "../utils/command-helpers.js"
+import { withErrorHandling } from "../utils/command-helpers.js"
 
 interface UpDownOptions {
   json?: boolean
@@ -94,106 +86,35 @@ export function downCommand(): Command {
     )
 }
 
-/**
- * up / down 共通の実行ロジック
- */
-async function runComposeLifecycle(
+export interface ComposeLifecycleResult {
+  branch: string
+  path: string
+  composeFile: string
+  project: string
+  action: "up" | "down"
+  ok: boolean
+  volumesRemoved?: boolean
+}
+
+export class ComposeLifecycleError extends CLIError {
+  constructor(
+    message: string,
+    exitCode: number,
+    public readonly dockerCommandRan: boolean
+  ) {
+    super(message, exitCode)
+  }
+}
+
+/** Shared lifecycle primitive: throws on failure, without JSON or process exit effects. */
+export async function runWorktreeComposeLifecycle(
   action: "up" | "down",
   branch: string | undefined,
-  options: UpDownOptions
-): Promise<void> {
-  // モジュール状態なので毎回明示的に設定する (前回実行のモードを引き継がない)。
-  const json = options.json === true
-  setJsonOutputMode(json)
-
-  // NOTE: getGitRootOrThrow (--show-toplevel) は worktree 内では worktree 自身を返すため
-  // 使えない — source を指す main worktree root が必要 (でないと worktree 内からの実行が
-  // 常に main-repo ガードで拒否され、same-project ガードの source 側も誤解決する)。
-  const repository = getRepositoryContext()
+  options: { removeVolumes?: boolean; lockWaitTimeoutMs?: number } = {}
+): Promise<ComposeLifecycleResult> {
+  const { repository, worktreePath, targetBranch, composePath, targetProject } =
+    resolveWorktreeComposeContext(branch, action)
   const gitRoot = repository.mainRoot
-  const { worktreePath, targetBranch } = resolveWorktreeTarget(action, branch)
-
-  // main repo は wtb の管理対象外 (per-worktree identity が無い)。誤って source の
-  // スタックを worktree 用ガードの文脈で操作しないよう拒否する。
-  if (isSamePath(worktreePath, gitRoot)) {
-    throw new CLIError(
-      `Refusing to run '${action}' against the main repository worktree — run 'docker compose ${action}' directly in the source repository instead.`,
-      EXIT_CODES.GENERAL_ERROR
-    )
-  }
-
-  const config = loadConfig(gitRoot)
-  if (!config.docker_compose_file) {
-    throw new CLIError(
-      "No docker_compose_file is configured — there is no Compose stack for wtb to manage. Set docker_compose_file in your wtb config.",
-      EXIT_CODES.CONFIG_ERROR
-    )
-  }
-
-  // compose は必ず worktree 内のものを使う。gitRoot の compose にフォールバックすると、
-  // source のリテラルなポート定義を worktree の project 名で up することになり、source と
-  // ポート衝突する (create が書き換えた per-worktree compose だけが安全)。
-  const composePath = resolveRepositoryPath(worktreePath, config.docker_compose_file, {
-    field: "docker_compose_file target",
-    rejectSymlinkAncestors: true,
-  })
-  if (!existsSync(composePath)) {
-    throw new CLIError(
-      `No compose file at ${config.docker_compose_file} inside the worktree (${worktreePath}) — cannot run 'docker compose ${action}' for it.`,
-      EXIT_CODES.GENERAL_ERROR
-    )
-  }
-
-  // same-project ガード (remove.ts の teardown ガードと対)。docker を呼ぶこと自体が
-  // このコマンドの目的なので、warning + skip ではなく hard-fail する。
-  const sourceComposePath = resolveRepositoryPath(gitRoot, config.docker_compose_file, {
-    field: "docker_compose_file source",
-    rejectSymlinkAncestors: true,
-  })
-  const sourceComposeExists = existsSync(sourceComposePath)
-  const sourceProject = sourceComposeExists
-    ? safeResolveComposeProjectName(sourceComposePath, gitRoot)
-    : undefined
-  const targetProject = safeResolveComposeProjectName(composePath, worktreePath)
-  if (sourceComposeExists && sourceProject === null) {
-    throw new CLIError(
-      `Could not resolve the source Compose project — refusing to run 'docker compose ${action}' without proving project ownership.`,
-      EXIT_CODES.GENERAL_ERROR
-    )
-  }
-  if (targetProject === null) {
-    throw new CLIError(
-      `Could not resolve this worktree's Compose project name (compose file unreadable) — refusing to run 'docker compose ${action}' against an unknown project.`,
-      EXIT_CODES.GENERAL_ERROR
-    )
-  }
-  if (sourceProject !== undefined && targetProject === sourceProject) {
-    throw new CLIError(
-      `This worktree resolves to the SAME Compose project as the source ('${targetProject}'), so 'docker compose ${action}' would hit your source stack. This usually means COMPOSE_PROJECT_NAME is set or the compose 'name:' is fixed. Unset COMPOSE_PROJECT_NAME or make the compose 'name:' per-worktree, then retry.`,
-      EXIT_CODES.GENERAL_ERROR
-    )
-  }
-  try {
-    assertComposeProjectUnique(
-      listWorktrees(gitRoot),
-      worktreePath,
-      config.docker_compose_file,
-      targetProject
-    )
-    assertDockerComposeProjectOwnedByWorktree(
-      targetProject,
-      worktreePath,
-      config.docker_compose_file
-    )
-  } catch (error) {
-    throw new CLIError(
-      `Could not prove exclusive ownership of Compose project '${targetProject}': ${getErrorMessage(error)}`,
-      error instanceof DockerComposeProjectInspectionError
-        ? EXIT_CODES.DOCKER_ERROR
-        : EXIT_CODES.GENERAL_ERROR
-    )
-  }
-
   const removeVolumes = action === "down" && options.removeVolumes === true
 
   if (action === "up") {
@@ -210,7 +131,7 @@ async function runComposeLifecycle(
 
   let targetLease: TargetVolumeLifecycleLease | undefined
   const releaseDestructiveRepositoryLock = removeVolumes
-    ? await acquireRepositoryLock(repository)
+    ? await acquireRepositoryLock(repository, { waitTimeoutMs: options.lockWaitTimeoutMs })
     : undefined
   let dockerCommandRan = false
   let lifecycleError: unknown
@@ -251,7 +172,9 @@ async function runComposeLifecycle(
     }
 
     if (action === "up") {
-      const releaseRepositoryLock = await acquireRepositoryLock(repository)
+      const releaseRepositoryLock = await acquireRepositoryLock(repository, {
+        waitTimeoutMs: options.lockWaitTimeoutMs,
+      })
       try {
         const recoveryTargets = new Set(
           readVolumeRecoveryRecords(getVolumeRecoveryDirectory(repository.commonGitDir)).map(
@@ -263,9 +186,7 @@ async function runComposeLifecycle(
           const resolved = resolveVolumeName(validatedCompose, key, targetProject)
           if (!resolved || resolved.external) continue
           if (recoveryTargets.has(resolved.name)) {
-            throw new Error(
-              `Target volume '${resolved.name}' has an unresolved recovery record`
-            )
+            throw new Error(`Target volume '${resolved.name}' has an unresolved recovery record`)
           }
           targetVolumes.push(resolved.name)
         }
@@ -315,33 +236,60 @@ async function runComposeLifecycle(
         (error) => `failed to release a safety lock/lease: ${getErrorMessage(error)}`
       ),
     ]
-    throw new CLIError(
+    throw new ComposeLifecycleError(
       details.join("; "),
       dockerCommandRan ||
         lifecycleError instanceof DockerVolumeInspectionError ||
         lifecycleError instanceof DockerComposeProjectInspectionError ||
         cleanupErrors.length > 0
         ? EXIT_CODES.DOCKER_ERROR
-        : EXIT_CODES.GENERAL_ERROR
+        : EXIT_CODES.GENERAL_ERROR,
+      dockerCommandRan
     )
   }
 
   out("")
   out(action === "up" ? "✅ Compose stack is up" : "✅ Compose stack is down")
 
-  if (json) {
-    // stdout には JSON オブジェクトを 1 つだけ出力する (人間向け出力は stderr 済み)。
-    const result: Record<string, unknown> = {
-      branch: targetBranch,
-      path: worktreePath,
-      composeFile: composePath,
-      project: targetProject,
-      action,
-      ok: true,
-    }
-    if (action === "down") {
-      result.volumesRemoved = removeVolumes
-    }
-    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
+  return {
+    branch: targetBranch,
+    path: worktreePath,
+    composeFile: composePath,
+    project: targetProject,
+    action,
+    ok: true,
+    ...(action === "down" ? { volumesRemoved: removeVolumes } : {}),
+  }
+}
+
+async function runComposeLifecycle(
+  action: "up" | "down",
+  branch: string | undefined,
+  options: UpDownOptions
+): Promise<void> {
+  setJsonOutputMode(options.json === true)
+  try {
+    const result = await runWorktreeComposeLifecycle(action, branch, options)
+    if (options.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
+  } catch (error) {
+    if (!options.json) throw error
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          branch: branch ?? null,
+          path: null,
+          composeFile: null,
+          project: null,
+          action,
+          ok: false,
+          error: getErrorMessage(error),
+          ...(action === "down" ? { volumesRemoved: false } : {}),
+        },
+        null,
+        2
+      )}\n`
+    )
+    process.exitCode = error instanceof CLIError ? error.exitCode : EXIT_CODES.GENERAL_ERROR
+    console.error(`Error: ${getErrorMessage(error)}`)
   }
 }

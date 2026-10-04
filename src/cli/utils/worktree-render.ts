@@ -4,6 +4,7 @@
  */
 
 import * as path from "node:path"
+import type { FullWorktreeInfo } from "../../core/git/full-status.js"
 import type { EnrichedWorktreeInfo, WorktreeInfo } from "../../types/index.js"
 
 const CURRENT_MARKER = "→ "
@@ -169,6 +170,34 @@ export function renderPaths(rows: WorktreeInfo[]): string {
   return `${rows.map((r) => r.path).join("\n")}\n`
 }
 
+export function renderFull(rows: FullWorktreeInfo[], currentPath: string, gitRoot: string): string {
+  if (rows.length === 0) return "No worktrees found\n"
+  const columns = ["BRANCH", "COMMIT", "AHEAD", "BEHIND", "D", "PATH", "TAGS / SUBJECT"]
+  const values = rows.map((row) => [
+    row.branch,
+    row.shortHash,
+    String(row.ahead ?? "?"),
+    String(row.behind ?? "?"),
+    row.dirty === null ? "?" : row.dirty ? "*" : "-",
+    row.path,
+    [
+      ...buildTags(row, isMainWorktree(row, gitRoot)),
+      row.enrichmentError ? "[incomplete]" : "",
+      row.subject,
+    ]
+      .filter(Boolean)
+      .join(" "),
+  ])
+  const widths = columns.map((name, index) =>
+    Math.max(visualWidth(name), ...values.map((row) => visualWidth(row[index])))
+  )
+  const line = (row: string[]) =>
+    row
+      .map((value, index) => (index === row.length - 1 ? value : padRight(value, widths[index])))
+      .join("  ")
+  return `Compared with ${rows[0].baseBranch}\n${NO_MARKER}${line(columns)}\n${values.map((row, index) => `${isCurrentWorktree(rows[index], currentPath) ? CURRENT_MARKER : NO_MARKER}${line(row)}`).join("\n")}\n`
+}
+
 /**
  * JSON 出力
  */
@@ -195,6 +224,13 @@ export function renderJson(
           ageTimestamp: wt.ageTimestamp,
           dirty: wt.dirty,
           ...(wt.enrichmentError ? { enrichmentError: wt.enrichmentError } : {}),
+        }
+      : {}),
+    ...("baseBranch" in wt
+      ? {
+          baseBranch: (wt as FullWorktreeInfo).baseBranch,
+          ahead: (wt as FullWorktreeInfo).ahead,
+          behind: (wt as FullWorktreeInfo).behind,
         }
       : {}),
   }))

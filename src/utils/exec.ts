@@ -4,6 +4,7 @@
  */
 
 import { execFileSync, execSync } from "node:child_process"
+import { AsyncLocalStorage } from "node:async_hooks"
 import { FILE_ENCODING } from "../constants/index.js"
 import { isJsonOutputMode } from "./output.js"
 
@@ -12,6 +13,25 @@ interface SafeExecOptions {
   env?: Record<string, string>
   /** Preserve semantically significant leading whitespace while still trimming trailing output. */
   preserveLeadingWhitespace?: boolean
+  timeoutMs?: number
+}
+
+const executionDeadline = new AsyncLocalStorage<number>()
+
+/** Bound nested Git, Docker and lifecycle calls with one operation-wide deadline. */
+export function withExecDeadline<T>(timeoutMs: number, operation: () => T): T {
+  const parent = executionDeadline.getStore() ?? Number.POSITIVE_INFINITY
+  return executionDeadline.run(Math.min(parent, Date.now() + timeoutMs), operation)
+}
+
+function remainingTimeout(timeoutMs?: number): number | undefined {
+  const deadline = executionDeadline.getStore()
+  const remaining = Math.min(
+    timeoutMs ?? Number.POSITIVE_INFINITY,
+    deadline === undefined ? Number.POSITIVE_INFINITY : deadline - Date.now()
+  )
+  if (remaining <= 0) throw new Error("Operation deadline exceeded")
+  return Number.isFinite(remaining) ? Math.max(1, Math.ceil(remaining)) : undefined
 }
 
 /**
@@ -25,6 +45,8 @@ export function execSafeSync(file: string, args: string[], options?: SafeExecOpt
       stdio: "pipe",
       ...(options?.cwd && { cwd: options.cwd }),
       ...(options?.env && { env: { ...process.env, ...options.env } }),
+      timeout: remainingTimeout(options?.timeoutMs),
+      killSignal: "SIGKILL",
     })
     return options?.preserveLeadingWhitespace ? stdout.trimEnd() : stdout.trim()
   } catch (error) {
@@ -71,5 +93,7 @@ export function executeLifecycleCommand(command: string, cwd: string): void {
     cwd,
     stdio: isJsonOutputMode() ? [0, 2, 2] : "inherit",
     shell: "/bin/sh",
+    timeout: remainingTimeout(),
+    killSignal: "SIGKILL",
   })
 }

@@ -62,24 +62,22 @@ describe("CLI exit codes (commander exitOverride)", () => {
 
   it("does not emit remove JSON when another command merely uses 'remove' as an argument", () => {
     const previousArgv = process.argv
-    process.argv = [
-      previousArgv[0],
-      previousArgv[1],
-      "create",
-      "remove",
-      "--json",
-      "--bogus",
-    ]
+    process.argv = [previousArgv[0], previousArgv[1], "create", "remove", "--json", "--bogus"]
     const program = createMainProgram()
     try {
       expect(() =>
         program.parse(["create", "remove", "--json", "--bogus"], { from: "user" })
       ).toThrow("exit")
-      expect(
-        stdoutSpy.mock.calls
-          .map((call) => String(call[0]))
-          .filter((value) => value.trim().startsWith("{"))
-      ).toEqual([])
+      const values = stdoutSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((value) => value.trim().startsWith("{"))
+      expect(values).toHaveLength(1)
+      expect(JSON.parse(values[0])).toMatchObject({
+        command: "create",
+        ok: false,
+        error: { exitCode: 2 },
+      })
+      expect(JSON.parse(values[0])).not.toHaveProperty("removed")
     } finally {
       process.argv = previousArgv
     }

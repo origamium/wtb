@@ -13,3 +13,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const { main } = await import("./cli/index.js")
   main()
 }
+
+export type {
+  SetupOptions,
+  SetupResult,
+  TeardownResult,
+  AwaitResult,
+  ComposeLifecycleResult,
+  EnvironmentSetupResult,
+} from "./types/index.js"

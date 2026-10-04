@@ -4,13 +4,16 @@
  */
 
 import { Command } from "commander"
+import { loadConfig } from "../../core/config/loader.js"
 import { enrichWorktree } from "../../core/git/commit-info.js"
-import { getGitRootOrThrow } from "../../core/git/repository.js"
+import { collectFullWorktreeStatus } from "../../core/git/full-status.js"
+import { getGitRootOrThrow, getRepositoryContext } from "../../core/git/repository.js"
 import { listWorktrees } from "../../core/git/worktree.js"
 import type { LsCommandOptions } from "../../types/index.js"
 import { withErrorHandling } from "../utils/command-helpers.js"
 import {
   renderDefault,
+  renderFull,
   renderJson,
   renderLong,
   renderPaths,
@@ -25,6 +28,7 @@ export function lsCommand(): Command {
     .alias("list")
     .description("List git worktrees (ls-like, scriptable)")
     .option("-l, --long", "Show commit hash, age, dirty state, and subject")
+    .option("--full", "Show commit details, dirty state, and ahead/behind counts vs base_branch")
     .option("--json", "Output machine-readable JSON")
     .option("-p, --paths", "Output paths only (one per line)")
     .action(withErrorHandling(executeLsCommand))
@@ -34,7 +38,7 @@ export function lsCommand(): Command {
  * lsコマンドのメイン実行ロジック
  * 優先順位: --paths > --json (+ -l) > plain (+ -l)
  */
-async function executeLsCommand(options: LsCommandOptions): Promise<void> {
+async function executeLsCommand(options: LsCommandOptions & { full?: boolean }): Promise<void> {
   const gitRoot = getGitRootOrThrow()
   const worktrees = listWorktrees()
   // cwd をそれを含む worktree のルートに解決する（サブディレクトリから実行しても
@@ -43,6 +47,18 @@ async function executeLsCommand(options: LsCommandOptions): Promise<void> {
 
   if (options.paths) {
     process.stdout.write(renderPaths(worktrees))
+    return
+  }
+
+  if (options.full) {
+    const { mainRoot } = getRepositoryContext()
+    const config = loadConfig(mainRoot)
+    const rows = await collectFullWorktreeStatus(worktrees, mainRoot, config.base_branch)
+    process.stdout.write(
+      options.json
+        ? `${renderJson(rows, currentPath, mainRoot)}\n`
+        : renderFull(rows, currentPath, mainRoot)
+    )
     return
   }
 

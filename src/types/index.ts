@@ -334,3 +334,10 @@ export interface ExecOptions {
   /** タイムアウト（ミリ秒） */
   timeout?: number
 }
+
+// Structured results exposed by the environment lifecycle and readiness commands.
+export type { SetupOptions, SetupResult } from "../cli/commands/setup.js"
+export type { TeardownResult } from "../cli/commands/teardown.js"
+export type { AwaitResult } from "../cli/commands/await.js"
+export type { ComposeLifecycleResult } from "../cli/commands/updown.js"
+export type { EnvironmentSetupResult } from "../cli/commands/create.js"

@@ -60,21 +60,19 @@ export function assertComposeProjectUnique(
 export function assertDockerComposeProjectOwnedByWorktree(
   targetProject: string,
   targetWorktreePath: string,
-  composeRelativePath: string
+  composeRelativePath: string,
+  runDocker: (args: string[]) => string = execDockerSafe
 ): void {
   let output: string
   try {
-    output = execDockerSafe(
-      [
-        "ps",
-        "-a",
-        "--filter",
-        `label=com.docker.compose.project=${targetProject}`,
-        "--format",
-        "{{.ID}}",
-      ],
-      {}
-    )
+    output = runDocker([
+      "ps",
+      "-a",
+      "--filter",
+      `label=com.docker.compose.project=${targetProject}`,
+      "--format",
+      "{{.ID}}",
+    ])
   } catch (error) {
     throw new DockerComposeProjectInspectionError(
       `Cannot enumerate containers for Compose project '${targetProject}': ${error instanceof Error ? error.message : String(error)}`
@@ -88,13 +86,13 @@ export function assertDockerComposeProjectOwnedByWorktree(
     })
   )
   const expectedComposeDir = canonicalPath(path.dirname(expectedCompose))
-  for (const containerId of output.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+  for (const containerId of output
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean)) {
     let rawLabels: string
     try {
-      rawLabels = execDockerSafe(
-        ["inspect", "--format", "{{json .Config.Labels}}", containerId],
-        {}
-      )
+      rawLabels = runDocker(["inspect", "--format", "{{json .Config.Labels}}", containerId])
     } catch (error) {
       throw new DockerComposeProjectInspectionError(
         `Cannot inspect Compose ownership for container '${containerId}': ${error instanceof Error ? error.message : String(error)}`
@@ -117,7 +115,10 @@ export function assertDockerComposeProjectOwnedByWorktree(
     const configFiles = values["com.docker.compose.project.config_files"]
     const parsedConfigFiles =
       typeof configFiles === "string"
-        ? configFiles.split(",").map((file) => file.trim()).filter(Boolean)
+        ? configFiles
+            .split(",")
+            .map((file) => file.trim())
+            .filter(Boolean)
         : []
     const ownsExpectedConfig =
       parsedConfigFiles.length > 0 &&

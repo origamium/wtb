@@ -9,6 +9,13 @@ import { realpathSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { Command, type CommanderError } from "commander"
 import { APP_DESCRIPTION, APP_NAME, APP_VERSION, EXIT_CODES } from "../constants/index.js"
+import { hasWrittenJsonResult, writeJsonResult } from "../utils/output.js"
+import { CLIError, getErrorMessage } from "../utils/error.js"
+import { awaitCommand } from "./commands/await.js"
+import { envCommand } from "./commands/env.js"
+import { setupCommand } from "./commands/setup.js"
+import { teardownCommand } from "./commands/teardown.js"
+import { initOrcaCommand } from "./commands/init-orca.js"
 import { createCommand } from "./commands/create.js"
 import { doctorCommand } from "./commands/doctor.js"
 import { initCommand } from "./commands/init.js"
@@ -49,14 +56,31 @@ function mapCommanderExitCode(error: CommanderError): number {
   return EXIT_CODES.GENERAL_ERROR
 }
 
-function writeRemoveJsonUsageError(error: CommanderError): void {
+function wantsJsonResult(args: string[]): boolean {
+  const optionBoundary = args.indexOf("--")
+  const options = args.slice(1, optionBoundary < 0 ? undefined : optionBoundary)
+  if (
+    ["ls", "list"].includes(args[0]) &&
+    options.some((arg) => arg === "--paths" || /^-[^-]*p/.test(arg))
+  )
+    return false
+  return options.includes("--json") || (args[0] === "ports" && !options.includes("--pretty"))
+}
+
+function writeJsonUsageError(error: CommanderError): void {
   const args = process.argv.slice(2)
-  if (args[0] !== "remove" || error.exitCode === 0) return
+  if (error.exitCode === 0 || !wantsJsonResult(args)) return
+  if (args[0] !== "remove") {
+    writeJsonResult({
+      command: args[0] ?? null,
+      ok: false,
+      error: { message: error.message, exitCode: mapCommanderExitCode(error) },
+    })
+    return
+  }
   const optionBoundary = args.indexOf("--")
   const removeArgs = args.slice(1, optionBoundary < 0 ? undefined : optionBoundary)
-  if (!removeArgs.includes("--json")) return
-  const branch = removeArgs
-    .find((value) => value !== "--json" && !value.startsWith("-"))
+  const branch = removeArgs.find((value) => value !== "--json" && !value.startsWith("-"))
   process.stdout.write(
     `${JSON.stringify({
       branch: branch ?? null,
@@ -93,12 +117,17 @@ function createMainProgram(): Command {
   program.addCommand(initCommand())
   program.addCommand(initClaudeCommand())
   program.addCommand(doctorCommand())
+  program.addCommand(setupCommand())
+  program.addCommand(teardownCommand())
+  program.addCommand(initOrcaCommand())
+  program.addCommand(awaitCommand())
+  program.addCommand(envCommand())
 
   // 使い方エラー (引数不足など) を commander 既定の exit 1 ではなく INVALID_USAGE (2)
   // で終了させる。exitOverride は addCommand したサブコマンドへ自動伝播しないため、
   // 各サブコマンドにも同じコールバックを設定する。
   const exitWithMappedCode = (error: CommanderError): never => {
-    writeRemoveJsonUsageError(error)
+    writeJsonUsageError(error)
     process.exit(mapCommanderExitCode(error))
   }
   program.exitOverride(exitWithMappedCode)
@@ -146,7 +175,21 @@ function main(): void {
   setupErrorHandling()
 
   const program = createMainProgram()
-  program.parse()
+  program.parseAsync().catch((error: unknown) => {
+    const args = process.argv.slice(2)
+    if (wantsJsonResult(args) && !hasWrittenJsonResult()) {
+      writeJsonResult({
+        command: args[0] ?? null,
+        ok: false,
+        error: {
+          message: getErrorMessage(error),
+          exitCode: error instanceof CLIError ? error.exitCode : EXIT_CODES.GENERAL_ERROR,
+        },
+      })
+    }
+    console.error(`Error: ${getErrorMessage(error)}`)
+    process.exitCode = error instanceof CLIError ? error.exitCode : EXIT_CODES.GENERAL_ERROR
+  })
 }
 
 // スクリプトとして実行された場合のみmain()を呼び出し

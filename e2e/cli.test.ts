@@ -719,12 +719,31 @@ describe("Remove Command - wtb-managed file protection (B1)", () => {
 
   beforeEach(() => {
     testRepo = createTestRepo("relocatability", "managed-protect")
+    // Dotenv files may be absent from a clean checkout or excluded by global
+    // Git ignores. These tests require an explicitly tracked source .env so
+    // create must record its rewrite, rather than exercising ordinary dirtiness.
+    testRepo.writeFile(
+      ".env",
+      "KONG_HTTP_PORT=54321\nDB_PORT=54322\nAPI_EXTERNAL_URL=http://127.0.0.1:54321\n"
+    )
+    execSync("git add -f -- .env", { cwd: testRepo.path, stdio: "pipe" })
+    execSync('git commit --allow-empty -m "Track managed env fixture"', {
+      cwd: testRepo.path,
+      stdio: "pipe",
+    })
     // create rewrites the tracked compose (identity) + .env (port adjust) → both
     // become wtb-managed. Skip volume clone / start so the test needs no Docker.
     const flags = HAS_DOCKER_DAEMON
       ? "--no-volume-copy --no-start"
       : "--no-docker --no-start"
-    testRepo.runCLI(`create ${BRANCH} ${flags}`)
+    const created = testRepo.runCLI(`create ${BRANCH} ${flags} --strict`)
+    expect(created.exitCode, created.combined).toBe(0)
+    expect(
+      execSync("git ls-files -v -- .env", {
+        cwd: testRepo.getWorktreePath(BRANCH),
+        encoding: "utf-8",
+      })
+    ).toMatch(/^S /)
   })
 
   afterEach(() => {

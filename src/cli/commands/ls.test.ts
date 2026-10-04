@@ -5,7 +5,9 @@
 import type { Command } from "commander"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { EXIT_CODES } from "../../constants/index.js"
+import { loadConfig } from "../../core/config/loader.js"
 import * as commitInfoModule from "../../core/git/commit-info.js"
+import { collectFullWorktreeStatus } from "../../core/git/full-status.js"
 import * as repositoryModule from "../../core/git/repository.js"
 import * as worktreeModule from "../../core/git/worktree.js"
 import { CLIError } from "../../utils/error.js"
@@ -14,6 +16,8 @@ import { lsCommand } from "./ls.js"
 vi.mock("../../core/git/repository.js")
 vi.mock("../../core/git/worktree.js")
 vi.mock("../../core/git/commit-info.js")
+vi.mock("../../core/git/full-status.js")
+vi.mock("../../core/config/loader.js")
 
 describe("ls command", () => {
   let writeSpy: ReturnType<typeof vi.spyOn>
@@ -181,5 +185,48 @@ describe("ls command", () => {
     const output = writeSpy.mock.calls.map((c) => c[0]).join("")
     expect(output).toContain("main")
     expect(output).toContain("feature")
+  })
+
+  it("--full includes divergence and preserves unknown dirty state in JSON", async () => {
+    vi.mocked(repositoryModule.getRepositoryContext).mockReturnValue({
+      mainRoot: "/repo",
+      currentRoot: "/repo-feature",
+      commonGitDir: "/repo/.git",
+    })
+    vi.mocked(loadConfig).mockReturnValue({ base_branch: "develop" } as ReturnType<
+      typeof loadConfig
+    >)
+    vi.mocked(collectFullWorktreeStatus).mockResolvedValue([
+      {
+        path: "/repo-feature",
+        branch: "feature",
+        head: "def",
+        shortHash: "def",
+        subject: "commit",
+        ageRelative: "now",
+        ageTimestamp: "today",
+        dirty: null,
+        baseBranch: "develop",
+        ahead: 2,
+        behind: 3,
+        enrichmentError: "status unreadable",
+      },
+    ])
+    await command.parseAsync(["--full", "--json"], { from: "user" })
+    const parsed = JSON.parse(writeSpy.mock.calls.map((call) => call[0]).join(""))
+    expect(parsed[0]).toMatchObject({
+      baseBranch: "develop",
+      ahead: 2,
+      behind: 3,
+      dirty: null,
+      enrichmentError: "status unreadable",
+    })
+    expect(loadConfig).toHaveBeenCalledWith("/repo")
+  })
+
+  it("--paths retains precedence over --full", async () => {
+    await command.parseAsync(["--full", "--paths"], { from: "user" })
+    expect(collectFullWorktreeStatus).not.toHaveBeenCalled()
+    expect(writeSpy.mock.calls.map((call) => call[0]).join("")).toBe("/repo\n/repo-feature\n")
   })
 })

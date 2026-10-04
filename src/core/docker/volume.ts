@@ -320,9 +320,18 @@ export function getVolumeSize(volumeName: string): number | null {
       ],
       {}
     )
-    const size = parseInt(output, 10)
-    return Number.isNaN(size) ? null : size
-  } catch {
+    const size = Number(output)
+    if (!/^\d+$/.test(output) || !Number.isSafeInteger(size) || size < 0) {
+      console.warn(
+        `Cannot inspect volume '${volumeName}' size: helper returned an invalid byte count`
+      )
+      return null
+    }
+    return size
+  } catch (error) {
+    console.warn(
+      `Cannot inspect volume '${volumeName}' size: ${error instanceof Error ? error.message : String(error)}`
+    )
     return null
   }
 }

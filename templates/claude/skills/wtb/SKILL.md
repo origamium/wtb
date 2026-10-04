@@ -41,6 +41,12 @@ Also activate when `wtb.yaml`, `wtb.yml`, `.wtb.yaml`, `.wtb.yml`, `.wtb/config.
 | "What worktrees exist?" | `wtb ls --json` | Fastest structured listing (1 git call) |
 | "cd into the worktree for X" | `cd "$(wtb path X)"` | Prints the absolute path, one line, nothing else on stdout |
 | "Set up wtb in this repo" | `wtb init` | Scaffolds a commented `wtb.yaml` (refuses to overwrite without `--force`) |
+| "Connect Orca's worktree lifecycle" | `wtb init-orca [--remove-volumes]` | Installs shared setup/archive hooks without changing Orca settings |
+| "Prepare a worktree Orca already created" | `wtb setup --up --wait --json` | Strict preparation; completed initialization is reused |
+| "Clean the environment but keep the checkout" | `wtb teardown [--remove-volumes] --json` | Never removes a Git worktree or branch |
+| "Wait until services are ready" | `wtb await [branch] --timeout 120 --json` | Checks healthy/running state without starting services |
+| "Which branches are ahead/behind?" | `wtb ls --full --json` | Long fields plus configured-base comparison; unknown values are null |
+| "Read adjusted env values" | `wtb env [branch] --json` | Only `env.adjust` keys; never dumps unrelated env entries |
 | "Show me everything (incl. Docker state)" | `wtb status -a` | Human-readable, includes containers/volumes |
 | "Make a worktree" | `wtb create <branch>` | Always preview with `--dry-run` first if config is unfamiliar |
 | "Remove a worktree" | `wtb remove <branch>` | **Destructive** — confirm with the user first |
@@ -51,6 +57,30 @@ Also activate when `wtb.yaml`, `wtb.yml`, `.wtb.yaml`, `.wtb.yml`, `.wtb/config.
 | "Why do two worktrees collide?" / "Is this compose worktree-safe?" | `wtb doctor` | Static preflight (no Docker) for worktree-relocatability problems before creating a worktree |
 
 Read-only commands (`ls`, `path`, `ports`, `status`, `doctor`, and `wtb prune` without `--yes`) are safe to run autonomously. Mutating commands (`create`, `remove`, `reclone`, `up`, `down`, `prune --yes`) require explicit user intent — `down` is disruptive (stops running services; with `--remove-volumes` it deletes data).
+
+## Orca-created worktrees
+
+Orca owns checkout creation/deletion and agents. wtb owns environment preparation and cleanup. Do not call `wtb create` from Orca setup or `wtb remove` from archive.
+
+```bash
+wtb init-orca --remove-volumes --dry-run
+wtb init-orca --remove-volumes
+wtb init-orca --remove-volumes --check
+```
+
+The installed shared `orca.yaml` uses `setupAgentStartupPolicy: wait-for-setup`, setup `wtb setup --up --wait --timeout 120 --json`, and archive `wtb teardown --remove-volumes --json`. Omit `--remove-volumes` when installing to preserve volume data. The installer keeps unrelated YAML and comments; `--force` replaces only its three integration keys. Validate the existing commands before intentionally replacing them. A valid `ORCA_ROOT_PATH` selects Orca's registered checkout root; otherwise an unset variable selects the canonical main root. An unrelated or non-root path is refused.
+
+Enable shared repository hooks and run-setup-by-default in Orca. Existing local hook settings may override the shared file. The installer does not modify these settings or invoke Orca. Orca CLI deletion requires `worktree rm --run-hooks`; its ordinary `--force` neither enables hooks nor waives archive failure. Hosts with `worktree.archive-failure-blocking.v1` keep the checkout when archive fails. The archive limit is 120 seconds; wtb teardown has an internal 110-second cleanup deadline. Report failures and inspect cleanup state instead of bypassing the hook.
+
+`setup [branch]` operates only on an existing non-main worktree, is strict by default, and accepts `--seed`, `--no-copy`, `--no-link`, `--no-env`, `--no-docker`, `--no-start`, `--no-volume-copy`, `--no-stop`, `--up`, `--wait`, `--timeout`, `--dry-run`, and `--json`. `--wait` implies startup; its 120-second default controls readiness only. Completed preparation is reused without changing ports or replaying seed/start. A startup/readiness failure can be retried with `setup --wait` or `up` then `await`.
+
+A failed/interrupted preparation is **not automatically resumed**. Inspect the phase recorded at `git rev-parse --git-path wtb-setup.json`, preserve local work and volume recovery records, and repair the reported operation. There is no reset/resume/force flag. Never delete the record to bypass safety. A fresh checkout after preserving work and successful cleanup is a recovery option. `teardown [branch]` keeps Git state, returns cleanup failures non-zero, and only deletes owned volumes when requested. `teardown` runs `end_command` first, then revalidates ownership and runs guarded Compose cleanup with the requested volume policy. Unlike `remove`, its hook does not suppress that final cleanup; a failed hook prevents it.
+
+`await --json` returns `{ branch, path, project, composeFile, ok, timedOut, elapsedMs, services }`. Healthy containers pass; ordinary containers without healthchecks must run. Explicit successful-completion dependencies and job services need exit 0. Unhealthy/missing/restarting/failed services stay pending until the deadline; Docker/config/protocol errors fail immediately. Timeout exits 1, missing/no-active Compose configuration 4, Docker failure 5.
+
+`ls --full --json` adds `baseBranch`, `ahead`, and `behind` to long output. Unknown dirty/count values are `null` and `enrichmentError` explains why. Never treat unknown counts as proof a branch is merged.
+
+`env [branch] --json` returns the values object for `env.adjust` keys only; later `env.file` entries win, and null/missing keys are omitted. Plain output is POSIX shell-quoted `KEY='value'`; `eval "$(wtb env X)"` assigns variables but does not export newly assigned ones. Env-file command substitutions are data, never commands. Keys intentionally included in `env.adjust` may still contain secrets.
 
 ## Discovering the current worktree's endpoints
 
@@ -231,7 +261,7 @@ Flags:
   }
   ```
 
-  `composeDown` is `null` when no `docker_compose_file` is configured; when teardown was skipped it's `{ ran: false, failed: false, volumesRemoved: false, skippedReason }` with `skippedReason` one of `no-docker-flag`, `end-command`, `same-project`, `unresolvable-project`, `compose-file-missing`. `endCommand` is `{ ran, failed }`, or `null` when no `end_command` is configured. A failed teardown/end command does **not** change the exit code (still `0`) — `ok: false` is the signal; check it instead of `$?`.
+  `composeDown` is `null` when no `docker_compose_file` is configured. Intentional skips (`no-docker-flag`, `end-command`) have `failed:false`; unsafe/missing project, file, or volume ownership produces `failed:true`. `endCommand` is `{ ran, failed }`, or `null`. `cleanupErrors` reports safety/cleanup failures. Failed cleanup keeps the worktree and exits non-zero; `--force` may continue removal but keeps `ok:false` and the non-zero exit (Docker 5, other cleanup 1).
 
 Ordering is: Docker teardown → `end_command` → `git worktree remove`. Setting `end_command` in `wtb.yaml` suppresses the automatic Docker teardown (the user owns shutdown). The default leaves volumes intact (consistent with `docker compose down`); use `--remove-volumes` only if the user explicitly wants the data gone.
 

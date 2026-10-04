@@ -6,6 +6,7 @@ import * as path from "node:path"
 import { EXIT_CODES } from "../../constants/index.js"
 import { canonicalPath, getWorktreePath, listWorktrees } from "../../core/git/worktree.js"
 import { CLIError, getErrorMessage } from "../../utils/error.js"
+import { hasWrittenJsonResult, setJsonOutputMode, writeJsonResult } from "../../utils/output.js"
 
 /**
  * コマンド action の標準エラーハンドリングラッパー
@@ -17,9 +18,34 @@ export function withErrorHandling<A extends unknown[]>(
   handler: (...args: A) => Promise<void>
 ): (...args: A) => Promise<void> {
   return async (...args: A) => {
+    const command = args.find(
+      (arg): arg is { name: () => string } =>
+        typeof arg === "object" && arg !== null && "name" in arg && typeof arg.name === "function"
+    )
+    const options = args.find(
+      (arg): arg is { json?: boolean; pretty?: boolean; paths?: boolean } =>
+        typeof arg === "object" &&
+        arg !== null &&
+        ("json" in arg || "pretty" in arg || "paths" in arg)
+    )
+    const pathsOnly = ["ls", "list"].includes(command?.name() ?? "") && options?.paths === true
+    const json =
+      !pathsOnly &&
+      (options?.json === true || (command?.name() === "ports" && options?.pretty !== true))
+    setJsonOutputMode(json)
     try {
       await handler(...args)
     } catch (error) {
+      if (json && !hasWrittenJsonResult()) {
+        writeJsonResult({
+          command: command?.name() ?? null,
+          ok: false,
+          error: {
+            message: getErrorMessage(error),
+            exitCode: error instanceof CLIError ? error.exitCode : EXIT_CODES.GENERAL_ERROR,
+          },
+        })
+      }
       if (error instanceof CLIError) {
         console.error(`Error: ${error.message}`)
         process.exit(error.exitCode)

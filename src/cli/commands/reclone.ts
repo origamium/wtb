@@ -18,6 +18,7 @@ import { resolveWorktreeTarget, withErrorHandling } from "../utils/command-helpe
 import {
   emptyVolumeCopyResult,
   previewVolumeCopy,
+  readComposeForPreview,
   setupVolumeCopy,
   type VolumeCopyResult,
 } from "./create.js"
@@ -132,7 +133,11 @@ async function executeRecloneCommand(
 
   if (options.dryRun) {
     out("🔍 Dry run mode — no changes will be made")
-    previewVolumeCopy(gitRoot, config)
+    previewVolumeCopy(
+      gitRoot,
+      config,
+      readComposeForPreview(gitRoot, worktreePath, config)?.compose ?? null
+    )
     if (json) {
       writeJsonResult(emptyVolumeCopyResult(), true)
     }

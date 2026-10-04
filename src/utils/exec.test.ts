@@ -8,7 +8,13 @@ import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 import { describe, expect, it } from "vitest"
-import { execDockerSafe, execGitSafe, execSafeSync, executeLifecycleCommand } from "./exec.js"
+import {
+  execDockerSafe,
+  execGitSafe,
+  execSafeSync,
+  executeLifecycleCommand,
+  withExecDeadline,
+} from "./exec.js"
 
 describe("execSafeSync error formatting", () => {
   it("returns trimmed stdout on success", () => {
@@ -106,5 +112,36 @@ describe("executeLifecycleCommand", () => {
 
   it("throws when the command exits non-zero (caller decides fatality)", () => {
     expect(() => executeLifecycleCommand("exit 7", os.tmpdir())).toThrow()
+  })
+})
+
+describe("operation-wide execution deadlines", () => {
+  it("terminates a stalled child within the operation deadline", () => {
+    const started = Date.now()
+    expect(() =>
+      withExecDeadline(50, () =>
+        execSafeSync(process.execPath, ["-e", "setTimeout(() => {}, 10000)"])
+      )
+    ).toThrow()
+    expect(Date.now() - started).toBeLessThan(2000)
+  })
+
+  it("does not allow a nested longer deadline to extend its parent", async () => {
+    await withExecDeadline(1, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(() => withExecDeadline(10000, () => execGitSafe(["--version"]))).toThrow(
+        "deadline exceeded"
+      )
+    })
+    expect(execGitSafe(["--version"])).toContain("git version")
+  })
+
+  it("applies the same deadline to lifecycle shells", () => {
+    const node = `'${process.execPath.replace(/'/g, "'\\''")}'`
+    expect(() =>
+      withExecDeadline(50, () =>
+        executeLifecycleCommand(`exec ${node} -e 'setTimeout(() => {}, 10000)'`, os.tmpdir())
+      )
+    ).toThrow()
   })
 })

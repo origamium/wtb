@@ -33,7 +33,7 @@
     "pretest:e2e": "npm run build",
     "test:e2e": "vitest run e2e/",
     "pretest:integration": "npm run build",
-    "test:integration": "bash e2e/integration-docker.sh && bash e2e/integration-databases.sh",
+    "test:integration": "bash e2e/integration-docker.sh && bash e2e/integration-databases.sh && bash e2e/integration-orca.sh",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build && npm run test:run"
   },
@@ -76,7 +76,7 @@
     "vitest": "^3.2.4"
   },
   "dependencies": {
-    "commander": "^14.0.1",
+    "commander": "^13.1.0",
     "fs-extra": "^11.3.1",
     "yaml": "^2.8.1"
   }

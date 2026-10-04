@@ -19,7 +19,7 @@ import * as volumeModule from "../../core/docker/volume.js"
 import * as volumeRemovalModule from "../../core/docker/volume-removal.js"
 import * as repositoryModule from "../../core/git/repository.js"
 import * as worktreeModule from "../../core/git/worktree.js"
-import { downCommand, upCommand } from "./updown.js"
+import { downCommand, runWorktreeComposeLifecycle, upCommand } from "./updown.js"
 
 vi.mock("node:fs", () => ({
   existsSync: vi.fn(() => true),
@@ -122,9 +122,50 @@ describe("up / down commands", () => {
     expect(composeModule.composeUp).toHaveBeenCalledWith(COMPOSE_PATH, "wtproj", WORKTREE_PATH)
   })
 
+  it("exposes lifecycle results to setup without writing JSON or exiting the process", async () => {
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+      throw new Error("unexpected exit")
+    })
+    try {
+      const result = await runWorktreeComposeLifecycle("up", "feature/x")
+      expect(result).toMatchObject({
+        branch: "feature/x",
+        path: WORKTREE_PATH,
+        project: "wtproj",
+        action: "up",
+        ok: true,
+      })
+      expect(output).not.toHaveBeenCalled()
+      expect(exit).not.toHaveBeenCalled()
+    } finally {
+      output.mockRestore()
+      exit.mockRestore()
+    }
+  })
+
+  it("returns one JSON result for hard target guard failures", async () => {
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true)
+    vi.mocked(worktreeModule.getWorktreePath).mockReturnValue("/repo")
+    try {
+      await up.parseAsync(["main", "--json"], { from: "user" })
+      expect(output).toHaveBeenCalledTimes(1)
+      expect(JSON.parse(String(output.mock.calls[0][0]))).toMatchObject({
+        branch: "main",
+        action: "up",
+        ok: false,
+      })
+      expect(process.exitCode).toBe(EXIT_CODES.GENERAL_ERROR)
+      expect(composeModule.composeUp).not.toHaveBeenCalled()
+    } finally {
+      output.mockRestore()
+      process.exitCode = undefined
+    }
+  })
+
   it("runs a branch-only target Compose when the main source file does not exist", async () => {
-    vi.mocked(existsSync).mockImplementation((value) =>
-      path.resolve(String(value)) !== path.resolve("/repo/compose.dev.yml")
+    vi.mocked(existsSync).mockImplementation(
+      (value) => path.resolve(String(value)) !== path.resolve("/repo/compose.dev.yml")
     )
 
     await up.parseAsync(["feature/x"], { from: "user" })
@@ -135,8 +176,8 @@ describe("up / down commands", () => {
   it("refuses a transient shell project override even for branch-only Compose", async () => {
     const previous = process.env.COMPOSE_PROJECT_NAME
     process.env.COMPOSE_PROJECT_NAME = "production"
-    vi.mocked(existsSync).mockImplementation((value) =>
-      path.resolve(String(value)) !== path.resolve("/repo/compose.dev.yml")
+    vi.mocked(existsSync).mockImplementation(
+      (value) => path.resolve(String(value)) !== path.resolve("/repo/compose.dev.yml")
     )
     // The compose module is mocked in this suite, so model the real helper's
     // fail-closed result under a shell override.
@@ -251,9 +292,7 @@ describe("up / down commands", () => {
     vi.mocked(
       projectOwnershipModule.assertDockerComposeProjectOwnedByWorktree
     ).mockImplementationOnce(() => {
-      throw new projectOwnershipModule.DockerComposeProjectInspectionError(
-        "daemon unavailable"
-      )
+      throw new projectOwnershipModule.DockerComposeProjectInspectionError("daemon unavailable")
     })
 
     await expectExit(up, ["feature/x"], EXIT_CODES.DOCKER_ERROR)

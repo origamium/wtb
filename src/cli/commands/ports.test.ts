@@ -156,7 +156,12 @@ describe("ports command surface", () => {
     await expect(portsCommand().parseAsync(["nope"], { from: "user" })).rejects.toThrow("exited")
 
     expect(exitSpy).toHaveBeenCalledWith(EXIT_CODES.GENERAL_ERROR)
-    expect(writeSpy).not.toHaveBeenCalled()
+    expect(writeSpy).toHaveBeenCalledTimes(1)
+    expect(JSON.parse(String(writeSpy.mock.calls[0][0]))).toMatchObject({
+      command: "ports",
+      ok: false,
+      error: { exitCode: EXIT_CODES.GENERAL_ERROR },
+    })
     const stderr = consoleErrorSpy.mock.calls.map((c) => c[0]).join("\n")
     expect(stderr).toContain("Available worktrees:")
     expect(stderr).toContain("No worktree found for branch 'nope'")
@@ -311,9 +316,7 @@ describe("gatherPortsForWorktree — interpolation", () => {
     vi.mocked(composeModule.readComposeFile).mockReturnValue(
       compose({
         web: {
-          ports: [
-            { target: 80, published: 3001, protocol: "tcp", mode: "host" },
-          ],
+          ports: [{ target: 80, published: 3001, protocol: "tcp", mode: "host" }],
         },
       })
     )

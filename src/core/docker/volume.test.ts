@@ -752,6 +752,8 @@ describe("copyVolume atomic overwrite", () => {
 })
 
 describe("getVolumeSize", () => {
+  afterEach(() => vi.restoreAllMocks())
+
   it("uses an entry-aware content byte count so an empty volume is exactly zero", () => {
     vi.clearAllMocks()
     vi.mocked(execDockerSafe).mockReturnValue("0")
@@ -759,6 +761,38 @@ describe("getVolumeSize", () => {
     expect(vi.mocked(execDockerSafe).mock.calls[0][0]).toEqual(
       expect.arrayContaining([expect.stringContaining("find /data -mindepth 1")])
     )
+  })
+
+  it.each([
+    "",
+    "123 unexpected output",
+    "-1",
+    "1.5",
+    "1e3",
+    "9007199254740992",
+  ])("returns unknown rather than trusting invalid byte count %j", (output) => {
+    vi.mocked(execDockerSafe).mockReturnValue(output)
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {})
+    expect(getVolumeSize("target_vol")).toBeNull()
+    expect(warning).toHaveBeenCalledWith(
+      "Cannot inspect volume 'target_vol' size: helper returned an invalid byte count"
+    )
+  })
+
+  it("retains exact Docker failure diagnostics while preserving the unknown result", () => {
+    vi.mocked(execDockerSafe).mockImplementation(() => {
+      throw new Error("Docker helper could not start: daemon unavailable")
+    })
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {})
+    expect(getVolumeSize("target_vol")).toBeNull()
+    expect(warning).toHaveBeenCalledWith(
+      "Cannot inspect volume 'target_vol' size: Docker helper could not start: daemon unavailable"
+    )
+  })
+
+  it("accepts an exact safe byte count for a populated volume", () => {
+    vi.mocked(execDockerSafe).mockReturnValue("10485760")
+    expect(getVolumeSize("target_vol")).toBe(10485760)
   })
 })
 

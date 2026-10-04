@@ -1,0 +1,9 @@
+# Run `wtb init-orca --remove-volumes` in the repository registered with Orca.
+# Enable shared repository hooks and "run setup by default" in Orca settings.
+# Git, wtb, Docker, and Compose must be available on the execution host's PATH.
+setupAgentStartupPolicy: wait-for-setup
+scripts:
+  setup: wtb setup --up --wait --timeout 120 --json
+  # Remove --remove-volumes to retain this worktree's data after archive.
+  # Orca CLI deletion must pass --run-hooks to run this command.
+  archive: wtb teardown --remove-volumes --json
